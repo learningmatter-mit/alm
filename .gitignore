@@ -1,0 +1,41 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*.so
+
+# The MatterGen fork is fetched + patched locally by external/setup_mattergen.sh
+# (no trailing slash: also ignores a dev symlink named external/mattergen)
+external/mattergen
+
+# Data, caches, checkpoints, run outputs (bring your own; see README)
+data/
+datasets/
+eval_results/
+*.flat.bin
+*.idx.json
+checkpoints/
+*.ckpt
+*.pt
+
+# Logs / SLURM / W&B
+wandb/
+logs/
+*.o
+*.e
+slurm-*.out
+*.log
+
+# Env
+.venv/
+env/
+venv/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Build artifacts
+*.egg-info/
+build/
+dist/

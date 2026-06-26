@@ -1,0 +1,672 @@
+{
+  "bounds": {
+    "benchmark": "mp_20",
+    "n_rows": 9046,
+    "lo_pct": 1.0,
+    "hi_pct": 99.0,
+    "density_min": 1.752533201453478,
+    "density_max": 15.657050956665168,
+    "vol_per_atom_min": 8.773392056882932,
+    "vol_per_atom_max": 45.867794704014315,
+    "min_pair_distance_min": 1.0239213297036553,
+    "aspect_ratio_max": 5.357833675569966,
+    "angle_min_min": 22.38934646549998,
+    "angle_max_max": 158.29083670300002
+  },
+  "at_risk": [
+    {
+      "row_id": "mp-1002572",
+      "formula": "LiMnO2",
+      "density": 4.0932486795097764,
+      "vol_per_atom": 9.52103338534429,
+      "min_pair_distance": 1.9546177989471787,
+      "aspect_ratio": 1.1025206576077777,
+      "angle_min": 89.99821457,
+      "angle_max": 90.00002107,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-626680",
+      "formula": "Fe(HO)2",
+      "density": 3.385648248646972,
+      "vol_per_atom": 8.814590199692542,
+      "min_pair_distance": 0.9735325964783393,
+      "aspect_ratio": 2.225614958428121,
+      "angle_min": 89.95162355,
+      "angle_max": 101.94251367,
+      "flags": [
+        "vol_per_atom",
+        "min_pair_distance"
+      ]
+    },
+    {
+      "row_id": "mp-1228956",
+      "formula": "AlAu4",
+      "density": 14.968187347383507,
+      "vol_per_atom": 18.07949887270625,
+      "min_pair_distance": 2.5795026981062628,
+      "aspect_ratio": 3.6768131991547977,
+      "angle_min": 70.51505966,
+      "angle_max": 85.85175533,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-1225183",
+      "formula": "Fe3Te2Se",
+      "density": 6.751035074742463,
+      "vol_per_atom": 20.566825159858897,
+      "min_pair_distance": 2.406255489453596,
+      "aspect_ratio": 5.207050062517702,
+      "angle_min": 90.0,
+      "angle_max": 90.0,
+      "flags": [
+        "aspect_ratio"
+      ]
+    },
+    {
+      "row_id": "mp-3833",
+      "formula": "Mg(AlSi)2",
+      "density": 2.3145342817778234,
+      "vol_per_atom": 19.290389590486207,
+      "min_pair_distance": 2.493601982906483,
+      "aspect_ratio": 1.6357695406862014,
+      "angle_min": 90.0,
+      "angle_max": 120.00000913000001,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-16965",
+      "formula": "LaTm(Ge2Ir)2",
+      "density": 10.29531204950759,
+      "vol_per_atom": 19.81525324393245,
+      "min_pair_distance": 2.49299522907591,
+      "aspect_ratio": 1.0,
+      "angle_min": 62.79065196000001,
+      "angle_max": 153.58151665,
+      "flags": [
+        "angle_max"
+      ]
+    },
+    {
+      "row_id": "mp-768203",
+      "formula": "BeH2",
+      "density": 0.8075344435137619,
+      "vol_per_atom": 7.559028576659486,
+      "min_pair_distance": 1.428558630359457,
+      "aspect_ratio": 1.0000000000000002,
+      "angle_min": 88.27403909999998,
+      "angle_max": 141.75195061,
+      "flags": [
+        "density",
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-625409",
+      "formula": "Sm(HO)3",
+      "density": 5.044411889169072,
+      "vol_per_atom": 9.470244906222144,
+      "min_pair_distance": 0.9712586149342902,
+      "aspect_ratio": 1.7881132136201652,
+      "angle_min": 61.037601929999994,
+      "angle_max": 90.0,
+      "flags": [
+        "vol_per_atom",
+        "min_pair_distance"
+      ]
+    },
+    {
+      "row_id": "mp-1225266",
+      "formula": "Fe9B4Ir3",
+      "density": 11.041873779058847,
+      "vol_per_atom": 10.55049137356181,
+      "min_pair_distance": 2.0747044222846176,
+      "aspect_ratio": 1.554142125779585,
+      "angle_min": 89.95576095999999,
+      "angle_max": 90.0,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-34127",
+      "formula": "K2NaAs",
+      "density": 2.190057643467705,
+      "vol_per_atom": 33.38201670283061,
+      "min_pair_distance": 3.1058789861381277,
+      "aspect_ratio": 1.980780660005093,
+      "angle_min": 90.0,
+      "angle_max": 120.00000745000001,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-1111218",
+      "formula": "K2NaYCl6",
+      "density": 2.164379154823408,
+      "vol_per_atom": 30.904109614253155,
+      "min_pair_distance": 2.6307935544451406,
+      "aspect_ratio": 1.0,
+      "angle_min": 59.99999999999999,
+      "angle_max": 59.99999999999999,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-1220892",
+      "formula": "NaTi3Nb(CuO4)3",
+      "density": 5.047992513222066,
+      "vol_per_atom": 10.561411731812656,
+      "min_pair_distance": 1.9705158755206083,
+      "aspect_ratio": 1.000000044595966,
+      "angle_min": 109.52905076,
+      "angle_max": 109.52905823999998,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-1212739",
+      "formula": "EuGa3(BO3)4",
+      "density": 4.889680132127668,
+      "vol_per_atom": 10.126381743432107,
+      "min_pair_distance": 1.3760985147614615,
+      "aspect_ratio": 1.0000000312136894,
+      "angle_min": 103.66016431,
+      "angle_max": 103.66016433,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-1215208",
+      "formula": "ZrTi3As2",
+      "density": 6.245200659193951,
+      "vol_per_atom": 17.046598647735966,
+      "min_pair_distance": 2.644941398002406,
+      "aspect_ratio": 1.0,
+      "angle_min": 39.78198748,
+      "angle_max": 152.15842971,
+      "flags": [
+        "angle_max"
+      ]
+    },
+    {
+      "row_id": "mp-1236924",
+      "formula": "K3RhF6",
+      "density": 2.0402825427729554,
+      "vol_per_atom": 27.199022690345778,
+      "min_pair_distance": 2.021059886644021,
+      "aspect_ratio": 1.1990381995193446,
+      "angle_min": 78.34712279,
+      "angle_max": 127.27111789,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-983062",
+      "formula": "K3Cd",
+      "density": 1.854551203320874,
+      "vol_per_atom": 51.4188581890336,
+      "min_pair_distance": 4.057402630193309,
+      "aspect_ratio": 1.0000000000000002,
+      "angle_min": 59.99999999999999,
+      "angle_max": 59.99999999999999,
+      "flags": [
+        "density",
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-19755",
+      "formula": "Li(TiS2)3",
+      "density": 2.603147304148886,
+      "vol_per_atom": 21.875519033259586,
+      "min_pair_distance": 2.41394346662883,
+      "aspect_ratio": 6.30840695677991,
+      "angle_min": 90.0,
+      "angle_max": 120.00000406,
+      "flags": [
+        "aspect_ratio"
+      ]
+    },
+    {
+      "row_id": "mp-1025578",
+      "formula": "Te2W3(SeS)2",
+      "density": 5.6723160823129515,
+      "vol_per_atom": 33.46296788242927,
+      "min_pair_distance": 2.4597078832237114,
+      "aspect_ratio": 9.26577667421791,
+      "angle_min": 90.0,
+      "angle_max": 120.00000133,
+      "flags": [
+        "aspect_ratio"
+      ]
+    },
+    {
+      "row_id": "mp-7751",
+      "formula": "PuPt5",
+      "density": 18.332624670195468,
+      "vol_per_atom": 18.40884386760713,
+      "min_pair_distance": 2.6713539983566235,
+      "aspect_ratio": 1.1957416900602114,
+      "angle_min": 90.0,
+      "angle_max": 120.00001230000001,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-1220596",
+      "formula": "Nb4AgS8",
+      "density": 4.535408214655463,
+      "vol_per_atom": 20.728853085235873,
+      "min_pair_distance": 2.463206951639191,
+      "aspect_ratio": 8.060884352200965,
+      "angle_min": 86.4437792,
+      "angle_max": 119.99999218000002,
+      "flags": [
+        "aspect_ratio"
+      ]
+    },
+    {
+      "row_id": "mp-571461",
+      "formula": "K4ZnAs2",
+      "density": 2.3531513395063404,
+      "vol_per_atom": 37.46536437108612,
+      "min_pair_distance": 2.3263060229778803,
+      "aspect_ratio": 1.0000000041463324,
+      "angle_min": 34.891433439999986,
+      "angle_max": 34.891436060000004,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-1212916",
+      "formula": "Eu3Al2O7",
+      "density": 7.393127499531507,
+      "vol_per_atom": 11.639274410572613,
+      "min_pair_distance": 1.87774285830925,
+      "aspect_ratio": 1.0,
+      "angle_min": 30.008408979999995,
+      "angle_max": 158.90357674,
+      "flags": [
+        "angle_max"
+      ]
+    },
+    {
+      "row_id": "mp-1094982",
+      "formula": "LiMg",
+      "density": 1.2282915743355873,
+      "vol_per_atom": 21.120882383134585,
+      "min_pair_distance": 3.114050354761808,
+      "aspect_ratio": 1.6508216186476163,
+      "angle_min": 90.0,
+      "angle_max": 120.00000993000002,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-30160",
+      "formula": "Si(CN2)2",
+      "density": 1.202422664518137,
+      "vol_per_atom": 21.33314905641914,
+      "min_pair_distance": 1.2093931167332097,
+      "aspect_ratio": 1.0,
+      "angle_min": 90.0,
+      "angle_max": 90.0,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-1303766",
+      "formula": "Li2MnCoO4",
+      "density": 4.275608461772768,
+      "vol_per_atom": 9.308902000880586,
+      "min_pair_distance": 1.892109037885789,
+      "aspect_ratio": 1.190815447190811,
+      "angle_min": 61.08875872000001,
+      "angle_max": 77.16954616,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-1224999",
+      "formula": "FeCoB2",
+      "density": 7.199485796893095,
+      "vol_per_atom": 7.865070478489954,
+      "min_pair_distance": 1.8207473362048698,
+      "aspect_ratio": 1.7543329496884768,
+      "angle_min": 90.0,
+      "angle_max": 90.0,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-29658",
+      "formula": "ZrNiH3",
+      "density": 6.340586424965525,
+      "vol_per_atom": 8.01076916350587,
+      "min_pair_distance": 1.6553525869913455,
+      "aspect_ratio": 1.2803015807972669,
+      "angle_min": 90.0,
+      "angle_max": 143.03784766,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-765552",
+      "formula": "Li2MnCoO4",
+      "density": 4.245613217215285,
+      "vol_per_atom": 9.374669365403062,
+      "min_pair_distance": 1.9463630212951684,
+      "aspect_ratio": 1.040799725896002,
+      "angle_min": 60.85026419,
+      "angle_max": 88.48442247000001,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-31138",
+      "formula": "MnPd3",
+      "density": 10.192077128367151,
+      "vol_per_atom": 15.24150733481381,
+      "min_pair_distance": 2.7754871415855433,
+      "aspect_ratio": 1.0,
+      "angle_min": 39.04235847000001,
+      "angle_max": 152.66541852,
+      "flags": [
+        "angle_max"
+      ]
+    },
+    {
+      "row_id": "mp-1185790",
+      "formula": "Mg3Sc",
+      "density": 2.138723657395777,
+      "vol_per_atom": 22.879212771176977,
+      "min_pair_distance": 3.186534990117086,
+      "aspect_ratio": 1.0,
+      "angle_min": 90.0,
+      "angle_max": 90.0,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-976843",
+      "formula": "Li2Mg",
+      "density": 1.032210088785174,
+      "vol_per_atom": 20.477422220469844,
+      "min_pair_distance": 2.9760650718231614,
+      "aspect_ratio": 1.180349030971841,
+      "angle_min": 31.095206650000005,
+      "angle_max": 74.17964428000002,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-1112542",
+      "formula": "CsTlI3",
+      "density": 4.733481890747889,
+      "vol_per_atom": 50.37605166439515,
+      "min_pair_distance": 3.0614460598819293,
+      "aspect_ratio": 1.0,
+      "angle_min": 59.999999999999986,
+      "angle_max": 59.99999999999999,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-1206113",
+      "formula": "UFeSi2",
+      "density": 9.264733207830368,
+      "vol_per_atom": 15.684835059263039,
+      "min_pair_distance": 2.232517240653869,
+      "aspect_ratio": 2.202048566215694,
+      "angle_min": 90.0,
+      "angle_max": 154.3388413,
+      "flags": [
+        "angle_max"
+      ]
+    },
+    {
+      "row_id": "mp-22759",
+      "formula": "CoBW",
+      "density": 13.555392900408012,
+      "vol_per_atom": 10.354709404880795,
+      "min_pair_distance": 2.097600668483849,
+      "aspect_ratio": 2.0352619027021324,
+      "angle_min": 90.0,
+      "angle_max": 90.0,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-12017",
+      "formula": "CeAl4Ge2Au",
+      "density": 5.933236377437181,
+      "vol_per_atom": 20.650565408031163,
+      "min_pair_distance": 2.591496542995051,
+      "aspect_ratio": 1.0000000083527285,
+      "angle_min": 22.826814460000016,
+      "angle_max": 22.826815550000013,
+      "flags": [
+        "angle_min"
+      ]
+    },
+    {
+      "row_id": "mp-2403",
+      "formula": "YPt3",
+      "density": 15.887428156379528,
+      "vol_per_atom": 17.61558632280254,
+      "min_pair_distance": 2.920590715499263,
+      "aspect_ratio": 1.0,
+      "angle_min": 90.0,
+      "angle_max": 90.0,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-1286297",
+      "formula": "Mg3Fe2O5",
+      "density": 4.377040928308683,
+      "vol_per_atom": 10.03833333777278,
+      "min_pair_distance": 2.0899885607694455,
+      "aspect_ratio": 1.5320529006982597,
+      "angle_min": 71.42550137,
+      "angle_max": 103.08234700000001,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-1023488",
+      "formula": "Mg15Sb",
+      "density": 2.19414282607901,
+      "vol_per_atom": 23.003808665180745,
+      "min_pair_distance": 3.17556785895153,
+      "aspect_ratio": 1.6456637512902743,
+      "angle_min": 90.0,
+      "angle_max": 119.99999715999999,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-696701",
+      "formula": "HPbClO",
+      "density": 5.923172975905796,
+      "vol_per_atom": 18.198697766086816,
+      "min_pair_distance": 0.9762509837758253,
+      "aspect_ratio": 2.4467525389544695,
+      "angle_min": 90.0,
+      "angle_max": 90.0,
+      "flags": [
+        "min_pair_distance"
+      ]
+    },
+    {
+      "row_id": "mp-1106127",
+      "formula": "Ba2DyInSe5",
+      "density": 5.636575663915842,
+      "vol_per_atom": 30.99107584896324,
+      "min_pair_distance": 2.560497558284018,
+      "aspect_ratio": 1.3809620358741546,
+      "angle_min": 90.0,
+      "angle_max": 154.49720189,
+      "flags": [
+        "angle_max"
+      ]
+    },
+    {
+      "row_id": "mp-755684",
+      "formula": "SrCa2I6",
+      "density": 3.7494667433465465,
+      "vol_per_atom": 45.72435647159876,
+      "min_pair_distance": 3.154168194125763,
+      "aspect_ratio": 1.901904912369536,
+      "angle_min": 90.0,
+      "angle_max": 90.0,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-1188975",
+      "formula": "La(Fe2B)6",
+      "density": 7.286642444231031,
+      "vol_per_atom": 10.481790552615337,
+      "min_pair_distance": 2.0553418364458333,
+      "aspect_ratio": 1.000000019748918,
+      "angle_min": 104.26129916,
+      "angle_max": 104.26131026000002,
+      "flags": [
+        "vol_per_atom"
+      ]
+    },
+    {
+      "row_id": "mp-1030448",
+      "formula": "Te6MoW3Se2",
+      "density": 6.197424699123941,
+      "vol_per_atom": 35.077388231662034,
+      "min_pair_distance": 2.5893759873647086,
+      "aspect_ratio": 11.329059752324177,
+      "angle_min": 90.0,
+      "angle_max": 119.99999730999998,
+      "flags": [
+        "aspect_ratio"
+      ]
+    },
+    {
+      "row_id": "mp-24124",
+      "formula": "NdH2ClO2",
+      "density": 4.546533012570829,
+      "vol_per_atom": 13.008933476167172,
+      "min_pair_distance": 0.9761134384421333,
+      "aspect_ratio": 1.767473189335232,
+      "angle_min": 67.43675597,
+      "angle_max": 90.0,
+      "flags": [
+        "min_pair_distance"
+      ]
+    },
+    {
+      "row_id": "mp-1183643",
+      "formula": "CdAu3",
+      "density": 15.608991012900612,
+      "vol_per_atom": 18.70516335101376,
+      "min_pair_distance": 2.9419418018169243,
+      "aspect_ratio": 1.0,
+      "angle_min": 68.48071190000002,
+      "angle_max": 133.11047173000003,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-865939",
+      "formula": "LiMg2",
+      "density": 1.4748130449119061,
+      "vol_per_atom": 20.848881182108265,
+      "min_pair_distance": 2.957994212168245,
+      "aspect_ratio": 1.0000000000000002,
+      "angle_min": 50.394073629999994,
+      "angle_max": 144.96004284000003,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-1227052",
+      "formula": "CaHF",
+      "density": 2.424832014482914,
+      "vol_per_atom": 13.715369245935689,
+      "min_pair_distance": 2.3729953440815517,
+      "aspect_ratio": 1.0,
+      "angle_min": 59.99999999999999,
+      "angle_max": 59.99999999999999,
+      "flags": [
+        "density"
+      ]
+    },
+    {
+      "row_id": "mp-4075",
+      "formula": "TbZrSb",
+      "density": 8.04392096586523,
+      "vol_per_atom": 25.591582695070006,
+      "min_pair_distance": 3.030542283561298,
+      "aspect_ratio": 1.0,
+      "angle_min": 39.85408922000001,
+      "angle_max": 152.10903996,
+      "flags": [
+        "angle_max"
+      ]
+    },
+    {
+      "row_id": "mp-1104139",
+      "formula": "Ta5(NiP)4",
+      "density": 12.08733132261608,
+      "vol_per_atom": 13.351158699818548,
+      "min_pair_distance": 2.2133732241873108,
+      "aspect_ratio": 1.0000000000000002,
+      "angle_min": 93.41078439,
+      "angle_max": 151.76461832,
+      "flags": [
+        "angle_max"
+      ]
+    },
+    {
+      "row_id": "mp-1113491",
+      "formula": "Cs3ScI6",
+      "density": 3.5996537116070306,
+      "vol_per_atom": 55.5918506992252,
+      "min_pair_distance": 2.8971368085616565,
+      "aspect_ratio": 1.0,
+      "angle_min": 59.99999999999999,
+      "angle_max": 59.99999999999999,
+      "flags": [
+        "vol_per_atom"
+      ]
+    }
+  ]
+}

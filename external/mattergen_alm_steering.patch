@@ -1,0 +1,1566 @@
+diff --git a/.gitignore b/.gitignore
+index aa661ff..6253cd1 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -355,6 +355,15 @@ ASALocalRun/
+ # NVidia Nsight GPU debugger configuration file
+ *.nvuser
+ 
++# mclm: local data caches, build artifacts, and SLURM logs (regenerated locally,
++# never committed). Applied on fresh setups via external/setup_mattergen.sh.
++datasets/cache/
++datasets/mp_20/
++datasets_old_file/
++*.egg-info/
++*.e
++*.o
++
+ # MFractors (Xamarin productivity tool) working folder
+ .mfractor/
+ 
+diff --git a/build_pyg_for_torch29.sh b/build_pyg_for_torch29.sh
+new file mode 100644
+index 0000000..30d2faa
+--- /dev/null
++++ b/build_pyg_for_torch29.sh
+@@ -0,0 +1,91 @@
++#!/usr/bin/env bash
++# Source-build torch_scatter / torch_cluster / torch_sparse for torch 2.9 + cu128 in
++# the active conda env. Required because Rocky 8.10's glibc 2.28 is older than the
++# 2.32 the data.pyg.org pre-built linux_x86_64 wheels require. Building from source
++# links the .so files against the host's glibc instead.
++#
++# Run on an H200 (pg_tata) compute node — login007 has no nvcc. Allocate via:
++#   srun -p pg_tata --gres=gpu:1 --time=01:00:00 --mem=32G --cpus-per-task=8 --pty bash
++#   conda activate llm
++#   cd external/mattergen
++#   bash build_pyg_for_torch29.sh
++#
++# Compile time: ~10-25 min total (8 cores). pyg_lib stays as the manylinux_2_28 wheel
++# already installed (works fine on glibc 2.28).
++#
++# Idempotent: re-running will rebuild and reinstall in place.
++
++set -euo pipefail
++
++if [[ -z "${CONDA_PREFIX:-}${VIRTUAL_ENV:-}" ]]; then
++  echo "ERROR: activate the conda env first (e.g. \`conda activate llm\`)."
++  exit 1
++fi
++
++# Sanity: torch must be importable and CUDA must be available.
++python -c "
++import torch
++assert torch.cuda.is_available(), 'torch.cuda.is_available() is False — are you on a GPU node?'
++print(f'torch {torch.__version__}, cuda {torch.version.cuda}, device {torch.cuda.get_device_name(0)}')
++"
++
++# Sanity: nvcc must be on PATH and match torch's CUDA major.
++if ! command -v nvcc >/dev/null 2>&1; then
++  echo "ERROR: nvcc not on PATH. Try: module load cuda/12.8"
++  exit 1
++fi
++NVCC_VER=$(nvcc --version | grep -oE 'release [0-9]+\.[0-9]+' | awk '{print $2}')
++echo "nvcc release: ${NVCC_VER}"
++
++# H200 / H100 are sm_90; L40S / RTX 4090 are sm_89 (Ada Lovelace);
++# A100 is sm_80; A6000 / 3090 are sm_86. To support multiple arches in one
++# build pass "8.9;9.0" (or whatever set you need) at invocation time:
++#   TORCH_CUDA_ARCH_LIST="8.9;9.0" bash build_pyg_for_torch29.sh
++# Default below targets both H200 and L40S since the cluster has both.
++export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9;9.0}"
++export FORCE_CUDA=1
++export MAX_JOBS=${MAX_JOBS:-8}
++
++# Set CUDA_HOME if not already (some build scripts use it directly).
++export CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}"
++echo "CUDA_HOME: ${CUDA_HOME}"
++echo "TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}"
++
++# Remove any pre-built versions first so pip is forced to recompile.
++pip uninstall -y torch_scatter torch_cluster torch_sparse 2>/dev/null || true
++
++# `-v` makes pip stream the build subprocess output (nvcc lines, gcc lines, etc.)
++# instead of showing one spinner line per package — important when builds take
++# 5-15 min each. Also tee everything to a log so you can inspect later.
++LOG_DIR="${HOME}/mclm_pyg_build_logs"
++mkdir -p "$LOG_DIR"
++
++echo "[1/3] Building torch_scatter 2.1.2 from source (logs → $LOG_DIR/torch_scatter.log) ..."
++pip install -v --no-binary torch_scatter --no-cache-dir --no-build-isolation torch_scatter==2.1.2 \
++  2>&1 | tee "$LOG_DIR/torch_scatter.log"
++
++echo "[2/3] Building torch_cluster 1.6.3 from source (logs → $LOG_DIR/torch_cluster.log) ..."
++pip install -v --no-binary torch_cluster --no-cache-dir --no-build-isolation torch_cluster==1.6.3 \
++  2>&1 | tee "$LOG_DIR/torch_cluster.log"
++
++echo "[3/3] Building torch_sparse 0.6.18 from source (logs → $LOG_DIR/torch_sparse.log) ..."
++pip install -v --no-binary torch_sparse --no-cache-dir --no-build-isolation torch_sparse==0.6.18 \
++  2>&1 | tee "$LOG_DIR/torch_sparse.log"
++
++echo
++echo "Smoke-check (CUDA ops):"
++python -c "
++import torch, torch_scatter, torch_cluster, torch_sparse
++x = torch.randn(8, 16, device='cuda')
++idx = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3], device='cuda')
++out = torch_scatter.scatter_add(x, idx, dim=0)
++print(f'  torch_scatter {torch_scatter.__version__} — scatter_add CUDA OK, out.shape={tuple(out.shape)}')
++print(f'  torch_cluster {torch_cluster.__version__}')
++print(f'  torch_sparse  {torch_sparse.__version__}')
++"
++
++echo
++echo "Done. mattergen import should now succeed:"
++echo "  python -c 'import mattergen, mattergen.adapter; print(\"OK\")'"
++echo
++echo "Reminder: Stage 3a runs need PYTHONPATH=<repo>/src/alm so AtomsMapper resolves."
+diff --git a/datasets/.gitattributes b/datasets/.gitattributes
+deleted file mode 100644
+index e85a43c..0000000
+--- a/datasets/.gitattributes
++++ /dev/null
+@@ -1,2 +0,0 @@
+-alex_mp_20.zip filter=lfs diff=lfs merge=lfs -text
+-mp_20.zip filter=lfs diff=lfs merge=lfs -text
+diff --git a/install_for_h200.sh b/install_for_h200.sh
+new file mode 100644
+index 0000000..bd4489b
+--- /dev/null
++++ b/install_for_h200.sh
+@@ -0,0 +1,112 @@
++#!/usr/bin/env bash
++# Install mattergen (this fork) into the active conda/venv env on an H200 box.
++#
++# Two supported scenarios — the script auto-detects which:
++#   (a) Fresh `mattergen` env (no torch installed yet): installs torch 2.5.1+cu124 +
++#       matching PyG companion wheels, then `pip install -e .`.
++#   (b) Co-install into mclm's `llm` env (torch 2.9.0+cu128 + flash-attn 2.8.3 already
++#       present): leaves torch alone, installs PyG companion wheels matching torch 2.9
++#       + cu128, then `pip install -e .`. This lets ALM (Qwen3 + LoRA + projector +
++#       OrbV3) and MatterGen run in one Python process — useful for real-time serving.
++#
++# pyproject.toml is loosened (torch>=2.5,<2.10; pytorch-lightning>=2.4,<2.6;
++# numpy>=1.26,<3; etc.) so the same install path works for both envs.
++#
++# Usage (a) — fresh env:
++#   conda create -n mattergen python=3.10 -y && conda activate mattergen
++#   cd external/mattergen && bash install_for_h200.sh
++#
++# Usage (b) — co-install into llm:
++#   conda activate llm
++#   cd external/mattergen && bash install_for_h200.sh
++
++set -euo pipefail
++
++if [[ -z "${CONDA_PREFIX:-}${VIRTUAL_ENV:-}" ]]; then
++  echo "ERROR: no conda or venv env detected. Activate one first."
++  exit 1
++fi
++
++PY=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
++if [[ "$PY" != "3.10" ]]; then
++  echo "ERROR: Python 3.10 required (got $PY)."
++  exit 1
++fi
++
++# Detect existing torch.
++TORCH_VERSION=$(python -c "
++try:
++    import torch
++    print(torch.__version__)
++except ImportError:
++    print('')
++" 2>/dev/null)
++
++case "$TORCH_VERSION" in
++  "")
++    echo "[scenario A] no torch installed — installing 2.5.1+cu124."
++    pip install --index-url https://download.pytorch.org/whl/cu124 \
++      torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
++    PYG_TORCH=2.5.0
++    PYG_CU=cu124
++    PYG_PT=pt25
++    PYG_LIB_VER=0.4.0
++    PYG_LIB_TAG="${PYG_PT}${PYG_CU}-cp310-cp310-linux_x86_64"
++    ;;
++  2.9.*)
++    echo "[scenario B-2.9] torch ${TORCH_VERSION} present."
++    echo "  pyg_lib has a manylinux_2_28 build (works on Rocky 8.10's glibc 2.28)."
++    echo "  torch_scatter/cluster/sparse pre-built linux_x86_64 wheels need glibc 2.32"
++    echo "  (verified: data.pyg.org wheels for torch-2.9.0+cu128 link against GLIBC_2.32)."
++    echo "  Installing pyg_lib only here — run build_pyg_for_torch29.sh on a GPU"
++    echo "  compute node to source-build the other three."
++    pip install \
++      "https://data.pyg.org/whl/torch-2.9.0+cu128/pyg_lib-0.6.0+pt29cu128-cp310-cp310-manylinux_2_28_x86_64.whl"
++    pip install -e .
++    echo
++    echo "Next step (on a pg_tata GPU node):"
++    echo "  srun -p pg_tata --gres=gpu:1 --time=01:00:00 --mem=32G --cpus-per-task=8 --pty bash"
++    echo "  conda activate llm  # or whichever env you ran this script in"
++    echo "  cd $(pwd) && bash build_pyg_for_torch29.sh"
++    exit 0
++    ;;
++  2.5.*|2.6.*|2.7.*|2.8.*)
++    MIN=$(echo "$TORCH_VERSION" | awk -F. '{print $1"."$2}')
++    NUM=$(echo "$MIN" | tr -d .)
++    echo "[scenario B'] torch ${TORCH_VERSION} present — assuming cu128 PyG wheels."
++    echo "             If your torch is +cu124 instead, edit PYG_CU below."
++    PYG_TORCH="${MIN}.0"
++    PYG_CU=cu128
++    PYG_PT="pt${NUM}"
++    PYG_LIB_VER=0.4.0
++    PYG_LIB_TAG="${PYG_PT}${PYG_CU}-cp310-cp310-linux_x86_64"
++    ;;
++  *)
++    echo "ERROR: torch ${TORCH_VERSION} not handled by this script. Supported: 2.5–2.9."
++    exit 1
++    ;;
++esac
++
++PYG_BASE="https://data.pyg.org/whl/torch-${PYG_TORCH}+${PYG_CU}"
++echo "[next] PyG companion wheels from ${PYG_BASE}"
++
++# pyg_lib has a different filename pattern (manylinux_2_28 for newer torch).
++# Use the precomputed PYG_LIB_TAG.
++pip install \
++  "${PYG_BASE}/pyg_lib-${PYG_LIB_VER}+${PYG_LIB_TAG}.whl" \
++  "${PYG_BASE}/torch_cluster-1.6.3+${PYG_PT}${PYG_CU}-cp310-cp310-linux_x86_64.whl" \
++  "${PYG_BASE}/torch_scatter-2.1.2+${PYG_PT}${PYG_CU}-cp310-cp310-linux_x86_64.whl" \
++  "${PYG_BASE}/torch_sparse-0.6.18+${PYG_PT}${PYG_CU}-cp310-cp310-linux_x86_64.whl"
++
++echo "[next] mattergen (this fork) + remaining deps ..."
++pip install -e .
++
++echo
++echo "Done. Smoke-check:"
++python -c "
++import torch, pytorch_lightning, mattergen, torch_scatter, torch_cluster, torch_sparse
++print('torch', torch.__version__, '| cuda', torch.version.cuda, '| pl', pytorch_lightning.__version__,
++      '| torch_scatter', torch_scatter.__version__)
++"
++echo
++echo "Reminder: Stage 3a runs need PYTHONPATH=<repo>/src/alm so AtomsMapper resolves."
+diff --git a/mattergen/adapter.py b/mattergen/adapter.py
+index 5c544ad..f004c12 100644
+--- a/mattergen/adapter.py
++++ b/mattergen/adapter.py
+@@ -10,6 +10,8 @@ from mattergen.common.data.types import PropertySourceId
+ from mattergen.denoiser import GemNetTDenoiser, get_chemgraph_from_denoiser_output
+ from mattergen.property_embeddings import (
+     ZerosEmbedding,
++    ZerosEmbeddingFiLM,
++    ZerosEmbeddingSequence,
+     get_property_embeddings,
+     get_use_unconditional_embedding,
+ )
+@@ -39,11 +41,37 @@ class GemNetTAdapter(GemNetTDenoiser):
+ 
+         # we make the choice that new adapter fields do not alter the unconditional score
+         # we therefore need the unconditional embedding for all properties added in the adapter
+-        # to return 0. We hack the unconditional embedding module here to achieve that
++        # to return 0. We hack the unconditional embedding module here to achieve that.
++        # Sequence-bridge (alm_seq_embedding.yaml) installs a sequence-shaped
++        # unconditional with a `K` attribute; dispatch on that to keep the
++        # (B, K, hidden_dim) shape consistent with the conditional forward.
+         for property_embedding in self.property_embeddings_adapt.values():
+-            property_embedding.unconditional_embedding_module = ZerosEmbedding(
+-                hidden_dim=property_embedding.unconditional_embedding_module.hidden_dim,
+-            )
++            u = property_embedding.unconditional_embedding_module
++            # MCLM FIX #1 (learned null): a `Learned*` unconditional opts OUT of the
++            # zeros-rewrite — keep its learnable baseline so CFG steers a deviation
++            # `(cond − learned_null)` instead of the full raw vector `(cond − 0)`,
++            # matching MatterGen's native base-path FT heads. Same output shape as the
++            # Zeros* sibling it would otherwise become.
++            if type(u).__name__.startswith("Learned"):
++                continue
++            # FiLM bridge: discriminator is `num_blocks` (in addition to K).
++            # FiLM emits a (B, K*num_blocks*2*hidden_dim) flat tensor; the
++            # unconditional must match that flat shape with zeros so γ_eff=1,
++            # β_eff=0 (identity) on the unconditional path.
++            num_blocks = getattr(u, "num_blocks", None)
++            K = getattr(u, "K", None)
++            if num_blocks is not None and K is not None:
++                property_embedding.unconditional_embedding_module = ZerosEmbeddingFiLM(
++                    hidden_dim=u.hidden_dim, K=K, num_blocks=num_blocks,
++                )
++            elif K is not None:
++                property_embedding.unconditional_embedding_module = ZerosEmbeddingSequence(
++                    hidden_dim=u.hidden_dim, K=K,
++                )
++            else:
++                property_embedding.unconditional_embedding_module = ZerosEmbedding(
++                    hidden_dim=u.hidden_dim,
++                )
+ 
+     def forward(
+         self,
+@@ -103,6 +131,9 @@ class GemNetTAdapter(GemNetTDenoiser):
+             num_bonds=None,
+             cond_adapt=conditions_adapt_dict,
+             cond_adapt_mask=conditions_adapt_mask_dict,  # when True use unconditional embedding
++            t=t,  # MCLM FIX #3: noise level reaches GemNetTCtrl so the bridge gate
++                  # can be attenuated at high noise (bridge_noise_gate). Harmless
++                  # (accepted + ignored) when noise-gating is off.
+         )
+ 
+         pred_atom_types = self.fc_atom(output.node_embeddings)
+diff --git a/mattergen/common/data/transform.py b/mattergen/common/data/transform.py
+index 7657317..8564f73 100644
+--- a/mattergen/common/data/transform.py
++++ b/mattergen/common/data/transform.py
+@@ -41,6 +41,22 @@ def set_chemical_system_string(sample: ChemGraph) -> ChemGraph:
+     )
+ 
+ 
++def set_composition_count(sample: ChemGraph) -> ChemGraph:
++    """Per-element atom COUNT vector, shape (1, MAX_ATOMIC_NUM+1).
++
++    Sibling of set_chemical_system but preserves the count instead of
++    binarizing to presence: count[Z] = number of atoms of element Z in this
++    structure (index 0 unused). This distinguishes Ni4P4 from Ni2P2, giving a
++    Mechanism-2 cond_field the same exact-multiset information that CSP node
++    features carry for free. Derived on-the-fly from atomic_numbers (no
++    sidecar), exactly like set_chemical_system_string.
++    """
++    counts = torch.eye(MAX_ATOMIC_NUM + 1, device=sample.atomic_numbers.device)[
++        sample.atomic_numbers
++    ].sum(0)[None]
++    return sample.replace(composition_count=counts)
++
++
+ class SetProperty:
+     def __init__(self, property_name: str, value: float | Sequence[str]):
+         self.property_name = property_name
+diff --git a/mattergen/common/gemnet/gemnet.py b/mattergen/common/gemnet/gemnet.py
+index 0e500ad..3d9a7ea 100644
+--- a/mattergen/common/gemnet/gemnet.py
++++ b/mattergen/common/gemnet/gemnet.py
+@@ -574,14 +574,28 @@ class GemNetT(torch.nn.Module):
+ 
+         # Remove 0 sizes
+         block_sizes = torch.masked_select(block_sizes, block_sizes > 0)
+-        id_swap = repeat_blocks(
+-            block_sizes,
+-            repeats=2,
+-            continuous_indexing=False,
+-            start_idx=block_sizes[0],
+-            block_inc=block_sizes[:-1] + block_sizes[1:],
+-            repeat_inc=-block_sizes,
+-        )
++        # Guard: when the diffusion sampler pushes the intermediate lattice
++        # outside the 6 Å radius cutoff (every atom pair is too far apart →
++        # zero neighbors → empty block_sizes), block_sizes[0] raises
++        # IndexError. Seen on seq + FiLM bridges (per-block strong
++        # conditioning) under archetype-specific prompts (perov-app).
++        # An empty id_swap propagates cleanly through the rest of the
++        # forward — get_triplets returns empty id3_*, the bilinear
++        # `if nEdges == 0: return torch.zeros((0,0))` guard at
++        # efficient.py:151-154 fires, and the score for this step is
++        # near-zero. The next predictor step contracts the lattice back
++        # into range. Diagnosed by Sonnet subagent 2026-05-20.
++        if block_sizes.numel() == 0:
++            id_swap = torch.zeros(0, dtype=torch.long, device=neighbors.device)
++        else:
++            id_swap = repeat_blocks(
++                block_sizes,
++                repeats=2,
++                continuous_indexing=False,
++                start_idx=block_sizes[0],
++                block_inc=block_sizes[:-1] + block_sizes[1:],
++                repeat_inc=-block_sizes,
++            )
+ 
+         id3_ba, id3_ca, id3_ragged_idx = self.get_triplets(
+             edge_index,
+diff --git a/mattergen/common/gemnet/gemnet_ctrl.py b/mattergen/common/gemnet/gemnet_ctrl.py
+index 40ee197..f2503f0 100644
+--- a/mattergen/common/gemnet/gemnet_ctrl.py
++++ b/mattergen/common/gemnet/gemnet_ctrl.py
+@@ -4,6 +4,7 @@
+ 
+ # Adapted from https://github.com/FAIR-Chem/fairchem/blob/main/src/fairchem/core/models/gemnet/gemnet.py.
+ 
++import os
+ from typing import Dict, List, Optional
+ 
+ # import numpy as np
+@@ -14,6 +15,7 @@ from torch_scatter import scatter
+ from mattergen.common.data.types import PropertySourceId
+ from mattergen.common.gemnet.gemnet import GemNetT, ModelOutput
+ from mattergen.common.gemnet.utils import inner_product_normalized
++from mattergen.diffusion.model_utils import NoiseLevelEncoding  # MCLM: learned t_enc bridge fusion
+ from mattergen.common.utils.data_utils import (
+     frac_to_cart_coords_with_lattice,
+     lattice_params_to_matrix_torch,
+@@ -39,33 +41,214 @@ class GemNetTCtrl(GemNetT):
+ 
+     """
+ 
+-    def __init__(self, condition_on_adapt: List[PropertySourceId], *args, **kwargs):
++    def __init__(self, condition_on_adapt: List[PropertySourceId], *args,
++                 cond_adapt_use_xattn: Optional[List[PropertySourceId]] = None,
++                 cond_adapt_use_ipa: Optional[List[PropertySourceId]] = None,
++                 cond_adapt_use_film: Optional[List[PropertySourceId]] = None,
++                 cond_adapt_n_heads: int = 4,
++                 cond_adapt_depth: int = 1,
++                 bridge_gate_init: float = 1.0,
++                 bridge_noise_gate: bool = False,
++                 bridge_tenc_fuse: bool = False, **kwargs):
+         super().__init__(*args, **kwargs)
++        # MCLM FIX #3 (noise-aware injection): when True, the alm_embedding bridge
++        # contribution is scaled per-step by w(t)=(1−t). DEPRECATED/RETIRED: the
++        # hand-set linear schedule HURT (9739) — kept only for reproducibility.
++        self.bridge_noise_gate = bool(bridge_noise_gate)
++        # MCLM FIX #3b (LEARNED timestep fusion — Option A, replaces the 1−t gate):
++        # make the cond TOKENS noise-aware before the IP-Adapter cross-attn —
++        # cond_t = LN(cond + MLP([cond, t_enc])), t_enc = native NoiseLevelEncoding(t).
++        # The MLP's final layer is zero-init so the arm starts as an exact no-op; the
++        # post-fusion LN keeps the out_norm magnitude bound. The model LEARNS whether
++        # to suppress/amplify/rotate/ignore the bridge per noise level (vs the crude
++        # 1−t guess). Modules built below; applied in forward() before the per-atom gather.
++        self.bridge_tenc_fuse = bool(bridge_tenc_fuse)
++        # mclm Phase A (2026-05-26): per-block scalar gate that multiplies the
++        # alm_embedding bridge residual before it's added to the atom-feature
++        # stream `h`. Initialized at 1.0 by default to preserve legacy
++        # additive behavior; teacher-student distillation training passes
++        # 1e-3 so the student starts ≈ teacher and the gate grows only where
++        # the bridge contributes useful signal. The gate is a registered
++        # parameter on this module (NOT in cond_adapt_layers / cond_mixin_layers
++        # ModuleDicts) so it lives outside the per-cond_field structure.
++        self.bridge_gate_init = float(bridge_gate_init)
+ 
+         self.condition_on_adapt = condition_on_adapt
+         self.cond_adapt_layers = nn.ModuleDict()
+         self.cond_mixin_layers = nn.ModuleDict()
+         # default value for emb_size_atom is 512
+         self.emb_size_atom = kwargs["emb_size_atom"] if "emb_size_atom" in kwargs else 512
++        # FiLM bridge: for cond fields named here, no per-block cond_adapt /
++        # mixin modules are created — AtomsMapperFiLM owns all parameters
++        # (per-K projection + FiLM head). The decoder side just unflattens
++        # (γ, β) per block and applies multiplicative-affine modulation
++        # h = γ_eff ⊙ h + β_eff, with γ_eff = γ_pred + 1 (identity at init).
++        self.cond_adapt_use_film = set(cond_adapt_use_film or [])
++
++        # Sequence-bridge: for cond fields named here, build a MultiheadAttention
++        # adapter that lets each atom attend over K conditioning tokens, instead
++        # of the original concat-MLP that broadcasts a single 512-d vector. The
++        # zero-init mixin Linear is preserved in both branches so guidance starts
++        # at the unconditional baseline.
++        self.cond_adapt_use_xattn = set(cond_adapt_use_xattn or [])
++        # IP-Adapter bridge: same MHA shape as seq, but (1) V projection is
++        # zero-initialized so softmax(QK^T)*V=0 ⇒ branch outputs 0 at step 0
++        # before mixin gating, and (2) injection happens AFTER int_blocks[i]
++        # (post-block, in forward()), not before.
++        self.cond_adapt_use_ipa = set(cond_adapt_use_ipa or [])
++        # The three sets must be disjoint — a cond field can't be both seq-style
++        # pre-block injection AND ipa-style post-block injection AND film-style
++        # multiplicative modulation at once.
++        _overlap_xi = self.cond_adapt_use_xattn & self.cond_adapt_use_ipa
++        _overlap_xf = self.cond_adapt_use_xattn & self.cond_adapt_use_film
++        _overlap_if = self.cond_adapt_use_ipa & self.cond_adapt_use_film
++        if _overlap_xi or _overlap_xf or _overlap_if:
++            raise ValueError(
++                "cond fields cannot be in more than one of "
++                "cond_adapt_use_xattn / _use_ipa / _use_film: "
++                f"x∩i={_overlap_xi}, x∩f={_overlap_xf}, i∩f={_overlap_if}"
++            )
++        self.cond_adapt_n_heads = cond_adapt_n_heads
++        # `cond_adapt_depth` stacks N cross-attention layers per gemnet block.
++        # depth=1 (default) matches the original seq variant (one MHA per block).
++        # depth>=2 gives cond_adapt more capacity to process the K conditioning
++        # tokens — adds ~1M params per depth-step per cond.
++        self.cond_adapt_depth = max(1, int(cond_adapt_depth))
++        if (self.cond_adapt_use_xattn or self.cond_adapt_use_ipa) and \
++                self.emb_size_atom % cond_adapt_n_heads != 0:
++            raise ValueError(
++                f"cond_adapt_n_heads={cond_adapt_n_heads} must divide "
++                f"emb_size_atom={self.emb_size_atom}"
++            )
+ 
+         for cond in condition_on_adapt:
++            if cond in self.cond_adapt_use_film:
++                # FiLM bridge owns its params in AtomsMapperFiLM; nothing to
++                # create on the decoder side. Skip module construction.
++                continue
++
+             adapt_layers = []
+             mixin_layers = []
+ 
+             for _ in range(self.num_blocks):
+-                adapt_layers.append(
+-                    nn.Sequential(
+-                        nn.Linear(self.emb_size_atom * 2, self.emb_size_atom),
+-                        nn.ReLU(),
+-                        nn.Linear(self.emb_size_atom, self.emb_size_atom),
++                if cond in self.cond_adapt_use_ipa:
++                    # IP-Adapter cross-attention. IPA_INIT_MODE selects the
++                    # init scheme (A/B/C) — see progress.tex 2026-05-22
++                    # "Bridge-conditioning audit": the original (V=0 +
++                    # cond_mixin=0) is a stacked-zero gradient fixed point.
++                    mha = nn.MultiheadAttention(
++                        embed_dim=self.emb_size_atom,
++                        num_heads=self.cond_adapt_n_heads,
++                        batch_first=True,
++                    )
++                    ipa_init_mode = os.environ.get("IPA_INIT_MODE", "A").upper()
++                    ipa_c_scale = float(os.environ.get("IPA_C_SCALE", "1e-3"))
++                    with torch.no_grad():
++                        E = self.emb_size_atom
++                        if ipa_init_mode == "A":
++                            pass  # standard random V (matches seq pattern)
++                        elif ipa_init_mode == "B":
++                            mha.in_proj_weight[2 * E : 3 * E, :].zero_()
++                            if mha.in_proj_bias is not None:
++                                mha.in_proj_bias[2 * E : 3 * E].zero_()
++                        elif ipa_init_mode == "C":
++                            mha.in_proj_weight[2 * E : 3 * E, :].mul_(ipa_c_scale)
++                            if mha.in_proj_bias is not None:
++                                mha.in_proj_bias[2 * E : 3 * E].mul_(ipa_c_scale)
++                        else:
++                            raise ValueError(f"Unknown IPA_INIT_MODE={ipa_init_mode!r}; expected A/B/C")
++                    adapt_layers.append(mha)
++                elif cond in self.cond_adapt_use_xattn:
++                    # Stack `cond_adapt_depth` MHA layers per gemnet block. With
++                    # depth=1 this is a single MHA (the original seq variant); with
++                    # depth>=2 the per-atom queries pass through multiple cross-
++                    # attention layers, refining the conditioning-driven update.
++                    if self.cond_adapt_depth == 1:
++                        adapt_layers.append(
++                            nn.MultiheadAttention(
++                                embed_dim=self.emb_size_atom,
++                                num_heads=self.cond_adapt_n_heads,
++                                batch_first=True,
++                            )
++                        )
++                    else:
++                        adapt_layers.append(
++                            nn.ModuleList([
++                                nn.MultiheadAttention(
++                                    embed_dim=self.emb_size_atom,
++                                    num_heads=self.cond_adapt_n_heads,
++                                    batch_first=True,
++                                )
++                                for _ in range(self.cond_adapt_depth)
++                            ])
++                        )
++                else:
++                    # Original concat-MLP path (byte-identical to pre-seq-bridge code).
++                    adapt_layers.append(
++                        nn.Sequential(
++                            nn.Linear(self.emb_size_atom * 2, self.emb_size_atom),
++                            nn.ReLU(),
++                            nn.Linear(self.emb_size_atom, self.emb_size_atom),
++                        )
+                     )
+-                )
+                 mixin_layers.append(nn.Linear(self.emb_size_atom, self.emb_size_atom, bias=False))
+-                nn.init.zeros_(mixin_layers[-1].weight)
++                # cond_mixin init: for IPA conds, IPA_INIT_MODE selects A/B/C.
++                # For pool / seq / concat-MLP conds, always zero-init (unchanged).
++                if cond in self.cond_adapt_use_ipa:
++                    ipa_init_mode = os.environ.get("IPA_INIT_MODE", "A").upper()
++                    ipa_c_scale = float(os.environ.get("IPA_C_SCALE", "1e-3"))
++                    if ipa_init_mode == "A":
++                        nn.init.zeros_(mixin_layers[-1].weight)
++                    elif ipa_init_mode == "B":
++                        pass  # standard random init (Kaiming uniform)
++                    elif ipa_init_mode == "C":
++                        with torch.no_grad():
++                            mixin_layers[-1].weight.mul_(ipa_c_scale)
++                    else:
++                        raise ValueError(f"Unknown IPA_INIT_MODE={ipa_init_mode!r}; expected A/B/C")
++                else:
++                    nn.init.zeros_(mixin_layers[-1].weight)
+ 
+             self.cond_adapt_layers[cond] = torch.nn.ModuleList(adapt_layers)
+             self.cond_mixin_layers[cond] = torch.nn.ModuleList(mixin_layers)
+ 
++        # Bridge gate (Phase A teacher-student distillation): per-block
++        # scalar applied to the alm_embedding cond_mixin output before the
++        # residual add. Default init=1.0 preserves legacy additive
++        # behavior byte-identical for runs without --teacher_ckpt.
++        # Distillation runs pass bridge_gate_init=1e-3 → gradient descent
++        # decides whether the bridge contributes signal. Other cond_fields
++        # (chemical_system, space_group) keep their existing un-gated path.
++        if "alm_embedding" in condition_on_adapt:
++            self.bridge_gate = torch.nn.Parameter(
++                torch.full((self.num_blocks,), self.bridge_gate_init,
++                           dtype=torch.float32)
++            )
++        else:
++            self.bridge_gate = None  # no alm_embedding cond_field → no gate
++
++        # MCLM FIX #3b: learned timestep-fusion modules for the token-cross-attn
++        # bridges (xattn/ipa). Per fused cond_field: an MLP([cond, t_enc])→cond (final
++        # layer zero-init ⇒ no-op at step 0) and a post-fusion LayerNorm (preserves the
++        # out_norm magnitude bound). t_enc is the native MatterGen NoiseLevelEncoding at
++        # the cond-token dim. Applied in forward() to the (N_cryst, M, H) tokens BEFORE
++        # the per-atom gather, so the bridge becomes noise-aware (learned, not 1−t).
++        self.tenc_fuse_mlp = nn.ModuleDict()
++        self.tenc_fuse_ln = nn.ModuleDict()
++        self.tenc_encoding = None
++        if self.bridge_tenc_fuse:
++            _H = self.emb_size_atom
++            self.tenc_encoding = NoiseLevelEncoding(_H)
++            _fuse_fields = [c for c in condition_on_adapt
++                            if c in self.cond_adapt_use_ipa or c in self.cond_adapt_use_xattn]
++            for cond in _fuse_fields:
++                mlp = nn.Sequential(
++                    nn.Linear(2 * _H, _H), nn.SiLU(), nn.Linear(_H, _H))
++                nn.init.zeros_(mlp[-1].weight)   # zero-init final ⇒ fusion = 0 at init
++                nn.init.zeros_(mlp[-1].bias)
++                self.tenc_fuse_mlp[cond] = mlp
++                self.tenc_fuse_ln[cond] = nn.LayerNorm(_H)
++
+     def forward(
+         self,
+         z: torch.Tensor,
+@@ -82,6 +265,7 @@ class GemNetTCtrl(GemNetT):
+         charges: Optional[torch.Tensor] = None,
+         cond_adapt: Optional[Dict[PropertySourceId, torch.Tensor]] = None,
+         cond_adapt_mask: Optional[Dict[PropertySourceId, torch.Tensor]] = None,
++        t: Optional[torch.Tensor] = None,
+     ) -> ModelOutput:
+         """
+         args:
+@@ -185,21 +369,135 @@ class GemNetTCtrl(GemNetT):
+         # use a ModuleDict for adapt layers and mixin layers.
+         # use a dictionary to track the conditions?
+ 
++        # FiLM bridge: precompute per-atom (γ, β) for each block once, outside
++        # the per-block loop. cond_adapt[cond] is (N_cryst, K*L*2*H) flat
++        # (matches AtomsMapperFiLM output); reshape, mean-pool over K, gather
++        # per-atom via `batch`. The K-mean pool reduces (K, L, 2, H) → (L, 2, H);
++        # per-K FiLM would require attention over K, defeating the simplicity.
++        # Stash here for cheap indexing in the per-block loop.
++        film_gamma_per_atom: Dict[PropertySourceId, torch.Tensor] = {}
++        film_beta_per_atom: Dict[PropertySourceId, torch.Tensor] = {}
++
++        # MCLM FIX #3b (learned timestep fusion): make the bridge cond TOKENS noise-aware
++        # BEFORE the per-atom gather / cross-attn. Per-crystal (N_cryst, M, H) tokens:
++        # cond_t = LN(cond + MLP([cond, t_enc])), t_enc = NoiseLevelEncoding(t). Zero-init
++        # MLP final ⇒ exact no-op at init; post-LN preserves the out_norm bound. The model
++        # learns the noise-dependence (replaces the retired hand-set 1−t gate).
++        if (self.bridge_tenc_fuse and t is not None and cond_adapt is not None
++                and len(self.tenc_fuse_mlp) > 0):
++            _tt = t.reshape(-1).float()
++            if _tt.numel() == 1:
++                _tt = _tt.expand(num_atoms.shape[0])
++            cond_adapt = dict(cond_adapt)  # shallow copy; don't mutate caller's dict
++            for cond, mlp in self.tenc_fuse_mlp.items():
++                if cond not in cond_adapt:
++                    continue
++                ct = cond_adapt[cond]                                  # (N_cryst, M, H)
++                te = self.tenc_encoding(_tt).to(ct.dtype)              # (N_cryst, H)
++                te_b = te.unsqueeze(1).expand(-1, ct.shape[1], -1)     # (N_cryst, M, H)
++                fused = mlp(torch.cat([ct, te_b], dim=-1))             # 0 at init (zero-init final)
++                cond_adapt[cond] = self.tenc_fuse_ln[cond](ct + fused)
++
+         if cond_adapt is not None and cond_adapt_mask is not None:
+             cond_adapt_per_atom = {}
+             cond_adapt_mask_per_atom = {}
+             for cond in self.condition_on_adapt:
+-                cond_adapt_per_atom[cond] = cond_adapt[cond][batch]
++                if cond in self.cond_adapt_use_film:
++                    # cond_adapt[cond] shape (N_cryst, K*L*2*H). Unflatten.
++                    N_cryst = cond_adapt[cond].shape[0]
++                    K = cond_adapt[cond].shape[1] // (self.num_blocks * 2 * self.emb_size_atom)
++                    γβ = cond_adapt[cond].view(
++                        N_cryst, K, self.num_blocks, 2, self.emb_size_atom,
++                    )
++                    γβ = γβ.mean(dim=1)                                # (N_cryst, L, 2, H)
++                    γ_all = γβ[:, :, 0, :]                              # (N_cryst, L, H)
++                    β_all = γβ[:, :, 1, :]
++                    film_gamma_per_atom[cond] = γ_all[batch]            # (N_atoms, L, H)
++                    film_beta_per_atom[cond] = β_all[batch]
++                elif cond in self.cond_adapt_use_xattn or cond in self.cond_adapt_use_ipa:
++                    # cond_adapt[cond] shape (N_cryst, K, dim_cond); gather to
++                    # (N_atoms, K, dim_cond) so each atom carries its crystal's
++                    # K conditioning tokens for MultiheadAttention as K/V.
++                    cond_adapt_per_atom[cond] = cond_adapt[cond][batch]
++                else:
++                    # (N_cryst, dim_cond) -> (N_atoms, dim_cond) broadcast, unchanged.
++                    cond_adapt_per_atom[cond] = cond_adapt[cond][batch]
+                 # 1 = use conditional embedding, 0 = use unconditional embedding
+                 cond_adapt_mask_per_atom[cond] = 1.0 - cond_adapt_mask[cond][batch].float()
+ 
++        # MCLM FIX #3: per-atom noise-aware bridge weight w(t)=(1−t), broadcast from
++        # per-crystal t to atoms via `batch`. Attenuates the alm_embedding bridge at
++        # high noise. None (no scaling) when the gate is off or t is absent.
++        bridge_noise_w = None
++        if self.bridge_noise_gate and t is not None:
++            _t = t.reshape(-1).float()
++            if _t.numel() == 1:
++                _t = _t.expand(num_atoms.shape[0])
++            _w = (1.0 - _t).clamp(0.0, 1.0)              # (N_cryst,)
++            bridge_noise_w = _w[batch].unsqueeze(-1)      # (N_atoms, 1)
++
+         for i in range(self.num_blocks):
++            # Pre-block FiLM: γ_eff = γ_pred + 1 (identity init), β_eff = β_pred,
++            # gated to identity by cond_adapt_mask on the unconditional path.
++            if cond_adapt is not None and cond_adapt_mask is not None:
++                for cond in self.condition_on_adapt:
++                    if cond not in self.cond_adapt_use_film:
++                        continue
++                    γ_i = film_gamma_per_atom[cond][:, i, :] + 1.0          # (N_atoms, H)
++                    β_i = film_beta_per_atom[cond][:, i, :]
++                    # cond_adapt_mask_per_atom[cond] is already (N_atoms, 1)
++                    # after the [batch] gather of a (N_cryst, 1) tensor. Do
++                    # NOT unsqueeze again — that'd produce (N_atoms, 1, 1)
++                    # and broadcast h to (N_atoms, N_atoms, H), which crashes
++                    # int_blocks[i] downstream with "Tensors must have same
++                    # number of dimensions: got 3 and 2" at embedding_block
++                    # h_s/h_t concat.
++                    m_mask = cond_adapt_mask_per_atom[cond]                  # (N_atoms, 1)
++                    γ_eff = m_mask * γ_i + (1.0 - m_mask) * 1.0
++                    β_eff = m_mask * β_i + (1.0 - m_mask) * 0.0
++                    h = γ_eff * h + β_eff
++
++            # Pre-block conditioning: pool (concat-MLP) and seq (xattn) conds
++            # accumulate into h_adapt and are added to h BEFORE int_blocks[i].
++            # IP-Adapter conds are deferred to AFTER int_blocks[i]. FiLM conds
++            # were already applied just above.
+             h_adapt = torch.zeros_like(h)
+             for cond in self.condition_on_adapt:
+-                h_adapt_cond = self.cond_adapt_layers[cond][i](
+-                    torch.cat([h, cond_adapt_per_atom[cond]], dim=-1)
+-                )
++                if cond in self.cond_adapt_use_ipa or cond in self.cond_adapt_use_film:
++                    continue   # post-block injection below / already applied
++                if cond in self.cond_adapt_use_xattn:
++                    # Per-atom h is the query; the K conditioning tokens are the K/V.
++                    # For depth=1 cond_adapt_layers[cond][i] is a single MHA; for
++                    # depth>=2 it's a ModuleList of MHA layers — pass q through
++                    # each cross-attention in sequence, with residual additions
++                    # so deeper stacks don't blow up.
++                    q = h.unsqueeze(1)
++                    kv = cond_adapt_per_atom[cond]
++                    layer = self.cond_adapt_layers[cond][i]
++                    if isinstance(layer, nn.ModuleList):
++                        x = q
++                        for mha in layer:
++                            attn_out, _ = mha(x, kv, kv, need_weights=False)
++                            x = x + attn_out
++                        out = x
++                    else:
++                        out, _ = layer(q, kv, kv, need_weights=False)
++                    h_adapt_cond = out.squeeze(1)
++                else:
++                    # Original concat-MLP path — byte-identical.
++                    h_adapt_cond = self.cond_adapt_layers[cond][i](
++                        torch.cat([h, cond_adapt_per_atom[cond]], dim=-1)
++                    )
+                 h_adapt_cond = self.cond_mixin_layers[cond][i](h_adapt_cond)
++                # Phase A: gate the alm_embedding bridge residual; legacy
++                # cond_fields (chemical_system, space_group, etc.) keep the
++                # original un-gated additive path. self.bridge_gate is None
++                # when alm_embedding isn't in condition_on_adapt (no-LLM-bridge
++                # control runs), so this is a no-op there.
++                if cond == "alm_embedding" and self.bridge_gate is not None:
++                    h_adapt_cond = self.bridge_gate[i] * h_adapt_cond
++                    if bridge_noise_w is not None:        # FIX #3: attenuate at high noise
++                        h_adapt_cond = bridge_noise_w * h_adapt_cond
+                 # cond_adapt_mask_per_atom[cond] is 1.0 if we want to use conditional embedding and 0 for unconditional embedding
+                 h_adapt += cond_adapt_mask_per_atom[cond] * h_adapt_cond
+             h = h + h_adapt
+@@ -219,6 +517,29 @@ class GemNetTCtrl(GemNetT):
+                 idx_t=idx_t,
+             )  # (nAtoms, emb_size_atom), (nEdges, emb_size_edge)
+ 
++            # Post-block conditioning: IP-Adapter conds inject AFTER int_blocks[i],
++            # so conditioning modulates neighborhood-aggregated atom features
++            # (the int_block's output) rather than raw atom embeddings. With the
++            # V projection zero-initialized at construction, this branch outputs
++            # exactly zero at step 0 — backbone undisturbed.
++            if cond_adapt is not None and cond_adapt_mask is not None:
++                for cond in self.condition_on_adapt:
++                    if cond not in self.cond_adapt_use_ipa:
++                        continue
++                    q = h.unsqueeze(1)                              # (N_atoms, 1, 512)
++                    kv = cond_adapt_per_atom[cond]                  # (N_atoms, K, 512)
++                    out, _ = self.cond_adapt_layers[cond][i](
++                        q, kv, kv, need_weights=False
++                    )
++                    h_adapt_post = out.squeeze(1)
++                    h_adapt_post = self.cond_mixin_layers[cond][i](h_adapt_post)
++                    # Phase A gate for alm_embedding (same pattern as pre-block).
++                    if cond == "alm_embedding" and self.bridge_gate is not None:
++                        h_adapt_post = self.bridge_gate[i] * h_adapt_post
++                        if bridge_noise_w is not None:    # FIX #3: attenuate at high noise
++                            h_adapt_post = bridge_noise_w * h_adapt_post
++                    h = h + cond_adapt_mask_per_atom[cond] * h_adapt_post
++
+             E, F = self.out_blocks[i + 1](h, m, rbf_out, idx_t)
+             # (nAtoms, num_targets), (nEdges, num_targets)
+             F_st += F
+diff --git a/mattergen/common/gemnet/layers/basis_utils.py b/mattergen/common/gemnet/layers/basis_utils.py
+index 9f06d45..6a9ff85 100644
+--- a/mattergen/common/gemnet/layers/basis_utils.py
++++ b/mattergen/common/gemnet/layers/basis_utils.py
+@@ -5,6 +5,7 @@ Licensed under the MIT License.
+ Adapted from https://github.com/FAIR-Chem/fairchem/blob/main/src/fairchem/core/models/gemnet/layers/basis_utils.py.
+ """
+ 
++import math
+ from typing import Any, List
+ 
+ import numpy as np
+@@ -106,8 +107,8 @@ def sph_harm_prefactor(l_degree: int, m_order: int) -> float:
+     return (
+         (2 * l_degree + 1)
+         / (4 * np.pi)
+-        * np.math.factorial(l_degree - abs(m_order))
+-        / np.math.factorial(l_degree + abs(m_order))
++        * math.factorial(l_degree - abs(m_order))
++        / math.factorial(l_degree + abs(m_order))
+     ) ** 0.5
+ 
+ 
+@@ -177,8 +178,8 @@ def associated_legendre_polynomials(
+                     for m_order in range(1, l_degree + 1):  # P_1(-1), P_2(-1) P_2(-2)
+                         P_l_m[l_degree][-m_order] = sym.simplify(
+                             (-1) ** m_order
+-                            * np.math.factorial(l_degree - m_order)
+-                            / np.math.factorial(l_degree + m_order)
++                            * math.factorial(l_degree - m_order)
++                            / math.factorial(l_degree + m_order)
+                             * P_l_m[l_degree][m_order]
+                         )
+ 
+diff --git a/mattergen/common/gemnet/layers/efficient.py b/mattergen/common/gemnet/layers/efficient.py
+index 461a62e..d124827 100644
+--- a/mattergen/common/gemnet/layers/efficient.py
++++ b/mattergen/common/gemnet/layers/efficient.py
+@@ -154,10 +154,24 @@ class EfficientInteractionBilinear(torch.nn.Module):
+             return torch.zeros((0, 0))
+ 
+         # Create (zero-padded) dense matrix of the neighboring edge embeddings.
+-        Kmax = torch.max(
+-            torch.max(id_ragged_idx) + 1,
+-            torch.tensor(0).to(id_ragged_idx.device),
+-        )
++        # Paired with the gemnet.py:573-595 patch (empty block_sizes → empty
++        # id_swap), this handles the case where edges exist but
++        # id_ragged_idx is empty (no triplets despite having edges — happens
++        # when the diffusion sampler pushes the lattice into degenerate
++        # geometries on archetype-specific prompts). Setting Kmax=0 lets
++        # the downstream matmuls fold to (nEdges, num_spherical, 0) @
++        # (nEdges, 0, emb_size) = (nEdges, num_spherical, emb_size) of zeros,
++        # which propagates correctly through the rest of the forward without
++        # downstream IndexError. The previous attempt to short-circuit-
++        # return (nEdges, units_out) broke that downstream contract; this
++        # path lets the existing matmul chain produce correctly-shaped zeros.
++        if id_ragged_idx.numel() == 0:
++            Kmax = torch.tensor(0, device=id_ragged_idx.device)
++        else:
++            Kmax = torch.max(
++                torch.max(id_ragged_idx) + 1,
++                torch.tensor(0).to(id_ragged_idx.device),
++            )
+         # maximum number of neighbors, catch empty id_reduce_ji with maximum
+         m2 = m.new_zeros(nEdges, Kmax, self.emb_size)
+         m2[id_reduce, id_ragged_idx] = m
+diff --git a/mattergen/common/gemnet/layers/scaling.py b/mattergen/common/gemnet/layers/scaling.py
+index b91dd43..e9bd50a 100644
+--- a/mattergen/common/gemnet/layers/scaling.py
++++ b/mattergen/common/gemnet/layers/scaling.py
+@@ -185,7 +185,12 @@ class ScalingFactor(torch.nn.Module):
+         self.autofit = AutoScaleFit(self.scale_factor, scale_file, name)
+ 
+     def forward(self, x_ref, y):
+-        y = y * self.scale_factor
++        # The scale_factor Parameter sometimes ends up on CPU after empty-graph
++        # passes (the upstream gemnet/efficient/utils patches return zero
++        # tensors that don't carry through the device migration). Cast it to
++        # y.device here defensively — y is the live computational tensor and
++        # always has the right device. Costs nothing if devices already match.
++        y = y * self.scale_factor.to(y.device)
+         self.autofit.observe(x_ref, y)
+ 
+         return y
+diff --git a/mattergen/common/gemnet/utils.py b/mattergen/common/gemnet/utils.py
+index b675da5..1545186 100644
+--- a/mattergen/common/gemnet/utils.py
++++ b/mattergen/common/gemnet/utils.py
+@@ -134,6 +134,19 @@ def repeat_blocks(
+         if isinstance(repeat_inc, torch.Tensor):
+             repeat_inc = torch.masked_select(repeat_inc, sizes_nonzero)
+ 
++    # Third-stage guard (added 2026-05-20): even after masking, if sizes is
++    # fully empty OR all repeats are zero, N=(sizes*repeats).sum() == 0 →
++    # id_ar = torch.ones(0, ...) → id_ar[0] = 0 raises IndexError.
++    # Happens in seq + FiLM bridges (per-block strong conditioning) under
++    # archetype-specific prompts when get_triplets returns empty
++    # id3_ba/id3_ca/id3_ragged_idx and select_symmetric_edges calls
++    # repeat_blocks with empty sizes. Return an empty long tensor; downstream
++    # consumers (indexing into edge arrays) treat empty selection cleanly.
++    if sizes.numel() == 0:
++        return torch.zeros(0, dtype=torch.long, device=sizes.device)
++    if isinstance(repeats, torch.Tensor) and repeats.numel() == 0:
++        return torch.zeros(0, dtype=torch.long, device=sizes.device)
++
+     if isinstance(repeats, torch.Tensor):
+         assert all(repeats >= 0)
+         insert_dummy = repeats[0] == 0
+diff --git a/mattergen/common/utils/globals.py b/mattergen/common/utils/globals.py
+index e35ec6a..c124fde 100644
+--- a/mattergen/common/utils/globals.py
++++ b/mattergen/common/utils/globals.py
+@@ -50,6 +50,20 @@ PROPERTY_SOURCE_IDS = [
+     "ml_bulk_modulus",
+     "chemical_system",
+     "dft_band_gap",
++    # mclm — per-element atom-count vector (100-d + 1), the count-preserving
++    # sibling of chemical_system. Derived on-the-fly by set_composition_count.
++    "composition_count",
++    # mclm Stage 3a — per-row Qwen3 hidden states at K=4 [atoms_{i}] output token
++    # positions, flattened to a (K * llm_hidden_dim,) vector. AtomsMapper (registered
++    # as the conditional_embedding_module in alm_embedding.yaml) projects this into
++    # MatterGen's score-network conditioning space.
++    "alm_embedding",
++    # mclm Stage 3 Part 2 — scalar ±1 directional-edit signal ("make a
++    # higher/lower-energy polymorph"). Embedded exactly like dft_band_gap
++    # (NoiseLevelEncoding sinusoid + StandardScalerTorch) as a SECOND cond_field
++    # alongside alm_embedding (the bridge carries the input structure; this clean
++    # channel carries the direction bit). Stamped at sampling via SetProperty.
++    "task_direction",
+ ]
+ 
+ SELECTED_ATOMIC_NUMBERS = [
+diff --git a/mattergen/conf/data_module/csp_backbone.yaml b/mattergen/conf/data_module/csp_backbone.yaml
+new file mode 100644
+index 0000000..ce9af57
+--- /dev/null
++++ b/mattergen/conf/data_module/csp_backbone.yaml
+@@ -0,0 +1,52 @@
++_target_: mattergen.common.data.datamodule.CrystDataModule
++_recursive_: true
++properties: []
++
++transforms:
++- _target_: mattergen.common.data.transform.symmetrize_lattice
++  _partial_: true
++- _target_: mattergen.common.data.transform.set_chemical_system_string
++  _partial_: true
++- _target_: mattergen.common.data.transform.set_composition_count
++  _partial_: true
++
++dataset_transforms:
++  - _target_: mattergen.common.data.dataset_transform.filter_sparse_properties
++    _partial_: true
++
++average_density: 0.05771451654022283  # safe to reuse MP-20's value for cell-volume init heuristic
++root_dir: ${oc.env:PROJECT_ROOT}/../datasets/cache/csp_backbone
++
++train_dataset:
++  _target_: mattergen.common.data.dataset.CrystalDataset.from_cache_path
++  cache_path: ${data_module.root_dir}/train
++  properties: ${data_module.properties}
++  transforms: ${data_module.transforms}
++  dataset_transforms: ${data_module.dataset_transforms}
++
++val_dataset:
++  _target_: mattergen.common.data.dataset.CrystalDataset.from_cache_path
++  cache_path: ${data_module.root_dir}/val
++  properties: ${data_module.properties}
++  transforms: ${data_module.transforms}
++  dataset_transforms: ${data_module.dataset_transforms}
++
++test_dataset:
++  _target_: mattergen.common.data.dataset.CrystalDataset.from_cache_path
++  cache_path: ${data_module.root_dir}/test
++  properties: ${data_module.properties}
++  transforms: ${data_module.transforms}
++  dataset_transforms: ${data_module.dataset_transforms}
++
++num_workers:
++  train: 0
++  val: 0
++  test: 0
++
++batch_size:
++  # total batch size of 512 (mirrors mp_20.yaml); auto-divides across devices × nodes × grad_accum.
++  train:  ${eval:'(512 // ${trainer.accumulate_grad_batches}) // (${trainer.devices} * ${trainer.num_nodes})'}
++  val: ${eval:'(64 // (${trainer.devices} * ${trainer.num_nodes}))'}
++  test: ${eval:'(64 // (${trainer.devices} * ${trainer.num_nodes}))'}
++
++max_epochs: 900
+diff --git a/mattergen/conf/data_module/mp_20.yaml b/mattergen/conf/data_module/mp_20.yaml
+index 669992c..0fc3fcf 100644
+--- a/mattergen/conf/data_module/mp_20.yaml
++++ b/mattergen/conf/data_module/mp_20.yaml
+@@ -11,8 +11,13 @@ transforms:
+   _partial_: true
+ - _target_: mattergen.common.data.transform.set_chemical_system_string
+   _partial_: true
++# mclm: derive the per-element atom-count vector on-the-fly (inert unless the
++# composition_count cond_field is attached). Lets the CFG teacher condition on
++# the exact atom multiset, matching what CSP node features carry for free.
++- _target_: mattergen.common.data.transform.set_composition_count
++  _partial_: true
+ 
+-dataset_transforms: 
++dataset_transforms:
+   - _target_: mattergen.common.data.dataset_transform.filter_sparse_properties
+     _partial_: true
+ 
+diff --git a/mattergen/conf/lightning_module/default.yaml b/mattergen/conf/lightning_module/default.yaml
+index a5f91c7..61cc890 100644
+--- a/mattergen/conf/lightning_module/default.yaml
++++ b/mattergen/conf/lightning_module/default.yaml
+@@ -9,7 +9,6 @@ scheduler_partials:
+       factor: 0.6
+       patience: 100
+       min_lr: 1e-6
+-      verbose: true
+       _partial_: true
+     interval: epoch
+     frequency: 1
+diff --git a/mattergen/conf/lightning_module/diffusion_module/model/property_embeddings/alm_embedding.yaml b/mattergen/conf/lightning_module/diffusion_module/model/property_embeddings/alm_embedding.yaml
+new file mode 100644
+index 0000000..24f00b7
+--- /dev/null
++++ b/mattergen/conf/lightning_module/diffusion_module/model/property_embeddings/alm_embedding.yaml
+@@ -0,0 +1,33 @@
++# mclm Stage 3a — ALM-derived conditioning channel.
++#
++# At training time, ChemGraph["alm_embedding"] is a (K * llm_hidden_dim,) = (32768,)
++# float32 vector per structure: the K=8 Qwen3-8B final-layer hidden states at the
++# [atoms_{i}] output token positions for the corresponding text prompt, concatenated.
++# AtomsMapper reshapes the flat input to (B, K, hidden_dim), projects each of the K
++# positions independently to (B, K, out_dim), then mean-pools across K → (B, 512).
++# That 512-d vector flows through the adapter's cond_adapt path into GemNetTCtrl.
++# Gradient from L_diff flows back through AtomsMapper into Stage 2 LoRA via Qwen3.
++# AtomsMapper params: ~9M (LLaVA-projector size; was 136M in the prior concat MLP).
++#
++# unconditional_embedding_module is rewritten to ZerosEmbedding by GemNetTAdapter.__init__
++# at adapter.py:43-46 — the choice here is moot but EmbeddingVector matches the
++# pattern of all the existing property_embeddings YAMLs.
++_target_: mattergen.property_embeddings.PropertyEmbedding
++name: alm_embedding
++unconditional_embedding_module:
++  _target_: mattergen.property_embeddings.EmbeddingVector
++  hidden_dim: ${lightning_module.diffusion_module.model.hidden_dim}
++# NOTE: imports atoms_mapper as a bare module name. The mclm `alm/` directory must
++# be on PYTHONPATH when running `mattergen-finetune`/`mattergen-generate` (and at
++# Lightning-checkpoint resume/load), e.g.
++#   PYTHONPATH=<repo>/src/alm:$PYTHONPATH mattergen-finetune ...
++# `alm/` is not a Python package today (alm/__init__.py would collide with alm/alm.py),
++# so a dotted import path won't resolve. PYTHONPATH is the workable option.
++conditional_embedding_module:
++  _target_: bridge.AtomsMapper
++  hidden_dim: 4096   # Qwen3-8B hidden dim; input shape (B, K*hidden_dim) flattens to (B, K, hidden_dim)
++  mid_dim: 2048      # bottleneck inside the per-position MLP
++  out_dim: ${lightning_module.diffusion_module.model.hidden_dim}
++  K: 8
++scaler:
++  _target_: torch.nn.Identity
+diff --git a/mattergen/conf/lightning_module/diffusion_module/model/property_embeddings/composition_count.yaml b/mattergen/conf/lightning_module/diffusion_module/model/property_embeddings/composition_count.yaml
+new file mode 100644
+index 0000000..46cab19
+--- /dev/null
++++ b/mattergen/conf/lightning_module/diffusion_module/model/property_embeddings/composition_count.yaml
+@@ -0,0 +1,10 @@
++_target_: mattergen.property_embeddings.PropertyEmbedding
++name: composition_count
++unconditional_embedding_module:
++  _target_: mattergen.property_embeddings.EmbeddingVector
++  hidden_dim: ${lightning_module.diffusion_module.model.hidden_dim}
++conditional_embedding_module:
++  _target_: mattergen.property_embeddings.CompositionCountEmbedding
++  hidden_dim: ${lightning_module.diffusion_module.model.hidden_dim}
++scaler:
++  _target_: torch.nn.Identity
+diff --git a/mattergen/conf/lightning_module/diffusion_module/model/property_embeddings/task_direction.yaml b/mattergen/conf/lightning_module/diffusion_module/model/property_embeddings/task_direction.yaml
+new file mode 100644
+index 0000000..51b856e
+--- /dev/null
++++ b/mattergen/conf/lightning_module/diffusion_module/model/property_embeddings/task_direction.yaml
+@@ -0,0 +1,10 @@
++_target_: mattergen.property_embeddings.PropertyEmbedding
++name: task_direction
++unconditional_embedding_module:
++  _target_: mattergen.property_embeddings.EmbeddingVector
++  hidden_dim: ${lightning_module.diffusion_module.model.hidden_dim}
++conditional_embedding_module:
++  _target_: mattergen.diffusion.model_utils.NoiseLevelEncoding
++  d_model: ${lightning_module.diffusion_module.model.hidden_dim}
++scaler:
++  _target_: mattergen.common.utils.data_utils.StandardScalerTorch
+diff --git a/mattergen/diffusion/sampling/classifier_free_guidance.py b/mattergen/diffusion/sampling/classifier_free_guidance.py
+index ecd0f39..aa99dc5 100644
+--- a/mattergen/diffusion/sampling/classifier_free_guidance.py
++++ b/mattergen/diffusion/sampling/classifier_free_guidance.py
+@@ -98,3 +98,69 @@ class GuidedPredictorCorrector(PredictorCorrector):
+                     for k in self._multi_corruption.corrupted_fields
+                 }
+             )
++
++
++class MultiBranchGuidedPredictorCorrector(GuidedPredictorCorrector):
++    """Composition-preserving two-scale classifier-free guidance (mclm #118).
++
++    Combines three score evaluations under different conditioning states::
++
++        s = s_null + g_comp * (s_comp - s_null) + g_text * (s_full - s_comp)
++
++    where
++        s_null : all conditioning dropped          (to_null_fn)
++        s_comp : composition kept, text dropped     (to_comp_fn)
++        s_full : all conditioning kept              (to_full_fn)
++
++    Keeping composition pinned in the negative branch lets ``g_text`` amplify the
++    *semantic* (text) residual without fighting composition -- unlike the
++    single-branch ``GuidedPredictorCorrector`` whose negative branch is fully
++    unconditional. Requires a model trained with iid per-field dropout so all
++    three conditioning states are in-distribution, and (ideally) a learned null
++    rather than ``ZerosEmbedding`` for the text field.
++
++    Computed as three *separate* score-model forwards rather than one batched
++    forward: the branches differ only in per-field ``_USE_UNCONDITIONAL_EMBEDDING``
++    state (same structures), so the per-field combination is aligned by
++    construction, and we avoid the collate-then-PyG-index split the single-branch
++    path relies on. Costs ~3x the score evaluations -- acceptable at sampling time.
++    """
++
++    def __init__(
++        self,
++        *,
++        guidance_scale_comp: float,
++        guidance_scale_text: float,
++        to_null_fn: BatchTransform,
++        to_comp_fn: BatchTransform,
++        to_full_fn: BatchTransform | None = None,
++        **kwargs,
++    ):
++        # GuidedPredictorCorrector requires guidance_scale + remove/keep fns; we
++        # override _score_fn, so these are only stand-ins for the base machinery.
++        super().__init__(
++            guidance_scale=1.0,
++            remove_conditioning_fn=to_null_fn,
++            keep_conditioning_fn=to_full_fn,
++            **kwargs,
++        )
++        self._guidance_scale_comp = guidance_scale_comp
++        self._guidance_scale_text = guidance_scale_text
++        self._to_null_fn = to_null_fn
++        self._to_comp_fn = to_comp_fn
++        self._to_full_fn = to_full_fn or identity
++
++    def _score_fn(self, x: Diffusable, t: torch.Tensor) -> Diffusable:
++        # raw (unguided) score model, bypassing GuidedPredictorCorrector._score_fn
++        base = super(GuidedPredictorCorrector, self)
++        s_null = base._score_fn(x=self._to_null_fn(x), t=t)
++        s_comp = base._score_fn(x=self._to_comp_fn(x), t=t)
++        s_full = base._score_fn(x=self._to_full_fn(x), t=t)
++        return s_full.replace(
++            **{
++                k: s_null[k]
++                + self._guidance_scale_comp * (s_comp[k] - s_null[k])
++                + self._guidance_scale_text * (s_full[k] - s_comp[k])
++                for k in self._multi_corruption.corrupted_fields
++            }
++        )
+diff --git a/mattergen/evaluation/reference/reference_dataset_serializer.py b/mattergen/evaluation/reference/reference_dataset_serializer.py
+index 4ddaee7..19f50a4 100644
+--- a/mattergen/evaluation/reference/reference_dataset_serializer.py
++++ b/mattergen/evaluation/reference/reference_dataset_serializer.py
+@@ -98,14 +98,23 @@ class LMDBGZSerializer():
+         gzip_compress(lmdb_file_path, Path(dataset_path).parent)
+ 
+     def deserialize(self, dataset_path: str | os.PathLike) -> ReferenceDataset:
+-        """Reads a dataset from a file using the gzip-compressed LMDB format."""
++        """Reads a dataset from a file using the gzip-compressed LMDB format.
++
++        mclm-stage3b patch: LMDB doesn't allow re-opening the same env path
++        within a single process. The original implementation called
++        `lmdb_read_metadata(lmdb_path, "name")` here AND inside
++        LMDBBackedReferenceDatasetImpl.__init__, which double-opens the env
++        and crashes with "already open in this process" on lmdb>=1.x. Fix:
++        construct the impl FIRST (which opens the env once and stashes it as
++        `impl.env`), then read "name" through that same env.
++        """
+         tempdir = mkdtemp()
+         lmdb_path = gzip_decompress(dataset_path, tempdir)
+-        name = lmdb_read_metadata(lmdb_path, "name")
+-        return ReferenceDataset(
+-            name=name,
+-            impl=LMDBBackedReferenceDatasetImpl(lmdb_path, cleanup_dir=True),
+-        )
++        impl = LMDBBackedReferenceDatasetImpl(lmdb_path, cleanup_dir=True)
++        with impl.env.begin() as txn:
++            name = lmdb_get(txn, "name", default="reference_dataset",
++                            raise_if_missing=False)
++        return ReferenceDataset(name=name, impl=impl)
+ 
+ 
+ class LMDBBackedReferenceDatasetImpl(ReferenceDatasetImpl):
+@@ -147,11 +156,15 @@ class LMDBBackedReferenceDatasetImpl(ReferenceDatasetImpl):
+     def _build_num_entries_by_chemsys_reduced_formulas(
+         self, lmdb_path: Path
+     ) -> dict[str, dict[str, int]]:
+-        chemical_systems = lmdb_read_metadata(lmdb_path, "chemical_systems")
++        # mclm-stage3b patch: read everything through self.env (already open
++        # since __init__ line above) instead of `lmdb_read_metadata(lmdb_path, ...)`
++        # which would try to re-open the same lmdb env and crash with
++        # "already open in this process" on lmdb>=1.x.
+         result: defaultdict[str, dict[str, int]] = defaultdict(dict)
+         with self.env.begin() as txn:
++            chemical_systems = lmdb_get(txn, "chemical_systems")
+             for chemsys in chemical_systems:
+-                reduced_formulas = lmdb_read_metadata(lmdb_path, f"{chemsys}.reduced_formulas")
++                reduced_formulas = lmdb_get(txn, f"{chemsys}.reduced_formulas")
+                 for reduced_formula in reduced_formulas:
+                     result[chemsys][reduced_formula] = lmdb_get(
+                         txn, f"{chemsys}.{reduced_formula}.length"
+diff --git a/mattergen/property_embeddings.py b/mattergen/property_embeddings.py
+index ac9d328..efb3ea7 100644
+--- a/mattergen/property_embeddings.py
++++ b/mattergen/property_embeddings.py
+@@ -346,7 +346,19 @@ class SpaceGroupEmbeddingVector(BaseUnconditionalEmbeddingModule):
+         """
+         Return embedding of the space group, 1 is subtracted from the space group number to
+         make it zero-indexed.
++
++        MCLM Fix 5b (2026-05-25): PropertyEmbedding.forward computes the
++        conditional embedding even for rows that will be masked out by the
++        torch.where(use_unconditional_embedding, ...) gate. If a batch has
++        mixed valid + NaN entries (training uses NaN to mean "missing →
++        route to unconditional"), `x.long()` on a NaN float wraps to a huge
++        negative integer and nn.Embedding raises IndexError. Substitute NaN
++        with a safe sentinel (1) before the lookup; the masked-out positions
++        will be replaced with the unconditional embedding downstream anyway,
++        so the value here doesn't matter as long as it's in [1, 230].
+         """
++        if x.dtype.is_floating_point:
++            x = torch.nan_to_num(x, nan=1.0)
+         return self.embedding(x.long() - 1)
+ 
+ 
+@@ -372,6 +384,126 @@ class ZerosEmbedding(BaseUnconditionalEmbeddingModule):
+         return torch.zeros(len(x), self.hidden_dim)
+ 
+ 
++class EmbeddingSequence(BaseUnconditionalEmbeddingModule):
++    """Sequence-shaped sibling of EmbeddingVector.
++
++    Returns a [n_crystals_in_batch, K, hidden_dim] tensor where each crystal
++    is conditioned on K learnable hidden vectors. Used as the unconditional
++    embedding for the seq-bridge AtomsMapperSeq path, so that the unconditional
++    forward shape matches the conditional (B, K, hidden_dim) output of
++    AtomsMapperSeq under classifier-free guidance.
++    """
++
++    only_depends_on_shape_of_input: bool = True
++
++    def __init__(self, hidden_dim: int, K: int):
++        super().__init__()
++        self.hidden_dim = hidden_dim
++        self.K = K
++        # K learnable embeddings, one per output position.
++        self.embedding = torch.nn.Embedding(K, hidden_dim)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        idx = torch.arange(self.K, device=self.embedding.weight.device)
++        # (K, hidden_dim) -> (n_struct, K, hidden_dim) via broadcast.
++        return self.embedding(idx).unsqueeze(0).expand(len(x), -1, -1)
++
++
++# MCLM FIX #1 (learned null): marker subclasses the adapter zeros-rewrite SKIPS
++# (GemNetTAdapter.__init__ leaves any `Learned*` unconditional in place instead of
++# overwriting it with a ZerosEmbedding*). This gives an adapter cond_field a LEARNED
++# unconditional baseline (like MatterGen's native base-path FT heads) so CFG steers a
++# deviation `(cond − learned_null)` rather than the full raw vector `(cond − 0)`. Same
++# output shape as the Zeros* sibling it replaces ⇒ no torch.where shape-mismatch risk.
++class LearnedEmbeddingSequence(EmbeddingSequence):
++    """Learnable (B, K, hidden_dim) unconditional — sequence bridges (producer-consumer / consumer-only)."""
++    pass
++
++
++class LearnedEmbeddingVector(EmbeddingVector):
++    """Learnable (B, hidden_dim) unconditional — pooled bridges (pool / producer-consumer-pool)."""
++    pass
++
++
++class ZerosEmbeddingSequence(BaseUnconditionalEmbeddingModule):
++    """Sequence-shaped zeros sibling of ZerosEmbedding.
++
++    Returns a [n_crystals_in_batch, K, hidden_dim] zero tensor. Installed by
++    the adapter.py auto-rewrite for seq-bridge unconditional embeddings — its
++    presence is determined by the original unconditional module having a
++    ``K`` attribute.
++    """
++
++    only_depends_on_shape_of_input: bool = True
++
++    def __init__(self, hidden_dim: int, K: int):
++        super().__init__()
++        self.hidden_dim = hidden_dim
++        self.K = K
++
++    def forward(self, x: torch.Tensor | list[str]) -> torch.Tensor:
++        return torch.zeros(len(x), self.K, self.hidden_dim)
++
++
++class EmbeddingFiLM(BaseUnconditionalEmbeddingModule):
++    """FiLM-shaped placeholder used as the unconditional embedding for the
++    FiLM bridge (alm_film_embedding.yaml). Outputs a flat tensor whose layout
++    matches AtomsMapperFiLM's output:
++
++        (B, K * num_blocks * 2 * hidden_dim)
++
++    where the inner axes (when unflattened) are (K, num_blocks, [γ, β], hidden_dim).
++    The adapter.py auto-rewrite swaps this for ZerosEmbeddingFiLM at adapter
++    instantiation time — discriminated by the `num_blocks` attribute, which is
++    NOT present on EmbeddingSequence — so the unconditional path returns
++    exactly zeros (⇒ γ_eff = 0 + 1 = 1, β_eff = 0 in GemNetTCtrl) and acts as
++    an identity on `h`. We keep this class as a sentinel so YAMLs can refer to
++    it without instantiating ZerosEmbeddingFiLM directly.
++    """
++
++    only_depends_on_shape_of_input: bool = True
++
++    def __init__(self, hidden_dim: int, K: int, num_blocks: int):
++        super().__init__()
++        self.hidden_dim = hidden_dim
++        self.K = K
++        self.num_blocks = num_blocks
++        # Placeholder learnable param — adapter.py auto-rewrite replaces this
++        # at runtime with ZerosEmbeddingFiLM. If somehow not replaced (legacy
++        # configs), the zeros init below still produces γ_eff=1, β_eff=0.
++        flat = K * num_blocks * 2 * hidden_dim
++        self.embedding = torch.nn.Embedding(1, flat)
++        torch.nn.init.zeros_(self.embedding.weight)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return self.embedding(
++            torch.zeros(len(x), dtype=torch.long, device=self.embedding.weight.device)
++        )
++
++
++class ZerosEmbeddingFiLM(BaseUnconditionalEmbeddingModule):
++    """FiLM-shaped zeros analog of ZerosEmbedding / ZerosEmbeddingSequence.
++
++    Returns `(B, K * num_blocks * 2 * hidden_dim)` zeros. Installed by the
++    adapter.py auto-rewrite when the original unconditional module has a
++    `num_blocks` attribute (i.e. is an EmbeddingFiLM). Once unflattened in
++    GemNetTCtrl into `(B, K, L, 2, H)` and adding +1 to γ at use time, the
++    unconditional path is exactly the identity on per-atom features `h`.
++    """
++
++    only_depends_on_shape_of_input: bool = True
++
++    def __init__(self, hidden_dim: int, K: int, num_blocks: int):
++        super().__init__()
++        self.hidden_dim = hidden_dim
++        self.K = K
++        self.num_blocks = num_blocks
++
++    def forward(self, x: torch.Tensor | list[str]) -> torch.Tensor:
++        flat = self.K * self.num_blocks * 2 * self.hidden_dim
++        return torch.zeros(len(x), flat)
++
++
+ class ChemicalSystemMultiHotEmbedding(torch.nn.Module):
+     def __init__(self, hidden_dim: int):
+         super().__init__()
+@@ -449,6 +581,45 @@ class ChemicalSystemMultiHotEmbedding(torch.nn.Module):
+         return self.embedding(multi_hot_representation)
+ 
+ 
++class CompositionCountEmbedding(torch.nn.Module):
++    """Embeds a per-element atom-COUNT vector via a single Linear.
++
++    Sibling of ChemicalSystemMultiHotEmbedding, but preserves counts instead of
++    binarizing to presence: the input is shape (n_structures_in_batch,
++    MAX_ATOMIC_NUM + 1) where entry [b, Z] = number of atoms of element Z in
++    structure b. This gives a Mechanism-2 (CFG vector) cond_field the same
++    exact-multiset information that CSP node features carry — Ni4P4 and Ni2P2
++    map to distinct conditioning vectors. The count vector is produced on-the-fly
++    by `transform.set_composition_count` from atomic_numbers (no sidecar).
++    """
++
++    def __init__(self, hidden_dim: int):
++        super().__init__()
++        self.hidden_dim = hidden_dim
++        self.embedding = torch.nn.Linear(in_features=MAX_ATOMIC_NUM + 1, out_features=hidden_dim)
++
++    @property
++    def device(self):
++        return next(self.parameters()).device
++
++    def forward(self, x) -> torch.Tensor:
++        """x: (n_structures_in_batch, MAX_ATOMIC_NUM + 1) float counts.
++
++        Training feeds a tensor via the set_composition_count transform; at
++        sampling time the value may arrive as a list/ndarray (SetProperty only
++        tensor-izes scalars) or with a stray (B,1,D) shape from collation, so
++        coerce defensively to (B, MAX_ATOMIC_NUM+1).
++        """
++        if not torch.is_tensor(x):
++            x = torch.as_tensor(x, dtype=self.embedding.weight.dtype)
++        x = x.to(device=self.device, dtype=self.embedding.weight.dtype)
++        if x.dim() == 1:
++            x = x.unsqueeze(0)
++        elif x.dim() == 3 and x.shape[1] == 1:
++            x = x.squeeze(1)
++        return self.embedding(x)
++
++
+ class PropertyEmbedding(torch.nn.Module):
+     def __init__(
+         self,
+@@ -514,6 +685,14 @@ class PropertyEmbedding(torch.nn.Module):
+                 batch.pos.device
+             )
+ 
++            # `use_unconditional_embedding` is (B, 1). When the embeddings are
++            # higher-rank (e.g. AtomsMapperSeq → (B, K, hidden_dim) for the seq
++            # bridge), pad with trailing-1 dims so torch.where broadcasts cleanly
++            # along the new sequence axes instead of trying to align (B, 1)'s
++            # second dim against the K axis of the embedding (shape mismatch).
++            while use_unconditional_embedding.dim() < conditional_embedding.dim():
++                use_unconditional_embedding = use_unconditional_embedding.unsqueeze(-1)
++
+             return torch.where(
+                 use_unconditional_embedding, unconditional_embedding, conditional_embedding
+             )
+diff --git a/mattergen/scripts/finetune.py b/mattergen/scripts/finetune.py
+index 8273806..0e017f4 100644
+--- a/mattergen/scripts/finetune.py
++++ b/mattergen/scripts/finetune.py
+@@ -62,6 +62,16 @@ def init_adapter_lightningmodule_from_pretrained(
+     diffusion_module_cfg = deepcopy(pretrained_cfg.lightning_module.diffusion_module)
+     denoiser_cfg = diffusion_module_cfg.model
+ 
++    # The denoiser_cfg copy below overwrites adapter_cfg.adapter.gemnet wholesale
++    # with the pretrained GemNet-T config. Preserve any user-supplied gemnet
++    # kwargs (e.g. cond_adapt_use_xattn / cond_adapt_n_heads for the seq bridge)
++    # so they survive the merge.
++    user_gemnet_overrides: dict = {}
++    if "gemnet" in adapter_cfg.adapter:
++        user_gemnet_overrides = (
++            OmegaConf.to_container(adapter_cfg.adapter.gemnet, resolve=False) or {}
++        )
++
+     with open_dict(adapter_cfg.adapter):
+         for k, v in denoiser_cfg.items():
+             # only legacy denoiser configs should contain property_embeddings_adapt
+@@ -82,6 +92,10 @@ def init_adapter_lightningmodule_from_pretrained(
+             adapter_cfg.adapter.property_embeddings_adapt
+         )
+ 
++        # Re-apply user-supplied gemnet overrides clobbered by the denoiser_cfg copy.
++        for k, v in user_gemnet_overrides.items():
++            adapter_cfg.adapter.gemnet[k] = v
++
+     # copy adapter config back into diffusion module config
+     with open_dict(diffusion_module_cfg):
+         diffusion_module_cfg.model = adapter_cfg.adapter
+diff --git a/pyproject.toml b/pyproject.toml
+index 2ce2504..6e516a0 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -42,38 +42,43 @@ classifiers = [
+ ]
+ 
+ dependencies = [
+-"ase<=3.25.0",
++"ase>=3.23,<4",  # loosened from upstream's <=3.25.0; ASE 3.28 is API-compatible and llm env already uses it.
+ "autopep8",
+ "cachetools",
+ "contextlib2",
+ "emmet-core>=0.84.2",  # keep up-to-date together with pymatgen, atomate2
+ "fire", # see https://github.com/google/python-fire
+ "huggingface-hub",
+-"hydra-core==1.3.1",
+-"hydra-joblib-launcher==1.1.5",
++"hydra-core>=1.3.1,<1.4",
++"hydra-joblib-launcher>=1.1.5,<1.3",
+ "jupyterlab>=4.2.5",
+ "lmdb",
+-"matplotlib==3.8.4",
++"matplotlib>=3.8",
+ "matscipy>=0.7.0",
+-"mattersim>=1.1",
+-"monty==2024.7.30 ",  # keep up-to-date together with pymatgen, atomate2
++"mattersim>=1.2",  # 1.1.x pins numpy<2 (incompatible with our llm env's numpy 2.x); 1.2+ uses numpy>=2 for py>=3.10.
++"monty>=2024.7.30",
+ "notebook>=7.2.2",
+-"numpy<2.0",  # pin numpy before breaking changes in 2.0
+-"omegaconf==2.3.0",
++"numpy>=1.26,<3",  # loosened from upstream's <2.0; needed for co-install with llm env (numpy 2.x ABI used by torch 2.9 + flash-attn). MatterGen code uses standard numpy patterns; no known 2.0 incompatibilities.
++"omegaconf>=2.3,<3",
+ "pymatgen>=2024.6.4",
+ "pylint",
+ "pytest",
+-"pytorch-lightning==2.0.6",
++"pytorch-lightning>=2.4,<2.6",  # bumped from upstream's 2.0.6 pin; mclm Stage 3a runs on H200 (CUDA 12.x), needs torch>=2.4 which 2.0.6 doesn't support cleanly. Public PL 2.x APIs used by mattergen (configure_optimizers, training_step, self.log, DDPStrategy, pl.cli.SaveConfigCallback, pl.utilities.rank_zero_only) are stable across this range.
+ "seaborn>=0.13.2",  # for plotting
+ "setuptools<81",
+ "SMACT",
+ "sympy>=1.11.1",
+-"torch==2.2.1+cu118; sys_platform == 'linux'", 
+-"torchvision==0.17.1+cu118; sys_platform == 'linux'",
+-"torchaudio==2.2.1+cu118; sys_platform == 'linux'",
+-"torch==2.4.1; sys_platform == 'darwin'",
+-"torchvision==0.19.1; sys_platform == 'darwin'",
+-"torchaudio==2.4.1; sys_platform == 'darwin'",
++# Bumped from upstream's torch 2.2.1+cu118 (H200 needs CUDA 12.x). Range is wide
++# enough that this pyproject works BOTH in a fresh `mattergen` env (torch 2.5.1+cu124
++# pulled by install_for_h200.sh) AND in the existing `llm` env (torch 2.9.0+cu128
++# already present alongside flash-attn 2.8.3 built for torch 2.9).
++# install_for_h200.sh detects which scenario applies and only installs torch if missing.
++"torch>=2.5,<2.10; sys_platform == 'linux'",
++"torchvision>=0.20,<0.25; sys_platform == 'linux'",
++"torchaudio>=2.5,<2.10; sys_platform == 'linux'",
++"torch>=2.4,<2.10; sys_platform == 'darwin'",
++"torchvision>=0.19,<0.25; sys_platform == 'darwin'",
++"torchaudio>=2.4,<2.10; sys_platform == 'darwin'",
+ "torch_cluster",
+ "torch_geometric>=2.5",
+ "torch_scatter",
+@@ -96,32 +101,36 @@ include = ["mattergen*"]
+ [tool.setuptools.package-data]
+ "*" = ["**.yaml", "**.csv", "**.pt", "**.json"]
+ 
++# NOTE — uv overrides retargeted from cu118 → cu128 to match torch 2.9.x (mclm `llm`
++# env's installed torch). pip does NOT consume [tool.uv.sources] / [tool.uv.index];
++# for pip-based installs run `bash install_for_h200.sh` first — it auto-detects the
++# installed torch (2.5–2.9) and pulls the correct PyG companion wheels.
+ [tool.uv.sources]
+ torch = { index = "pytorch_linux",  marker = "sys_platform == 'linux'" }
+ torchvision = { index = "pytorch_linux",  marker = "sys_platform == 'linux'" }
+ torchaudio = { index = "pytorch_linux",  marker = "sys_platform == 'linux'" }
+ pyg-lib = [
+-  { url = "https://data.pyg.org/whl/torch-2.2.0%2Bcu118/pyg_lib-0.4.0%2Bpt22cu118-cp310-cp310-linux_x86_64.whl",  marker = "sys_platform == 'linux'" },
++  { url = "https://data.pyg.org/whl/torch-2.9.0%2Bcu128/pyg_lib-0.6.0%2Bpt29cu128-cp310-cp310-manylinux_2_28_x86_64.whl",  marker = "sys_platform == 'linux'" },
+   { url = "https://data.pyg.org/whl/torch-2.4.0%2Bcpu/pyg_lib-0.4.0%2Bpt24-cp310-cp310-macosx_14_0_universal2.whl",  marker = "sys_platform == 'darwin'" }
+ ]
+ torch_cluster = [
+-  { url = "https://data.pyg.org/whl/torch-2.2.0%2Bcu118/torch_cluster-1.6.3%2Bpt22cu118-cp310-cp310-linux_x86_64.whl",  marker = "sys_platform == 'linux'" },
++  { url = "https://data.pyg.org/whl/torch-2.9.0%2Bcu128/torch_cluster-1.6.3%2Bpt29cu128-cp310-cp310-linux_x86_64.whl",  marker = "sys_platform == 'linux'" },
+   { url = "https://data.pyg.org/whl/torch-2.4.0%2Bcpu/torch_cluster-1.6.3-cp310-cp310-macosx_10_9_universal2.whl",  marker = "sys_platform == 'darwin'"  }
+ ]
+ 
+ torch_scatter = [
+-  { url = "https://data.pyg.org/whl/torch-2.2.0%2Bcu118/torch_scatter-2.1.2%2Bpt22cu118-cp310-cp310-linux_x86_64.whl",  marker = "sys_platform == 'linux'" },
++  { url = "https://data.pyg.org/whl/torch-2.9.0%2Bcu128/torch_scatter-2.1.2%2Bpt29cu128-cp310-cp310-linux_x86_64.whl",  marker = "sys_platform == 'linux'" },
+   { url = "https://data.pyg.org/whl/torch-2.4.0%2Bcpu/torch_scatter-2.1.2-cp310-cp310-macosx_10_9_universal2.whl",  marker = "sys_platform == 'darwin'"  }
+ ]
+ 
+ torch_sparse = [
+-  { url = "https://data.pyg.org/whl/torch-2.2.0%2Bcu118/torch_sparse-0.6.18%2Bpt22cu118-cp310-cp310-linux_x86_64.whl",  marker = "sys_platform == 'linux'" },
++  { url = "https://data.pyg.org/whl/torch-2.9.0%2Bcu128/torch_sparse-0.6.18%2Bpt29cu128-cp310-cp310-linux_x86_64.whl",  marker = "sys_platform == 'linux'" },
+   { url = "https://data.pyg.org/whl/torch-2.4.0%2Bcpu/torch_sparse-0.6.18-cp310-cp310-macosx_11_0_universal2.whl",  marker = "sys_platform == 'darwin'"  }
+ ]
+ 
+ [[tool.uv.index]]
+ name = "pytorch_linux"
+-url = "https://download.pytorch.org/whl/cu118"
++url = "https://download.pytorch.org/whl/cu128"
+ explicit = true
+ 
+ 

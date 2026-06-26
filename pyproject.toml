@@ -1,0 +1,80 @@
+# Atomistic Language Models (ALM) — packaging + tooling config.
+#
+# IMPORTANT — install order (the stack is CUDA-12 only; see README "Installation"):
+#   1. Create the env:        conda env create -f environment.yml   (or: python3.10 -m venv .venv)
+#   2. Install CUDA-12 torch: pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+#   3. Install this package:  pip install -e .          # picks up the deps below WITHOUT replacing torch
+#   4. Fetch + build the MatterGen fork: bash external/setup_mattergen.sh   (not on PyPI)
+#
+# Do NOT let pip pull a CUDA-13 torch / nvidia-* wheel — they collide with the
+# cu128 .so paths. Always install torch first, then `pip install -e .`.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atomistic-language-models"
+version = "0.1.0"
+description = "A Qwen3-8B backbone bridged to a diffusion crystal decoder for materials understanding, generation, and text-conditioned editing."
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "LearningMatter @ MIT" }]
+keywords = ["materials", "crystal-structure-prediction", "diffusion", "llm", "multimodal"]
+
+# Versions track the `llm` conda env (see environment.yml). torch and the
+# MatterGen fork are installed out-of-band (see the header) and are intentionally
+# NOT listed here so `pip install -e .` never reinstalls/clobbers the cu128 torch.
+dependencies = [
+    "transformers>=4.57,<5",
+    "peft>=0.19",
+    "accelerate>=1.13",
+    "safetensors>=0.7",
+    "datasets>=4.5",
+    "numpy>=1.26,<3",
+    "scipy>=1.15",
+    "pandas>=2.3",
+    "polars>=1.39",
+    "pyarrow>=23",
+    "scikit-learn>=1.7",
+    "ase>=3.28",
+    "pymatgen>=2025.6",
+    "orb-models>=0.5",      # OrbV3 atomistic encoder (orb_v3_direct_20_omat)
+    "mattersim>=1.2",       # relaxation + single-point energies (eval / FK rewards)
+    "smact>=3.2",           # charge-neutrality validity check
+    "hydra-core>=1.3",      # diffusion config plumbing (also used by the MatterGen fork)
+    "omegaconf>=2.3",
+    "tqdm>=4.67",
+    "wandb>=0.25",
+    "aiohttp>=3.13",        # async client for the LLM-judge eval (app-consistency)
+]
+
+[project.urls]
+Paper = "https://arxiv.org/abs/2606.21395"
+
+# Console entry points (available after `pip install -e .`). The package's
+# __init__ runs the sys.path bootstrap on import, so these resolve the flat
+# module namespace with no per-file boilerplate. Every other script is runnable
+# as `python -m alm.<group>.<name>`; multi-GPU training launches via
+# `torchrun --nproc-per-node=N -m alm.train.stageK`.
+[project.scripts]
+alm-generate       = "alm.inference.generate:main"
+alm-eval-csp       = "alm.eval.generation.eval_csp:main"
+alm-eval-dng       = "alm.eval.generation.eval_dng:main"
+alm-eval-edit      = "alm.eval.generation.eval_edit:main"
+alm-eval-almbench  = "alm.eval.generation.eval_almbench:main"
+alm-eval-llm4mat   = "alm.eval.understanding.eval_llm4mat:main"
+alm-eval-aggregate = "alm.eval.understanding.aggregate_results:main"
+
+[tool.setuptools]
+# src/ layout: the importable package is `alm`. ALM also keeps a flat module
+# namespace on sys.path (see src/alm/_alm_bootstrap.py) so the MatterGen fork's
+# Hydra `_target_`s resolve bridge modules by bare name.
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+alm = ["eval/eval_prompts/*"]
