@@ -7,6 +7,7 @@ import time
 import torch
 from tqdm import tqdm
 
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from paths import DATA_ROOT
 
 
@@ -36,7 +37,7 @@ def main(args):
         runner="pooling",
         dtype="float16",
         enforce_eager=True,
-        tensor_parallel_size=4,       # 4 GPUs per node
+        tensor_parallel_size=args.tensor_parallel_size,
     )
     print(f"LLM loaded")
     time_end = time.time()
@@ -86,5 +87,7 @@ if __name__ == "__main__":
     parser.add_argument("--data", type=str, default=os.path.join(DATA_ROOT, "train.csv"))
     parser.add_argument("--emb_output", type=str, default=os.path.join(DATA_ROOT, "descriptions_embeddings.pt"))
     parser.add_argument("--ids_output", type=str, default=os.path.join(DATA_ROOT, "descriptions_ids.txt"))
+    parser.add_argument("--tensor_parallel_size", type=int, default=4,
+                        help="Number of GPUs vLLM shards the embedding model across.")
     args = parser.parse_args()
     main(args)

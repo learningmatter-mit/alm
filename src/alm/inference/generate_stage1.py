@@ -109,7 +109,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--data_folder", type=str, required=True,
-                        help="Single dataset folder in LLM4Mat-Bench layout, e.g. /tmp/LLM4Mat-Bench/oqmd.")
+                        help="Single dataset folder in LLM4Mat-Bench layout, e.g. <data_root>/LLM4Mat-Bench/oqmd.")
     parser.add_argument("--cached_embs_path", type=str, default=None,
                         help="Full path to {dataset}/embeddings/{model}_{split}_atom.flat.bin. "
                              "If set, skips DB/live OrbV3 (cached-embedding path, matches training).")

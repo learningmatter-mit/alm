@@ -34,7 +34,7 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--alm_checkpoint", type=Path,
-                    default=Path(os.path.join(CHECKPOINTS, "alm_checkpoints/stage2_checkpoints/step=12000")),
+                    default=Path(os.path.join(CHECKPOINTS, "alm-core")),
                     help="Stage-2 base ckpt (the bridge LoRA is overlaid on the merged base).")
     ap.add_argument("--atoms_mapper", type=Path, required=True,
                     help="<bridge variant>/step=N/atoms_mapper.pt (bridge + cond layers).")
@@ -84,8 +84,8 @@ def main():
     ap.add_argument("--bridge_off", action="store_true",
                     help="Stamp a zero alm_embedding (ablation: JSON->csp_backbone == baseline path).")
     ap.add_argument("--composition_source", choices=["teacher", "planner"], default="teacher",
-                    help="teacher (default) = use the prompt's deduped GT element set (== baseline). "
-                         "planner = have the ALM emit a JSON composition from the prompt text.")
+                    help="Target composition: 'teacher' uses the ground-truth composition; "
+                         "'planner' has the ALM propose one from the prompt.")
     ap.add_argument("--prompt_version", default="v5",
                     choices=["v1", "v2", "v3", "v4", "v5"],
                     help="Planner prompt template (only used when composition_source=planner).")
@@ -109,7 +109,7 @@ def main():
         seed=args.prompts_seed,
         parent_filter=None,
     )
-    # Filter on REAL atom count (full multiset); deduped count-1 cells go zero-edge mid-diffusion and crash.
+    # Filter on the full atom count; very small cells have no edges and crash GemNet.
     kept = [(p, pid, els, jc) for p, pid, els, jc in
             zip(prompts, prompt_ids, elements_per_prompt, _json_counts)
             if args.min_n_atoms <= sum(jc.values()) <= args.max_n_atoms]
@@ -206,11 +206,11 @@ def main():
             print(f"  [{i}/{len(kept)}] (t={time.time()-t0:.0f}s) ...", flush=True)
 
         if args.composition_source == "teacher":
-            # GT-composition ceiling arm (full multiset); leaks composition, not the headline.
+            # Oracle composition: use the ground-truth atom counts (upper bound).
             target_comp = dict(jc)
             json_counts_for_bridge = target_comp
         else:
-            # Planner (headline, de-novo): LLM proposes a formula, scaled to [min,max] n_atoms.
+            # Planner: the ALM proposes a formula, scaled up to at least min_n_atoms.
             _txt, parsed = epc.llm_plan(prompt, alm, tok,
                                         prompt_version=args.prompt_version)
             pfu, _fu = epc.comp_from_plan(parsed, args.prompt_version, target_atoms=None)

@@ -145,8 +145,6 @@ def main() -> int:
     ap.add_argument("--atoms_mapper", required=True)
     ap.add_argument("--polymorph_parquet", type=Path,
                     default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_polymorph_under_hull.parquet")))
-    ap.add_argument("--cached_embs_root", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "cached_embs_narratives")))
     ap.add_argument("--mattergen_pretrained", default="mattergen_base")
     ap.add_argument("--out_dir", type=Path, required=True)
     ap.add_argument("--max_rows", type=int, default=100)
@@ -154,9 +152,6 @@ def main() -> int:
     ap.add_argument("--guidance_factor", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--diffusion_seed", type=int, default=1337)
-    ap.add_argument("--score_e_hull", action="store_true",
-                    help="Also relax via MatterSim and report fraction of polymorphs "
-                         "below input's E_hull (slow; off by default).")
     # StructureMatcher tolerances: CDVAE / CrystaLLM defaults
     ap.add_argument("--ltol", type=float, default=0.3)
     ap.add_argument("--stol", type=float, default=0.5)
@@ -275,7 +270,7 @@ def main() -> int:
         for e in examples:
             f.write(json.dumps(e) + "\n")
 
-    print(f"\n[eval_polymorph] HEADLINE ({n_scored} candidates across {len(examples)} prompts):", flush=True)
+    print(f"\n[eval_polymorph] {n_scored} candidates across {len(examples)} prompts:", flush=True)
     print(f"  composition_match             = {headline.get('composition_match', 0):.3f}", flush=True)
     print(f"  structurally_distinct         = {headline.get('structurally_distinct', 0):.3f}", flush=True)
     print(f"  structurally_valid            = {headline.get('structurally_valid', 0):.3f}", flush=True)

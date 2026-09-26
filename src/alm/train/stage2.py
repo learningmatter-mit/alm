@@ -15,6 +15,7 @@ from peft import LoraConfig, get_peft_model
 
 from model import AtomisticLanguageModel
 from samplers import BucketedDistributedSampler
+from paths import DATA_ROOT
 from utils import (
     ArxivAbstractDataset,
     AtomisticLanguageDataset,
@@ -193,73 +194,20 @@ def _print_coverage(lengths, weights, total_optim_steps, effective_batch):
 
 
 def _log_mem(label, main_process):
-    """Log rank-0 RSS + cgroup usage/limit at every level up the hierarchy."""
+    """Log rank-0 resident memory."""
     if not main_process:
         return
-    try:
-        with open(f"/proc/{os.getpid()}/status") as f:
-            rss_kb = next(int(l.split()[1]) for l in f if l.startswith("VmRSS:"))
-        cg = next(l.split(":")[2].strip() for l in open(f"/proc/{os.getpid()}/cgroup")
-                  if "memory" in l or l.split(":")[1] == "")
-        print(f"[mem] {label}: rss={rss_kb/1e6:.2f}GB", flush=True)
-        # Walk up so the binding ancestor limit is visible.
-        path = cg
-        while path and path != "/":
-            for usage_p, limit_p in [
-                (f"/sys/fs/cgroup/memory{path}/memory.usage_in_bytes",
-                 f"/sys/fs/cgroup/memory{path}/memory.limit_in_bytes"),
-                (f"/sys/fs/cgroup{path}/memory.current",
-                 f"/sys/fs/cgroup{path}/memory.max"),
-            ]:
-                if os.path.exists(usage_p) and os.path.exists(limit_p):
-                    u = int(open(usage_p).read())
-                    raw = open(limit_p).read().strip()
-                    lim = "unlimited" if raw == "max" or int(raw) > 1 << 60 else f"{int(raw)/1e9:.2f}GB"
-                    print(f"[mem]   {path}: usage={u/1e9:.2f}GB limit={lim}", flush=True)
-                    break
-            path = os.path.dirname(path)
-    except Exception as e:
-        print(f"[mem] {label}: error ({e})", flush=True)
-
-
-class _MultiOpt(torch.optim.Optimizer):
-    """Two optimizers stepped in lockstep under one scheduler (Muon path); subclasses Optimizer so LambdaLR's isinstance check passes."""
-    def __init__(self, optimizers):
-        super().__init__([torch.nn.Parameter(torch.zeros(1))], {})
-        self.optimizers = optimizers
-        self.param_groups = [g for o in optimizers for g in o.param_groups]
-    def zero_grad(self, set_to_none=True):
-        for o in self.optimizers:
-            o.zero_grad(set_to_none=set_to_none)
-    def step(self, closure=None):
-        for o in self.optimizers:
-            o.step()
-    def state_dict(self):
-        return {"opts": [o.state_dict() for o in self.optimizers]}
-    def load_state_dict(self, sd):
-        for o, s in zip(self.optimizers, sd["opts"]):
-            o.load_state_dict(s)
+    with open(f"/proc/{os.getpid()}/status") as f:
+        rss_kb = next(int(l.split()[1]) for l in f if l.startswith("VmRSS:"))
+    print(f"[mem] {label}: rss={rss_kb/1e6:.2f}GB", flush=True)
 
 
 def _build_optimizer(args, lora_params, projector_params):
-    if args.optimizer == "adamw":
-        return torch.optim.AdamW(
-            [{"params": lora_params,      "lr": args.lora_lr},
-             {"params": projector_params, "lr": args.projector_lr}],
-            betas=(0.9, 0.95), weight_decay=0.01,
-        )
-    if args.optimizer == "muon":
-        from muon import Muon
-        muon_p  = [p for p in lora_params if p.ndim >= 2]
-        adam_p  = [p for p in lora_params if p.ndim < 2] + projector_params
-        return _MultiOpt([
-            Muon(muon_p, lr=args.lora_lr, momentum=0.95),
-            torch.optim.AdamW(
-                [{"params": adam_p, "lr": args.projector_lr}],
-                betas=(0.9, 0.95), weight_decay=0.01,
-            ),
-        ])
-    raise ValueError(f"unknown optimizer: {args.optimizer}")
+    return torch.optim.AdamW(
+        [{"params": lora_params,      "lr": args.lora_lr},
+         {"params": projector_params, "lr": args.projector_lr}],
+        betas=(0.9, 0.95), weight_decay=0.01,
+    )
 
 
 def train(args):
@@ -301,7 +249,7 @@ def train(args):
         atom_bidirectional_attention=args.atom_bidirectional_attention,
     )
 
-    # Wrap fresh then overwrite on resume; PeftModel.from_pretrained hits a version mismatch we bypass.
+    # Load adapter weights by hand on resume; PeftModel.from_pretrained fails on these adapters across peft versions.
     lora_cfg = LoraConfig(
         r=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=0.05,
         bias="none", task_type="CAUSAL_LM", target_modules=LORA_TARGET_MODULES,
@@ -635,10 +583,10 @@ def save_checkpoint(model, optim, scheduler, global_opt_step, save_root, main_pr
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--data_parent_path", type=str, default="/tmp/LLM4Mat-Bench")
-    p.add_argument("--cached_embs_parent_path", type=str, default="/tmp/cached_embs")
-    p.add_argument("--narrative_parquet_dir", type=str, default="/tmp/GPT-Narratives-for-Materials")
-    p.add_argument("--narrative_cache_dir", type=str, default="/tmp/cached_embs_narratives")
+    p.add_argument("--data_parent_path", type=str, default=os.path.join(DATA_ROOT, "LLM4Mat-Bench"))
+    p.add_argument("--cached_embs_parent_path", type=str, default=os.path.join(DATA_ROOT, "cached_embs"))
+    p.add_argument("--narrative_parquet_dir", type=str, default=os.path.join(DATA_ROOT, "GPT-Narratives-for-Materials"))
+    p.add_argument("--narrative_cache_dir", type=str, default=os.path.join(DATA_ROOT, "cached_embs_narratives"))
     p.add_argument("--matterchat_train_csv", type=str,
                    default="data/matterchat/train.csv",
                    help="MatterChat MP train CSV (128k rows). Skipped if missing.")
@@ -651,10 +599,10 @@ if __name__ == "__main__":
     p.add_argument("--matterchat_val_cache", type=str,
                    default="data/matterchat/cached_embs/orb_v3_direct_20_omat_validation_atom.flat.bin",
                    help="OrbV3 cache for matterchat MP val.")
-    p.add_argument("--mascqa_json", type=str, default="/tmp/MaScQA/mascqa-eval.json")
-    p.add_argument("--mascqa_xlsx", type=str, default="/tmp/MaScQA/scoresheets/all_questions.xlsx")
-    p.add_argument("--arxiv_parquet", type=str, default="/tmp/jarvis_arxiv.parquet")
-    p.add_argument("--camel_jsonl",   type=str, default="/tmp/camel_ai.jsonl")
+    p.add_argument("--mascqa_json", type=str, default=os.path.join(DATA_ROOT, "MaScQA/mascqa-eval.json"))
+    p.add_argument("--mascqa_xlsx", type=str, default=os.path.join(DATA_ROOT, "MaScQA/scoresheets/all_questions.xlsx"))
+    p.add_argument("--arxiv_parquet", type=str, default=os.path.join(DATA_ROOT, "jarvis_arxiv.parquet"))
+    p.add_argument("--camel_jsonl",   type=str, default=os.path.join(DATA_ROOT, "camel_ai.jsonl"))
     p.add_argument("--max_num_tokens", type=int, default=2048)
     p.add_argument("--bucket_weights", type=str, default="0.408,0.408,0.14,0.04,0,0",
                    help="order: describe, property_apps, arxiv, camel, mascqa, matterchat (0 = skip). "
@@ -679,21 +627,13 @@ if __name__ == "__main__":
                    help="Per-atom feature dim of the cached embeddings. OrbV3=256, UMA=128, "
                         "PET-MAD variable.")
     p.add_argument("--atom_bidirectional_attention", action="store_true",
-                   help="When set, atoms inside the <atoms>-spliced block attend BIDIRECTIONALLY "
-                        "to each other (instead of the default causal mask). Forces the LLM's "
-                        "attn_implementation to 'sdpa' (flash_attn_2 requires strictly causal). "
-                        "OrbV3 outputs atoms in arbitrary ASE-index order — causal attention "
-                        "imposes a meaningless ordering on a fundamentally unordered set; "
-                        "bidirectional-within-block fixes that. Other tokens (text, output-side "
-                        "[atoms_i]) remain causal. Slower (~10-15%%) than flash_attn_2 but "
-                        "principled.")
+                   help="Let atom tokens attend to each other bidirectionally; text and "
+                        "[atoms_i] tokens stay causal. Switches attention to SDPA, about "
+                        "10-15%% slower than flash-attention-2.")
     p.add_argument("--llm_name", type=str, default="Qwen/Qwen3-8B",
-                   help="HuggingFace model id; used by the scaling-law sweep to swap the "
-                        "base LLM (Qwen/Qwen3-0.6B, -1.7B, -4B, -8B, -14B, -32B).")
+                   help="Base LLM (HuggingFace id), e.g. Qwen/Qwen3-4B.")
     p.add_argument("--lora_rank", type=int, default=64)
     p.add_argument("--lora_alpha", type=int, default=128)
-    p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
-                   help="muon: Newton-Schulz orthogonalized SGD on LoRA 2D mats, AdamW for the rest")
     p.add_argument("--lora_lr", type=float, default=2e-4)
     p.add_argument("--projector_lr", type=float, default=2e-5)
     p.add_argument("--batch_size", type=int, default=12)
@@ -706,8 +646,7 @@ if __name__ == "__main__":
     p.add_argument("--disable_wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default="alm-stage2")
     p.add_argument("--wandb_run_id", type=str, default=None,
-                   help="Resume a specific wandb run by id (e.g. 'vc5cfy32' to keep "
-                        "curves on one plot when changing node count or batch size).")
+                   help="W&B run id to resume, so loss curves continue on the same plot.")
     p.add_argument("--save_dir", type=str, default="runs/stage2")
     p.add_argument("--num_workers", type=int, default=4)
     args = p.parse_args()

@@ -11,11 +11,7 @@ from collections import Counter
 from pathlib import Path
 import torch
 
-from paths import CHECKPOINTS, EVAL_RESULTS
-
-_ALM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-STAGE2 = os.path.join(CHECKPOINTS, "alm_checkpoints/stage2_checkpoints/step=12000")
+from paths import EVAL_RESULTS
 
 # Factual questions paired with acceptable keywords for the cheap cross-check.
 FACTUAL = [
@@ -69,7 +65,7 @@ def detect_loop(text, window=4):
     return c.most_common(1)[0][1] >= 4 if c else False
 
 
-def load_model(mode, bridge_dir, k, device, hf_model_path=None):
+def load_model(mode, bridge_dir, k, device, hf_model_path=None, stage2_checkpoint=None):
     from loader import load_alm
     if mode == "base":
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -95,7 +91,9 @@ def load_model(mode, bridge_dir, k, device, hf_model_path=None):
         alm, tok = load_alm(checkpoint=bridge_dir, merge_lora=True, use_cached_embeddings=True,
                             device=device, num_output_atom_tokens=k)
     else:
-        alm, tok = load_alm(checkpoint=STAGE2, merge_lora=True, use_cached_embeddings=True,
+        if not stage2_checkpoint:
+            raise ValueError(f"mode={mode} requires --stage2_checkpoint")
+        alm, tok = load_alm(checkpoint=stage2_checkpoint, merge_lora=True, use_cached_embeddings=True,
                             device=device, num_output_atom_tokens=k)
         if mode == "part":
             from eval_bridge_csp import apply_bridge_lora
@@ -119,6 +117,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["base", "stage2", "part", "hf"], required=True)
     ap.add_argument("--bridge_dir", default=None, help="step=N dir (mode=part)")
+    ap.add_argument("--stage2_checkpoint", default=None,
+                    help="Stage 2 step=N dir (required for mode=stage2, and for mode=part with a LoRA bridge)")
     ap.add_argument("--hf_model_path", default=None,
                     help="external HF causal-LM dir (mode=hf, e.g. CrystalReasoner)")
     ap.add_argument("--tag", required=True)
@@ -130,7 +130,8 @@ def main():
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[kret:{args.tag}] loading model (mode={args.mode}) ...", flush=True)
-    llm, tok, _ = load_model(args.mode, args.bridge_dir, args.k, device, hf_model_path=args.hf_model_path)
+    llm, tok, _ = load_model(args.mode, args.bridge_dir, args.k, device, hf_model_path=args.hf_model_path,
+                             stage2_checkpoint=args.stage2_checkpoint)
 
     items = []
     t0 = time.time()

@@ -55,14 +55,17 @@ def _apply_lora_adapter(llm, adapter_dir: Path, lora_rank=None, lora_alpha=None,
 
 
 def _infer_from_projector(ckpt_dir: Path, base_model_default: str) -> tuple[str, int]:
-    """Read (base_model, atomistic_feature_dim) from the Stage-2 projector weight shape; falls back to (default, 256)."""
-    try:
-        state = torch.load(ckpt_dir / "projector_and_state.pt", map_location="cpu",
-                           weights_only=False)
-        w = state["projector_state_dict"]["0.weight"]
-        out_dim, in_dim = int(w.shape[0]), int(w.shape[1])
-    except Exception:
+    """Read (base_model, atomistic_feature_dim) from the Stage-2 projector weight shape; returns (default, 256) if there is no projector file."""
+    blob = ckpt_dir / "projector_and_state.pt"
+    if not blob.exists():
         return base_model_default, 256
+    state = torch.load(blob, map_location="cpu", weights_only=False)
+    try:
+        w = state["projector_state_dict"]["0.weight"]
+    except (KeyError, TypeError) as e:
+        raise ValueError(f"{blob} has no projector_state_dict['0.weight']; "
+                         f"the file is corrupt or not an ALM Stage 2 checkpoint") from e
+    out_dim, in_dim = int(w.shape[0]), int(w.shape[1])
     base_model = base_model_default
     # out_dim is the Qwen3 hidden_size; map to the model id.
     for hidden_size, model_id in (
@@ -124,7 +127,7 @@ def load_alm(checkpoint=None, stage1_projector=None,
         proj_state = ckpt.get("projector_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
         model.projector.load_state_dict(proj_state)
     elif (Path(checkpoint) / "llm_full_ft" / "qwen3_state_dict.pt").exists():
-        # Full Qwen3-8B fine-tune (Stage 4): saved state_dict is merged weights, no PEFT wrap.
+        # Full fine-tune checkpoint: the saved state_dict holds merged LLM weights, no PEFT wrapper.
         llm_full_path = Path(checkpoint) / "llm_full_ft" / "qwen3_state_dict.pt"
         full_state = torch.load(str(llm_full_path), map_location=device)
         missing, unexpected = model.llm.load_state_dict(full_state, strict=False)
@@ -134,12 +137,12 @@ def load_alm(checkpoint=None, stage1_projector=None,
         model.projector.load_state_dict(state["projector_state_dict"])
     elif (stage2_base or os.environ.get("ALM_STAGE2_BASE")) and \
             (Path(checkpoint) / "lora_adapter").exists():
-        # Fresh-r8 bridge two-stage load: the r8 adapter only makes sense atop the Stage-2-merged base.
+        # The bridge adapter was trained on the merged Stage 2 model, so merge Stage 2 first.
         if is_trainable:
             raise ValueError("stage2_base two-stage load is eval-only (it merges both "
                              "adapters); drop stage2_base for training resume.")
         s2 = Path(stage2_base or os.environ["ALM_STAGE2_BASE"])
-        print(f"[load_alm] fresh-r8 two-stage load: Stage-2 base {s2} → "
+        print(f"[load_alm] two-stage load: Stage-2 base {s2} → "
               f"bridge adapter {Path(checkpoint)/'lora_adapter'}", flush=True)
         model.llm = _apply_lora_adapter(model.llm, s2 / "lora_adapter", merge=True)
         model.llm = _apply_lora_adapter(model.llm, Path(checkpoint) / "lora_adapter",

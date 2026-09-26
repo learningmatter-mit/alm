@@ -10,6 +10,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 from utils import AtomisticLanguageDataset, custom_collate_fn, is_main_process, FullAtomisticLanguageDataset
 from model import AtomisticLanguageModel
+from paths import DATA_ROOT
 import wandb
 
 
@@ -24,12 +25,10 @@ def train(args):
     use_wandb = main_process and not args.disable_wandb
 
     # Empty string => disabled, fall back to live OrbV3 encoding.
-    print(f"cached_embs_parent_path: {args.cached_embs_parent_path}")
     if not args.cached_embs_parent_path:
         args.cached_embs_parent_path = None
 
     use_cached_embeddings = args.cached_embs_parent_path is not None
-    print(f"use_cached_embeddings: {use_cached_embeddings}")
     model = AtomisticLanguageModel(
         llm_name=args.llm_name,
         atomistic_model_name=args.atomistic_model_name,
@@ -210,7 +209,6 @@ def train(args):
         ):
             if step < initial_step:
                 continue
-            # Early-exit for the scaling-law sweep's tight step budget.
             if args.max_steps is not None and (epoch * len(train_dataloader) + step) >= args.max_steps:
                 break
             row_batch = batch.get('atom_rows')
@@ -334,7 +332,7 @@ if __name__ == '__main__':
     parser.add_argument("--db_path", type=str, default=None)
     parser.add_argument("--train_csv_path", type=str, default=None)
     parser.add_argument("--model_save_path", type=str, default="runs/stage1/checkpoint_model.pt")
-    parser.add_argument("--data_parent_path", type=str, default='/tmp/LLM4Mat-Bench/')
+    parser.add_argument("--data_parent_path", type=str, default=os.path.join(DATA_ROOT, "LLM4Mat-Bench"))
     parser.add_argument("--cached_embs_parent_path", type=str, default=None,
                         help="Parent of {dataset}/embeddings/{model}_{split}_atom.flat.bin pre-cached OrbV3 features. "
                              "Set to empty string to force live OrbV3 encoding.")
@@ -346,7 +344,7 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_epochs", type=int, default=5)
     parser.add_argument("--max_steps", type=int, default=None,
-                        help="Optional step cap for sweeps (early-exits the inner loop). "
+                        help="Optional step cap (early-exits the inner loop). "
                              "Default None = run num_epochs to completion.")
     parser.add_argument("--thinking", action="store_true")
     parser.add_argument("--log_every", type=int, default=10)
@@ -368,8 +366,7 @@ if __name__ == '__main__':
                         help="Per-atom feature dim of the cached embeddings. OrbV3=256, UMA=128, "
                              "PET-MAD variable.")
     parser.add_argument("--llm_name", type=str, default="Qwen/Qwen3-8B",
-                        help="HuggingFace model id; used by the scaling-law sweep to "
-                             "swap the base LLM (e.g. Qwen/Qwen3-0.6B, -1.7B, -4B, ...).")
+                        help="Base LLM (HuggingFace id), e.g. Qwen/Qwen3-4B.")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="DataLoader workers per rank. 0 runs the pipeline in the main process.")
     args = parser.parse_args()

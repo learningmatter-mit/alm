@@ -2,7 +2,7 @@
 
 Usage:
   export OPENAI_API_KEY=sk-...
-  python -m alm.eval.eval_atomtxt_direction \\
+  python -m alm.eval.generation.eval_atomtxt_direction \\
       --alm_checkpoint <ckpt_dir> \\
       --atoms_mapper   <ckpt_dir>/atoms_mapper.pt \\
       --atomtxt_parquet <data_root>/pairs_atomtxt.parquet \\
@@ -160,7 +160,7 @@ def main() -> int:
     ap.add_argument("--K", type=int, default=20)
     ap.add_argument("--guidance_factor", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0,
-                    help="Eval-set hash seed; pick a value never used in training (default 42).")
+                    help="Seed for selecting the eval subset (default 0).")
     ap.add_argument("--judge", action=argparse.BooleanOptionalAction, default=True,
                     help="Whether to run the LLM judge overlay (default on).")
     ap.add_argument("--judge_model", default=DEFAULT_MODEL)
@@ -365,19 +365,21 @@ def main() -> int:
         input_structs.append(s)
     # Defensive Z-range filter: one bad input would crash the whole relax batch.
     valid_inputs: list[Structure] = []
+    input_ok: list[bool] = []
     n_input_filtered = 0
     for s in input_structs:
-        if s is None:
-            continue
-        try:
-            zs = [int(site.specie.Z) for site in s]
-        except Exception:
-            n_input_filtered += 1
-            continue
-        if not zs or any(z < 1 or z > 94 for z in zs):
-            n_input_filtered += 1
-            continue
-        valid_inputs.append(s)
+        ok = s is not None
+        if ok:
+            try:
+                zs = [int(site.specie.Z) for site in s]
+                ok = bool(zs) and all(1 <= z <= 94 for z in zs)
+            except Exception:
+                ok = False
+            if not ok:
+                n_input_filtered += 1
+        input_ok.append(ok)
+        if ok:
+            valid_inputs.append(s)
     if n_input_filtered:
         print(f"[eval_atomtxt] pre-filtered {n_input_filtered} input structures with out-of-range Z", flush=True)
     relaxed_inputs, _ = relax_structures_mattersim(
@@ -387,7 +389,7 @@ def main() -> int:
     )
     rel_input_iter = iter(relaxed_inputs)
     relaxed_inputs_aligned: list[Atoms | None] = [
-        next(rel_input_iter, None) if s is not None else None for s in input_structs
+        next(rel_input_iter, None) if ok else None for ok in input_ok
     ]
 
     print(f"[eval_atomtxt] relaxing outputs ...", flush=True)
@@ -428,8 +430,6 @@ def main() -> int:
     examples: list[dict] = []
     per_prompt_correct: dict[str, list[bool]] = defaultdict(list)
     n_skipped = 0
-
-    out_iter = iter(relaxed_outputs)
     for (pi, gj), out_atoms in zip(flat_back_idx, relaxed_outputs):
         r = rows[pi]
         tag = r["_tag"]
@@ -490,8 +490,23 @@ def main() -> int:
             judge_items.append(ex)
             judge_back_idx.append(len(examples) - 1)
 
+    # Every expected generation stays in the denominator: failed generations, failed
+    # conversions, out-of-range Z, failed input relaxations and NaN properties count as wrong.
+    n_expected = args.fk_n_particles if fk_active else args.K
+    prop_of_row: dict[str, str] = {}
+    n_gen_failed = 0
+    for r in rows:
+        rid = r["row_id"]
+        prop_of_row[rid] = r["_tag"]["prop"]
+        n_missing = max(0, n_expected - len(per_prompt_correct[rid]))
+        per_prompt_correct[rid].extend([False] * n_missing)
+        n_gen_failed += n_missing
+    n_slots = sum(len(v) for v in per_prompt_correct.values())
+    gen_failed_rate = n_gen_failed / n_slots if n_slots else 0.0
+
     print(f"[eval_atomtxt] {len(examples)} (input,output) pairs scored deterministically; "
-          f"{n_skipped} skipped (relaxation/parsing failures or zero-direction)", flush=True)
+          f"{n_gen_failed}/{n_slots} generations unscorable and counted as wrong "
+          f"(gen_failed_rate={gen_failed_rate:.3f})", flush=True)
 
     # ── 6. Optional LLM judge overlay ──
     judge_score_by_idx: dict[int, int] = {}
@@ -520,9 +535,8 @@ def main() -> int:
         for rid, corrects in per_prompt_correct.items() if corrects
     }
     direction_rate = float(np.mean(list(per_prompt_rate.values()))) if per_prompt_rate else 0.0
-    direction_rate_overall = float(np.mean([
-        e["direction_correct"] for e in examples
-    ])) if examples else 0.0
+    all_correct = [c for corrects in per_prompt_correct.values() for c in corrects]
+    direction_rate_overall = float(np.mean(all_correct)) if all_correct else 0.0
 
     judge_mean = None
     if judge_score_by_idx:
@@ -530,14 +544,18 @@ def main() -> int:
 
     by_prop_rate: dict[str, float] = {}
     for prop in SCOREABLE_PROPS:
-        prop_examples = [e for e in examples if e["prop_target"] == prop]
-        if prop_examples:
-            by_prop_rate[prop] = float(np.mean([e["direction_correct"] for e in prop_examples]))
+        prop_correct = [c for rid, corrects in per_prompt_correct.items()
+                        if prop_of_row.get(rid) == prop for c in corrects]
+        if prop_correct:
+            by_prop_rate[prop] = float(np.mean(prop_correct))
 
     metrics = {
         "n_rows": len(rows),
         "n_pairs_scored": len(examples),
         "n_skipped": n_skipped,
+        "n_generations_expected": n_slots,
+        "n_gen_failed": n_gen_failed,
+        "gen_failed_rate": gen_failed_rate,
         "K": args.K,
         "judge_model": args.judge_model if args.judge else None,
         "guidance_factor": args.guidance_factor,
@@ -554,7 +572,7 @@ def main() -> int:
         for ex in examples:
             f.write(json.dumps(ex) + "\n")
 
-    print(f"[eval_atomtxt] HEADLINE — direction_correctness_rate = {direction_rate:.3f}", flush=True)
+    print(f"[eval_atomtxt] direction_correctness_rate = {direction_rate:.3f}", flush=True)
     if judge_mean is not None:
         print(f"[eval_atomtxt]            judge_consistency_score = {judge_mean:.3f} / 2.0", flush=True)
     print(f"[eval_atomtxt]            by-prop: {by_prop_rate}", flush=True)

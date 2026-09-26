@@ -12,6 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from paths import DATA_ROOT
 
 

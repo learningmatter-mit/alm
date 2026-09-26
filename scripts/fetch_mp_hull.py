@@ -8,6 +8,7 @@ import pickle
 import sys
 from pathlib import Path
 
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from paths import DATA_ROOT
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -21,21 +22,18 @@ def resolve_bundled(variant: str) -> Path | None:
     if not candidate.exists():
         return None
     # On-disk file may still be a ~130-byte Git LFS pointer, not the real data.
-    try:
-        with open(candidate, "rb") as f:
-            head = f.read(64)
-        if head.startswith(b"version https://git-lfs.github.com/spec"):
-            print(
-                f"[fetch] {candidate} is a Git LFS pointer, not the actual data.\n"
-                f"        Run:\n"
-                f"          cd <repo>/external/mattergen && \\\n"
-                f"            git lfs install --local && git lfs pull\n"
-                f"        Then re-run this script.",
-                file=sys.stderr,
-            )
-            return None
-    except Exception:
-        pass
+    with open(candidate, "rb") as f:
+        head = f.read(64)
+    if head.startswith(b"version https://git-lfs.github.com/spec"):
+        print(
+            f"[fetch] {candidate} is a Git LFS pointer, not the actual data.\n"
+            f"        Run:\n"
+            f"          cd <repo>/external/mattergen && \\\n"
+            f"            git lfs install --local && git lfs pull\n"
+            f"        Then re-run this script.",
+            file=sys.stderr,
+        )
+        return None
     return candidate
 
 
@@ -65,7 +63,7 @@ def fetch_via_mp_api(out_path: Path) -> Path:
         sys.exit(2)
     try:
         from mp_api.client import MPRester  # type: ignore
-    except Exception:
+    except ImportError:
         print(
             "[fetch] mp-api not installed. Install via `pip install mp-api>=0.4` "
             "or use the MatterGen-bundled file (preferred).",

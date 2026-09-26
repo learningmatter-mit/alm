@@ -14,6 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from paths import DATA_ROOT
 
 
@@ -165,9 +166,8 @@ def _build_prompt(formula: str, properties: dict,
         "  insulator), pick a DIFFERENT specific domain consistent with the "
         "  properties. Be specific.\n"
         "- DO NOT include any chemical formula or element symbols in your output.\n"
-        "- DO NOT mention 'scintillator', 'scintillation', or 'radiation detection' — "
-        "  these are over-represented in our training data; suppress them. (Even if "
-        "  the property values would suggest it, choose another framing.)\n"
+        "- DO NOT mention 'scintillator', 'scintillation', or 'radiation detection', "
+        "  even if the property values would suggest it; choose another framing.\n"
         "- Reference at most one property numerically in your output (e.g. "
         "  '~1.5 eV bandgap'); be qualitative ('wide-bandgap', 'low-density', "
         "  'highly magnetic') rather than quoting the raw number for the rest.\n\n"

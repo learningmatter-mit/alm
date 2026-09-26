@@ -301,7 +301,7 @@ def main():
     ap.add_argument("--planner_fallback_teacher", action="store_true",
                     help="If --composition_source planner fails to parse a row, fall back "
                          "to teacher-forced ground-truth counts instead of skipping it. "
-                         "Useful for plumbing smokes; leave off for honest planner evals.")
+                         "Useful for smoke tests; leave off when reporting planner results.")
     ap.add_argument("--bench_root", type=Path, default=DEFAULT_BENCH_ROOT)
     ap.add_argument("--out_root", type=Path, default=None,
                     help="Override $ALM_EVAL_RESULTS_ROOT.")
@@ -415,7 +415,7 @@ def main():
         suffix = f"_rows{args.row_start}-{end_tag}"
         args.run_id = (args.run_id + suffix) if args.run_id else f"rows{args.row_start}-{end_tag}"
 
-    # Timestamped progress logging: the "looks hung" stalls are silent ckpt load + first diffusion.
+    # Timestamped progress log: checkpoint load and the first diffusion call are slow and otherwise silent.
     import time as _time, datetime as _dt
     _t0 = _time.time()
     def _stage(msg):

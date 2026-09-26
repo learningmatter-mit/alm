@@ -1,7 +1,10 @@
-"""CSP eval for a from-scratch trained MatterGen MP-20 checkpoint (M@1, M@K).
+"""CSP eval for a from-scratch trained CSP-mode MatterGen checkpoint (M@1, M@K).
+
+Per-row RMSD: rmsd_n1 is the matched RMSD of candidate 0 and rmsd_nK the minimum matched RMSD over
+the K candidates (CDVAE/CrystaLLM convention; compute_csp_rmse.py uses the same definition).
 
 Usage:
-  python -m alm.eval.eval_csp \\
+  python -m alm.eval.generation.eval_csp \\
       --ckpt_dir <ckpt_dir> \\
       --max_rows 100 --K 64 \\
       --out_dir <results_dir>/mg_csp_from_scratch_K64
@@ -48,7 +51,7 @@ def load_targets(csv_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt_dir", type=Path, required=True,
-                    help="Local MG-CSP training dir (contains checkpoints/ + config.yaml).")
+                    help="MatterGen CSP checkpoint dir (contains checkpoints/ + config.yaml).")
     ap.add_argument("--max_rows", type=int, default=100)
     ap.add_argument("--K", type=int, default=64)
     ap.add_argument("--out_dir", type=Path, required=True)
@@ -80,7 +83,7 @@ def main():
         print(f"  shard {args.shard_idx}/{args.num_shards}: {len(targets)}/{len(all_targets)} rows", flush=True)
     else:
         targets = all_targets
-        print(f"  {len(targets)} MP-20 test rows", flush=True)
+        print(f"  {len(targets)} test rows from {args.test_csv}", flush=True)
 
     _ALM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from mattergen.common.utils.data_classes import MatterGenCheckpointInfo
@@ -187,12 +190,12 @@ def main():
         "match_rate_n1": n_match_n1 / max(1, n_targeted),
         "match_rate_nK": n_match_nK / max(1, n_targeted),
         "ckpt_dir": str(args.ckpt_dir),
-        "note": "MG-CSP-from-scratch eval. No ALM bridge, no FK, native CSP-mode. Per-row SIGALRM watchdog (ROW_TIMEOUT_S) skips deadlocking compositions; timed-out rows kept in denominator.",
+        "note": "CSP-mode MatterGen eval. No ALM bridge, no FK, native CSP-mode. Per-row SIGALRM watchdog (ROW_TIMEOUT_S) skips deadlocking compositions; timed-out rows kept in denominator.",
     }
     (args.out_dir / "metrics.json").write_text(json.dumps(headline, indent=2))
     with (args.out_dir / "predictions.jsonl").open("w") as f:
         for r in results: f.write(json.dumps(r) + "\n")
-    print(f"\n[mg-csp-fs] HEADLINE on MP-20 ({n_targeted} rows, K={args.K}):")
+    print(f"\n[mg-csp-fs] {args.test_csv.parent.name} ({n_targeted} rows, K={args.K}):")
     print(f"  M@1   = {headline['match_rate_n1']:.3f}")
     print(f"  M@K   = {headline['match_rate_nK']:.3f}")
     print(f"  total time: {time.time()-t0:.0f}s")

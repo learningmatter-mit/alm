@@ -10,6 +10,7 @@ import argparse
 import os
 import random
 import sys
+import traceback
 from pathlib import Path
 from typing import Mapping
 
@@ -43,9 +44,9 @@ ASSISTANT_ANCHOR = "Structure: "
 def build_pl_module(atoms_mapper_path: Path, mattergen_pretrained: str,
                     hidden_dim: int, K: int, mid_dim: int, device,
                     model_path: str | None = None):
-    """Build pl_module via the training path, then overlay Stage 3a state; bridge_kind is sniffed from the ckpt.
+    """Build pl_module via the training path and load the trained bridge state; bridge_kind is read from the checkpoint.
 
-    model_path: optional LOCAL MatterGen training dir; loads the backbone from there (CSP-mode) instead of the HF name.
+    model_path: optional local MatterGen training dir; loads the backbone from there (CSP-mode) instead of the HF name.
     """
     # CPU load avoids pulling multi-GB optimizer_state_dict into GPU before sampling.
     try:
@@ -117,11 +118,11 @@ def build_pl_module(atoms_mapper_path: Path, mattergen_pretrained: str,
         bridge_noise_gate=bridge_noise_gate,
         bridge_tenc_fuse=bridge_tenc_fuse,
     )
-    print(f"[gen] bridge fix flags: out_norm={bridge_out_norm} "
+    print(f"[gen] bridge flags: out_norm={bridge_out_norm} "
           f"learnable_null={bridge_learnable_null} noise_gate={bridge_noise_gate} "
           f"tenc_fuse={bridge_tenc_fuse}", flush=True)
     if model_path is not None:
-        print(f"[gen] backbone from LOCAL model_path={model_path} "
+        print(f"[gen] backbone from local model_path={model_path} "
               f"(CSP-mode if trained so; atoms observed)")
     lm_cfg = _make_lightning_module_cfg(lr=1e-4)
     pl_module, _ = init_adapter_lightningmodule_from_pretrained(adapter_cfg, lm_cfg)
@@ -137,14 +138,14 @@ def build_pl_module(atoms_mapper_path: Path, mattergen_pretrained: str,
               f"source_len={qformer_context_tokens + qformer_input_atoms + K} "
               f"input_atoms={qformer_input_atoms} pool={'mean' if bridge_kind=='producer-consumer-pool' else 'none'}")
 
-    # Overlay Stage 3a's AtomsMapper + cond_adapt/mixin for all active cond_fields.
+    # Load the trained AtomsMapper + cond_adapt/mixin for all active cond_fields.
     diffusion_model = pl_module.diffusion_module.model
     if use_alm_embedding_cond and "atoms_mapper_state_dict" in ckpt:
         atoms_mapper = (
             diffusion_model.property_embeddings_adapt["alm_embedding"]
             .conditional_embedding_module
         )
-        # strict=False so pre-dir_proto qformer ckpts load (dir_proto is train-only); surface other mismatches.
+        # strict=False: dir_proto is training-only and may be absent from the checkpoint.
         _ld = atoms_mapper.load_state_dict(ckpt["atoms_mapper_state_dict"], strict=False)
         _miss = [k for k in _ld.missing_keys if "dir_proto" not in k]
         if _miss or _ld.unexpected_keys:
@@ -156,7 +157,7 @@ def build_pl_module(atoms_mapper_path: Path, mattergen_pretrained: str,
         cur = diffusion_model.state_dict()
         cur.update(ckpt["mattergen_full_state_dict"])
         _ld = diffusion_model.load_state_dict(cur, strict=False)
-        print(f"[gen] overlaid FULL MatterGen backbone (full-FT): "
+        print(f"[gen] loaded full MatterGen backbone (full-FT): "
               f"{len(ckpt['mattergen_full_state_dict'])} tensors "
               f"(missing={len(_ld.missing_keys)}, unexpected={len(_ld.unexpected_keys)})")
     elif "trainable_state_dict" in ckpt:
@@ -334,7 +335,7 @@ def build_sampler_and_loader(pl_module, batch_size: int, num_batches: int,
         n_exact = int(constrain_n_atoms_exact)
         new_name = f"{num_atoms_distribution}__exact_{n_exact}"
         NUM_ATOMS_DISTRIBUTIONS[new_name] = {n_exact: 1.0}
-        print(f"[fk] N_p constraint: STRICT N_p = {n_exact} (no multiples)", flush=True)
+        print(f"[n_atoms] fixed at {n_exact}", flush=True)
         num_atoms_distribution = new_name
     elif constrain_n_atoms_to_multiple_of > 0:
         from mattergen.common.data.num_atoms_distribution import NUM_ATOMS_DISTRIBUTIONS
@@ -655,10 +656,17 @@ def main(args):
             [s.strip() for s in args.allowed_elements.split(",") if s.strip()]
             if args.allowed_elements else None
         )
+        physical_bounds = None
+        if args.fk_physical_bounds_path:
+            import json as _json
+            with open(args.fk_physical_bounds_path) as _f:
+                _pb = _json.load(_f)
+            physical_bounds = _pb.get("bounds", _pb)
         reward = _fk_parse_rewards(
             args.fk_rewards,
             allowed_elements=allowed_elements,
             target_counts=fk_target_counts,
+            physical_bounds=physical_bounds,
         )
         _ensure_fk_hook_installed(pl_module)
         st = pl_module._fk_state
@@ -768,7 +776,7 @@ def main(args):
               f"shape per component: {traj[next(iter(traj))].shape.numel()} elems)",
               flush=True)
 
-    print(f"\n[gen] DONE — {len(structures)} structures generated. Outputs in {out_dir}")
+    print(f"\n[gen] done: {len(structures)} structures generated. Outputs in {out_dir}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1319,7 +1327,7 @@ def _install_fk_on_sampler(sampler, fk_state: "_FKState"):
         return new_batch
 
     def _resample_batch(batch, mean_batch, idx):
-        """Multinomial-resample BOTH batch and mean_batch by particle index `idx`."""
+        """Multinomial-resample both batch and mean_batch by particle index `idx`."""
         return _resample_one(batch, idx), _resample_one(mean_batch, idx)
 
     @torch.no_grad()
@@ -1521,20 +1529,15 @@ def _install_fk_on_sampler(sampler, fk_state: "_FKState"):
                     if int(old_z[new_global].item()) != target_z:
                         n_overrides += 1
                     new_z[new_global] = target_z
-            # Update BOTH: draw_samples_from_sampler builds final structures from mean_batch.atomic_numbers.
+            # Update both: draw_samples_from_sampler builds final structures from mean_batch.atomic_numbers.
             batch["atomic_numbers"] = new_z
-            try:
-                mean_batch["atomic_numbers"] = new_z.clone()
-            except Exception as exc:
-                print(f"[fk] WARNING: could not update mean_batch.atomic_numbers ({exc}); "
-                      "post-hoc override may not propagate to final structures.",
-                      flush=True)
+            mean_batch["atomic_numbers"] = new_z.clone()
             print(f"[fk] post-hoc Z-override: changed {n_overrides}/{int(old_z.numel())} "
                   f"atomic_numbers to enforce target_counts={state.target_counts}",
                   flush=True)
 
         clip_frac = (state.n_clip_hits / max(state.n_fk_steps * n_particles, 1))
-        print(f"[fk] DONE — n_fk_steps={state.n_fk_steps}, "
+        print(f"[fk] done: n_fk_steps={state.n_fk_steps}, "
               f"n_resamples={state.n_resamples}, "
               f"clip_hits={state.n_clip_hits} "
               f"({100*clip_frac:.1f}% of (step×particle) updates), "
@@ -1698,7 +1701,7 @@ def generate_for_prompts(
     # No-LLM-bridge ckpts lack alm_embedding -> skip the ALM forward and don't pass it as a condition.
     _has_alm_cond = "alm_embedding" in pl_module.diffusion_module.model.property_embeddings_adapt
     if not _has_alm_cond:
-        print("[gen] adapter has no alm_embedding cond_field — skipping ALM forward, "
+        print("[gen] adapter has no alm_embedding cond_field; skipping ALM forward, "
               "running conditional generation from discrete cond_fields only.")
     else:
         _alm_mapper = (
@@ -1913,10 +1916,8 @@ def generate_for_prompts(
         except Exception as exc:
             # MatterGen's sampler can crash mid-denoise on stochastic edge cases; log + skip one prompt.
             n_skipped += 1
-            print(f"[gen-batch] {i+1}/{len(prompts)}: id={pid} FAILED — "
+            print(f"[gen-batch] {i+1}/{len(prompts)}: id={pid} failed: "
                   f"{type(exc).__name__}: {exc}", flush=True)
-            # Do NOT `import os` here: it would shadow the module-level import and UnboundLocalError above.
-            import traceback
             if os.environ.get("ALM_FULL_TRACEBACK") == "1":
                 traceback.print_exc()
             structures = []
@@ -1929,8 +1930,8 @@ def generate_for_prompts(
               + (" (skipped)" if not structures else ""),
               flush=True)
     if n_skipped:
-        print(f"[gen-batch] SUMMARY: {n_skipped}/{len(prompts)} prompts FAILED "
-              f"(stochastic sampler crashes); rest succeeded.", flush=True)
+        print(f"[gen-batch] {n_skipped}/{len(prompts)} prompts failed during sampling; "
+              f"the rest succeeded.", flush=True)
     return all_results
 
 
@@ -2010,8 +2011,7 @@ def load_alm_and_pl_module(
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--alm_checkpoint", required=True,
-                   help="Stage 2 ckpt dir (lora_adapter/ + projector_and_state.pt). Stage 3a "
-                        "doesn't train the LLM, so this is just the Stage 2 ckpt used at training.")
+                   help="Stage-2 checkpoint dir (lora_adapter/ + projector_and_state.pt) that the bridge was trained on.")
     p.add_argument("--atoms_mapper", required=True,
                    help="Path to atoms_mapper.pt produced by the trainer")
     p.add_argument("--prompt", required=True)
@@ -2047,9 +2047,8 @@ if __name__ == "__main__":
                    help="Comma-separated 'Sym:n' for stoich_match, e.g. 'V:2,Ga:1,Fe:1'. "
                         "Mutually exclusive with --fk_target_counts_from_prompt_json.")
     p.add_argument("--fk_target_counts_from_prompt_json", type=str, default=None,
-                   help="'<path>:<tag>' lookup, e.g. "
-                        "'scripts/eval_prompts/id_prompt_targets.json:v2gafe'. "
-                        "Single source of truth across the bash wrapper and the CLI.")
+                   help="Read target counts from a JSON file as '<path>:<key>', e.g. "
+                        "'src/alm/eval/eval_prompts/id_prompt_targets.json:v2gafe'.")
     p.add_argument("--fk_resample_every", type=int, default=5,
                    help="Resample cadence (every k denoising steps). Default 5.")
     p.add_argument("--fk_t_start_frac", type=float, default=0.5,
@@ -2067,23 +2066,13 @@ if __name__ == "__main__":
     p.add_argument("--fk_log_w_clip", type=float, default=10.0,
                    help="Clip cumulative log_w to ±clip per step. Default 10.0.")
     p.add_argument("--fk_constrain_n_atoms_to_target_multiple", action="store_true",
-                   help="Restrict per-particle N_p sampled from --num_atoms_distribution to "
-                        "multiples of sum(target_counts). For V₂GaFe (sum=4) only "
-                        "{4,8,12,16,20} stay; for LaClAu (sum=3) only {3,6,9,…}. Without "
-                        "this, ALEX_MP_20's mode at 4 atoms forces multiset rounding to "
-                        "drop target elements (LiMnPO₅H₂ → 0×Mn) so per-atom Hungarian "
-                        "satisfies presence but never strict ratio.")
+                   help="Only sample atom counts that are multiples of sum(target_counts).")
     p.add_argument("--fk_stratify_resample_by_n_atoms", action="store_true",
-                   help="Resample WITHIN each N_p group separately so each group keeps "
-                        "its representation. Mitigates N_p collapse where one N_p "
-                        "value crowds out the others. Default OFF; "
-                        "fk_trajectory.pt's resample_log surfaces collapse without it.")
+                   help="Resample particles separately within each atom-count group so "
+                        "no single atom count crowds out the others.")
     p.add_argument("--fk_n_atoms_exact_sum_target", action="store_true",
-                   help="STRICT: force N_p = sum(target_counts) exactly (no multiples). "
-                        "For SrTiO3 → only N_p=5; for V2GaFe → only N_p=4. Wins over "
-                        "--fk_constrain_n_atoms_to_target_multiple if both are set. "
-                        "Pairs naturally with --fk_enforce_target_counts to guarantee "
-                        "exact-stoichiometry generations.")
+                   help="Fix the atom count to exactly sum(target_counts). Takes precedence "
+                        "over --fk_constrain_n_atoms_to_target_multiple.")
     p.add_argument("--fk_enforce_target_counts", action="store_true",
                    help="Post-hoc Hungarian Z-override at end of denoising: for each "
                         "particle, reassign atom labels to the target multiset using the "
@@ -2093,9 +2082,8 @@ if __name__ == "__main__":
                         "--fk_n_atoms_exact_sum_target so every particle is exactly the "
                         "right size and exactly the right composition.")
     p.add_argument("--fk_physical_bounds_path", type=str, default=None,
-                   help="Path to JSON of empirical physical-prior bounds (output of "
-                        "archive/data_prep/calibrate_physical_priors.py). Required if "
-                        "--fk_rewards includes 'physical_sanity'.")
+                   help="JSON of physical-prior bounds (output of "
+                        "scripts/calibrate_physical_priors.py), required by the physical_sanity reward.")
     # peaked atomic_numbers init at sampler t=T
     p.add_argument("--init_types_at_target", action="store_true",
                    help="Override atomic_numbers immediately after _sample_prior with a "
@@ -2124,9 +2112,7 @@ if __name__ == "__main__":
     p.add_argument("--type_bias_t_end", type=float, default=0.05,
                    help="t at which type biasing reaches full peaked assignment. Default 0.05.")
     p.add_argument("--diffusion_seed", type=int, default=None,
-                   help="Optional PRNG seed (torch/cuda/numpy/random). Lets callers retry "
-                        "with bumped seeds when MatterGen's GemNet hits the stochastic "
-                        "torch.max(empty) crash mid-denoise.")
+                   help="Seed for torch, CUDA, numpy and random.")
     # LLM-temperature CoT sampling between the anchor and the [atoms_i] tokens (cot_tokens=0 = deterministic)
     p.add_argument("--cot_tokens", type=int, default=0,
                    help="K' = number of LLM-sampled tokens to splice between the "

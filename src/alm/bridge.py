@@ -166,7 +166,7 @@ class AtomsMapperProducerConsumer(nn.Module):
         out = self.out_proj(queries)                # (B, M, out_dim)
         if self.out_norm is not None:
             out = self.out_norm(out)
-        # qformer_pool ablation: collapse M query tokens to (B, out_dim).
+        # Optionally pool the M query tokens to a single (B, out_dim) vector.
         if self.pool == "mean":
             out = out.mean(dim=1)                   # (B, out_dim)
         elif self.pool == "query0":

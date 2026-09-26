@@ -235,7 +235,7 @@ BASELINES = {
     # Language retention: no published baselines.
     "language_retention": {},
 
-    # Stage 3b crystal-generation baselines, verbatim from each paper's headline table.
+    # Crystal-generation baselines, copied from each paper's headline table.
 
     # CSP MP-20 (CrystaLLM split, OrderedStructureMatcher ltol=0.3/stol=0.5/angle_tol=10). CrystaLLM Table 3 + OMatG + DiffCSP.
     "stage3b_csp_mp_20_n1_g10": {

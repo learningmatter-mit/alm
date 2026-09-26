@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
-# Set up the MatterGen fork for ALM Stage 3 (the LLM→diffusion bridge).
+# Set up the MatterGen fork used by ALM Stage 3 (the LLM to diffusion bridge).
 #
 # What this does:
 #   1. Clones microsoft/mattergen at the pinned commit into external/mattergen
 #      (skipped if already present).
 #   2. Applies external/mattergen_alm_steering.patch. The patch retargets
-#      pyproject.toml to CUDA-12 (H200), bumps pytorch-lightning >=2.4, registers
-#      AtomsMapper / AtomsMapperProducerConsumer as the `alm_embedding` conditional
-#      embedding module, appends "alm_embedding" to PROPERTY_SOURCE_IDS, adds the
-#      from-scratch CSP data-module configs (csp_backbone{,_v2,_stable70,
-#      _stable70_cap64}.yaml) + the task_direction embedding config, adds the
+#      pyproject.toml to CUDA 12, bumps pytorch-lightning to >=2.4, adds the
+#      `alm_embedding` cond_field (alm_embedding.yaml, backed by bridge.AtomsMapper)
+#      and appends it to PROPERTY_SOURCE_IDS, adds the from-scratch CSP data-module
+#      config (csp_backbone.yaml) and the task_direction embedding config, adds the
 #      GemNetTCtrl IP-Adapter / tenc-fuse bridge, and writes install_for_h200.sh.
 #   3. Marks install_for_h200.sh executable (git diff doesn't preserve +x).
 #
-# The ALM bridge modules (alm/atoms_mapper*.py) must be on PYTHONPATH at runtime;
-# the patched alm_embedding.yaml references them by name.
+# The ALM bridge modules (src/alm/bridge.py) must be importable at runtime; the
+# patched alm_embedding.yaml references them by bare module name.
 #
 # Usage (from repo root):
 #   bash external/setup_mattergen.sh
@@ -28,11 +27,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SUBMODULE="${REPO_ROOT}/external/mattergen"
 PATCH="${REPO_ROOT}/external/mattergen_alm_steering.patch"
 MATTERGEN_URL="https://github.com/microsoft/mattergen.git"
-# Last upstream microsoft/mattergen commit the ALM patch is built against
-# ("save detailed metrics, #239"). The patch carries every ALM edit on top of
-# this (the bridge adapter, alm_embedding cond_field, csp_backbone data modules,
-# CFG/LMDB/numpy-2 fixes), so a clean clone @ this commit + the patch == the
-# full ALM fork. Do NOT pin to a local ALM commit — those SHAs aren't on GitHub.
+# Upstream microsoft/mattergen commit the patch is built against
+# ("save detailed metrics, #239"). The patch carries every ALM edit on top of it
+# (the bridge adapter, alm_embedding cond_field, csp_backbone data module, and the
+# CFG/LMDB/numpy-2 fixes), so a clean clone at this commit plus the patch is the
+# full fork. Keep this an upstream commit so the clone can fetch it from GitHub.
 MATTERGEN_COMMIT="a245cf2b7538eea6d873e6430b0e30c56d26c60e"
 
 [[ -f "$PATCH" ]] || { echo "ERROR: patch not found at $PATCH"; exit 1; }
@@ -42,10 +41,10 @@ if [[ ! -d "$SUBMODULE/.git" ]]; then
   git clone "$MATTERGEN_URL" "$SUBMODULE"
   git -C "$SUBMODULE" checkout -q "$MATTERGEN_COMMIT"
 else
-  echo "  $SUBMODULE already present — leaving as-is."
+  echo "  $SUBMODULE exists; skipping clone."
 fi
 
-echo "[2/3] apply ALM Stage-3 patch ..."
+echo "[2/3] apply ALM patch ..."
 cd "$SUBMODULE"
 if git diff --quiet HEAD; then
   if git apply --check "$PATCH" 2>/dev/null; then
@@ -57,7 +56,7 @@ if git diff --quiet HEAD; then
     exit 1
   fi
 else
-  echo "  working tree already has edits — skipping (reset --hard to start fresh)."
+  echo "  working tree already has edits; skipping (reset --hard to start fresh)."
 fi
 
 echo "[3/3] chmod +x install_for_h200.sh ..."

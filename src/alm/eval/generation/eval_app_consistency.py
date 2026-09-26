@@ -99,6 +99,17 @@ def _formula_summary(struct: Structure) -> dict:
     }
 
 
+def _app_messages(item: dict) -> list[dict]:
+    """Judge messages; a missing energy (None, e.g. under --skip_relax) is shown to the judge as unknown."""
+    if item.get("formation_energy_per_atom") is not None:
+        return build_app_consistency_messages(item)
+    msgs = build_app_consistency_messages({**item, "formation_energy_per_atom": float("nan")})
+    for m in msgs:
+        m["content"] = m["content"].replace(
+            "formation_energy_per_atom: nan eV/atom", "formation_energy_per_atom: unknown")
+    return msgs
+
+
 def _formation_energy_per_atom_from_relaxed(atoms: Atoms) -> float:
     """Total energy/atom (eV) from MatterSim; elemental reference not subtracted, fine for relative-rank judging."""
     e = atoms.info.get("total_energy")
@@ -181,7 +192,11 @@ def main() -> int:
         judge_items: list[dict] = []
         keep_idx: list[int] = []
         n_dropped_cap = 0
+        failed_row_ids: list[str] = []
         for i, ex in enumerate(existing):
+            if ex.get("failed"):
+                failed_row_ids.append(ex["row_id"])
+                continue
             req = ("prompt", "formula", "density", "volume_per_atom",
                    "formation_energy_per_atom", "elements", "space_group", "n_atoms")
             if not all(k in ex for k in req):
@@ -206,7 +221,7 @@ def main() -> int:
               flush=True)
         verdicts = asyncio.run(batch_judge(
             items=judge_items,
-            build_messages_fn=build_app_consistency_messages,
+            build_messages_fn=_app_messages,
             model=args.judge_model,
             concurrency=args.judge_concurrency,
         ))
@@ -215,6 +230,8 @@ def main() -> int:
             print(f"[eval_app] judge failures: {fc}", flush=True)
 
         per_prompt: dict[str, list[int]] = defaultdict(list)
+        for rid in failed_row_ids:
+            per_prompt[rid].append(0)
         for back_i, verdict in zip(keep_idx, verdicts):
             score = parse_score(verdict, default=0)
             existing[back_i]["judge_score"] = score
@@ -227,9 +244,8 @@ def main() -> int:
 
         per_prompt_mean = {rid: float(np.mean(scores)) for rid, scores in per_prompt.items() if scores}
         overall_mean = float(np.mean(list(per_prompt_mean.values()))) if per_prompt_mean else 0.0
-        score_2_rate = float(np.mean([
-            1 if existing[back_i].get("judge_score") == 2 else 0 for back_i in keep_idx
-        ]))
+        all_scores = [sc for scores in per_prompt.values() for sc in scores]
+        score_2_rate = float(np.mean([sc == 2 for sc in all_scores])) if all_scores else 0.0
 
         metrics = {
             "n_judge_calls": len(judge_items),
@@ -247,8 +263,8 @@ def main() -> int:
         with open(preds_path, "w") as f:
             for ex in existing:
                 f.write(json.dumps(ex) + "\n")
-        print(f"[eval_app] HEADLINE — overall_consistency_mean_per_prompt = {overall_mean:.3f} / 2.0", flush=True)
-        print(f"[eval_app]            fraction_score_2 = {score_2_rate:.3f}", flush=True)
+        print(f"[eval_app] overall_consistency_mean_per_prompt = {overall_mean:.3f} / 2.0", flush=True)
+        print(f"[eval_app] fraction_score_2 = {score_2_rate:.3f}", flush=True)
         print(f"[eval_app] DONE (judge-only replay) in {time.time()-t0:.0f}s", flush=True)
         return 0
 
@@ -370,14 +386,21 @@ def main() -> int:
 
     judge_items: list[dict] = []
     judge_back_idx: list[tuple[int, int]] = []  # (prompt_i, gen_j)
+    # Structures with a NaN energy after relaxation or that fail to characterize are not
+    # sent to the judge; they score 0 and stay in the per-prompt denominator.
+    failed_items: list[dict] = []
     skipped = 0
     for (pi, gj), atoms in zip(flat_back_idx, relaxed_atoms):
         try:
             struct = AseAtomsAdaptor.get_structure(atoms)
             summary = _formula_summary(struct)
             fe = _formation_energy_per_atom_from_relaxed(atoms)
-            if not (fe == fe):  # NaN
-                fe = 0.0
+            if not (fe == fe) and args.skip_relax:
+                fe = None  # no relaxation was run, so the energy is unknown
+            elif not (fe == fe):  # NaN after relaxation
+                failed_items.append({"row_id": rows[pi]["row_id"], "prompt": rows[pi]["user_prompt"],
+                                     "failed": True, "failure": "nan_energy", **summary})
+                continue
             judge_items.append({
                 "row_id": rows[pi]["row_id"],
                 "prompt": rows[pi]["user_prompt"],
@@ -387,8 +410,10 @@ def main() -> int:
             judge_back_idx.append((pi, gj))
         except Exception:
             skipped += 1
-    print(f"[eval_app] characterized {len(judge_items)} structures, "
-          f"{skipped} skipped (relaxation/parse failures)", flush=True)
+            failed_items.append({"row_id": rows[pi]["row_id"], "prompt": rows[pi]["user_prompt"],
+                                 "failed": True, "failure": "characterization_error"})
+    print(f"[eval_app] characterized {len(judge_items)} structures; {len(failed_items)} failed "
+          f"(NaN energy or parse error) and score 0", flush=True)
 
     # ── 4. Batch LLM judge ──
     reset_failure_counts()
@@ -396,7 +421,7 @@ def main() -> int:
           f"(model={args.judge_model}, concurrency={args.judge_concurrency}) ...", flush=True)
     verdicts = asyncio.run(batch_judge(
         items=judge_items,
-        build_messages_fn=build_app_consistency_messages,
+        build_messages_fn=_app_messages,
         model=args.judge_model,
         concurrency=args.judge_concurrency,
     ))
@@ -407,6 +432,10 @@ def main() -> int:
     # ── 5. Aggregate ──
     per_prompt: dict[str, list[int]] = defaultdict(list)
     examples: list[dict] = []
+    for item in failed_items:
+        per_prompt[item["row_id"]].append(0)
+        examples.append({**item, "judge_verdict": None, "judge_score": 0,
+                         "judge_reason": None, "extracted_application": None})
     for item, verdict in zip(judge_items, verdicts):
         score = parse_score(verdict, default=0)
         per_prompt[item["row_id"]].append(score)
@@ -426,6 +455,7 @@ def main() -> int:
         "n_prompts": len(rows),
         "n_judge_calls": len(judge_items),
         "n_judge_failures": int(sum(fc.values())) if fc else 0,
+        "n_failed_structures": len(failed_items),
         "judge_model": args.judge_model,
         "K": args.K,
         "guidance_factor": args.guidance_factor,
@@ -443,8 +473,8 @@ def main() -> int:
             f.write(json.dumps(ex) + "\n")
 
     print(f"[eval_app] wrote {args.out_dir}/metrics.json + predictions.jsonl", flush=True)
-    print(f"[eval_app] HEADLINE — overall_consistency_mean_per_prompt = {overall_mean:.3f} / 2.0", flush=True)
-    print(f"[eval_app]            fraction_score_2 = {overall_max_score_rate:.3f}", flush=True)
+    print(f"[eval_app] overall_consistency_mean_per_prompt = {overall_mean:.3f} / 2.0", flush=True)
+    print(f"[eval_app] fraction_score_2 = {overall_max_score_rate:.3f}", flush=True)
     print(f"[eval_app] DONE in {time.time()-t0:.0f}s", flush=True)
     return 0
 

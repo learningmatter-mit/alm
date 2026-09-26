@@ -68,6 +68,31 @@ def _atoms_struct_to_tensors(struct: dict):
     return frac, cell, Z
 
 
+def _is_valid_geometry(struct: dict) -> bool:
+    """Reject geometries that NaN the diffusion score.
+
+    Drops n_atoms<=1, a non-finite or non-3x3 lattice, det<=0, volume per atom
+    above 100 A^3 (outside MatterGen's 15-50 schedule), and non-finite coords.
+    """
+    n = len(struct.get("elements") or [])
+    if n <= 1:
+        return False
+    lat = struct.get("lattice_mat")
+    lat = np.asarray(lat if lat is not None else [], dtype=np.float64)
+    if lat.shape != (3, 3) or not np.isfinite(lat).all():
+        return False
+    det = float(np.linalg.det(lat))
+    if det < 1e-3:
+        return False
+    if det / n > 100.0:
+        return False
+    coords = struct.get("coords")
+    coords = np.asarray(coords if coords is not None else [], dtype=np.float64)
+    if coords.size and not np.isfinite(coords).all():
+        return False
+    return True
+
+
 def _direction_tag(row_id) -> str:
     """row_id '...-{property}-{higher|lower}' -> ' Target: lower formation energy.' ('' if non-directional)."""
     s = str(row_id)
@@ -318,27 +343,7 @@ class Stage3aDataset(Dataset):
         if hasattr(atoms_struct, "as_py"):
             atoms_struct = atoms_struct.as_py()
 
-        # Reject geometries that NaN the diffusion score: n_atoms<=1, VPA>100 A^3/atom
-        # (outside MatterGen's 15-50 schedule), non-finite/wrong-shape lattice, det<=0.
-        try:
-            import numpy as _np
-            _elems = atoms_struct.get("elements") or []
-            _n = len(_elems)
-            if _n <= 1:
-                return None
-            _lat = _np.asarray(atoms_struct.get("lattice_mat") or [], dtype=_np.float64)
-            if _lat.shape != (3, 3) or not _np.isfinite(_lat).all():
-                return None
-            _det = float(_np.linalg.det(_lat))
-            if abs(_det) < 1e-3 or _det <= 0:
-                return None
-            _vol = abs(_det)
-            if _vol / _n > 100.0:
-                return None
-            _coords = _np.asarray(atoms_struct.get("coords") or [], dtype=_np.float64)
-            if _coords.size and not _np.isfinite(_coords).all():
-                return None
-        except Exception:
+        if not _is_valid_geometry(atoms_struct):
             return None
 
         _tok = self._tokenize_prompt(user_prompt, assistant_anchor, atoms_struct)
@@ -495,7 +500,7 @@ def _make_adapter_cfg(pretrained_name: str, full_finetuning: bool,
                       bridge_tenc_fuse: bool = False):
     """Build the OmegaConf DictConfig for init_adapter_lightningmodule_from_pretrained."""
     if bridge_kind not in ("pool", "producer-consumer", "producer-consumer-pool", "consumer-only"):
-        raise ValueError(f"Unknown bridge_kind={bridge_kind!r}; expected pool|qformer|qformer_pool|ipadapter")
+        raise ValueError(f"Unknown bridge_kind={bridge_kind!r}; expected pool|producer-consumer|producer-consumer-pool|consumer-only")
 
     # Skip alm_embedding for the discrete-cond-only / no-LLM-bridge control.
     property_embedding_cfg = {}
@@ -833,7 +838,7 @@ def resume_checkpoint(ckpt_path: str, diffusion_module, optimizer, device, aux_h
         cur_sd = dm.model.state_dict()
         cur_sd.update(ckpt["mattergen_full_state_dict"])
         miss, unexp = dm.model.load_state_dict(cur_sd, strict=False)
-        print(f"[stage3a] resumed FULL MatterGen backbone (full-FT): "
+        print(f"[stage3a] resumed full MatterGen backbone (full-FT): "
               f"{len(ckpt['mattergen_full_state_dict'])} tensors "
               f"(missing={len(miss)}, unexpected={len(unexp)})")
     elif "trainable_state_dict" in ckpt:
@@ -955,12 +960,10 @@ def parse_args():
                    help="MatterGen pretrained name (HF hub) or path")
     p.add_argument("--mattergen_model_path", type=str, default=None,
                    help="Local CSP-mode backbone dir. When set, "
-                        "the adapter loads this LOCAL ckpt instead of --mattergen_pretrained, "
+                        "the adapter loads this local checkpoint instead of --mattergen_pretrained, "
                         "wraps its plain GemNetT into GemNetTCtrl, and attaches the "
                         "alm_embedding cond field. CSP corruption (atoms observed, pos+cell "
-                        "denoised) + CSP loss are inherited from the backbone's saved config. "
-                        "This is the planner architecture: JSON-composition observed "
-                        "atoms + atoms_i->CFG task conditioning.")
+                        "denoised) + CSP loss are inherited from the backbone's saved config.")
     p.add_argument("--out_dir", required=True)
     p.add_argument("--total_steps", type=int, default=10000)
     p.add_argument("--batch_size", type=int, default=4,
@@ -969,12 +972,9 @@ def parse_args():
                    help="LR for AtomsMapper + cond_adapt/mixin layers + aux head.")
     p.add_argument("--lora_lr", type=float, default=0.0,
                    help="LR for Stage 2 LoRA params on Qwen3. Default 0 (Stage 3a, frozen LLM). "
-                        "Set >0 to enter Stage 3b (unfreeze LoRA on Qwen3). Recommended: 1e-5 "
-                        "to 5e-5 — much lower than Stage 2's 2e-4 since the diffusion+aux "
-                        "gradient is noisier, and LoRA at high lr destroys Qwen3's "
-                        "hidden-state diversity. With aux composition loss "
-                        "as anchor, low-lr LoRA can refine [atoms_i] hidden states without "
-                        "drifting into the degenerate equilibrium.")
+                        "Set >0 to enter Stage 3b (unfreeze LoRA on Qwen3). Values of 1e-5 "
+                        "to 5e-5 work well; a high LoRA LR collapses the diversity of the "
+                        "[atoms_i] hidden states. Pair with the composition aux loss.")
     p.add_argument("--contrastive_lambda", type=float, default=0.0,
                    help="Weight on the off-diag-cosine contrastive loss that decorrelates "
                         "AtomsMapper outputs across the batch. Default 0 (disabled). Note: "
@@ -986,8 +986,8 @@ def parse_args():
                    help="Auxiliary supervision target on AtomsMapper output. 'composition' "
                         "predicts a multi-hot Z=1..100 of the target structure (BCE). "
                         "'composition_count' adds a per-element CE on the exact integer count "
-                        "(clamped to MAX_COUNT=20) on top of the same presence BCE — drop-in "
-                        "replacement for 'composition' that pressures stoichiometry.")
+                        "(clamped to MAX_COUNT=20) on top of the same presence BCE, which adds "
+                        "pressure on stoichiometry.")
     p.add_argument("--aux_lambda", type=float, default=1.0,
                    help="Weight on the auxiliary loss in total = L_diff + λ_aux * L_aux + "
                         "λ_contrastive * L_contrastive.")
@@ -998,8 +998,7 @@ def parse_args():
                    help="Bypass the K random-init [atoms_i] embeddings and pool from "
                         "the position immediately preceding the first [atoms_i] token. "
                         "Returns K copies of that hidden state so AtomsMapper API stays "
-                        "the same. Tests whether the random-init [atoms_i] tokens are "
-                        "the bottleneck for archetype-knowledge preservation.")
+                        "the same.")
     p.add_argument("--aux_warmup_steps", type=int, default=0,
                    help="Pre-train AtomsMapper on aux loss only for N steps (zero-out L_diff). "
                         "Useful if mapper output starts uninformative; lets the aux head "
@@ -1019,13 +1018,10 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--max_num_tokens", type=int, default=2048)
     p.add_argument("--num_output_atom_tokens", type=int, default=8,
-                   help="K — number of [atoms_{i}] output-side tokens emitted at the end "
-                        "of the assistant turn. Default 8. Reduce to 4 for the "
-                        "K=4 ablation; increase to 16 to give Qwen3 more capacity for "
-                        "spreading structural info across positions before AtomsMapper "
-                        "pooling. Each change requires a fresh Stage 3b run from the Stage 2 "
-                        "ckpt — load_alm migrates the saved [atoms_i] embedding rows to the "
-                        "new K (truncating prefix on shrink, freshly init'ing extras on grow).")
+                   help="K: number of [atoms_{i}] output-side tokens emitted at the end "
+                        "of the assistant turn. Default 8. Changing K requires a fresh Stage 3b "
+                        "run from the Stage 2 checkpoint; load_alm migrates the saved [atoms_i] "
+                        "embedding rows to the new K (truncating on shrink, fresh init on grow).")
     p.add_argument("--atoms_mapper_mid_dim", type=int, default=2048,
                    help="Hidden width of AtomsMapper's two-Linear-with-GELU MLP. Default "
                         "2048. Bump to 4096 to give the K*4096 -> 512 "
@@ -1048,66 +1044,62 @@ def parse_args():
                         "'auto' (default): sniff bridge_kind from --resume_atoms_mapper if set, "
                         "else default to 'pool' for backward compatibility.")
     p.add_argument("--cond_adapt_n_heads", type=int, default=4,
-                   help="Number of attention heads for the qformer IP-Adapter cross-attention "
+                   help="Number of attention heads for the IP-Adapter cross-attention "
                         "cond_adapt. Must divide MatterGen's emb_size_atom=512. Ignored when "
                         "bridge_kind=pool.")
     # ── CFG-interface controls (compose freely) ───────────────────────────────
     p.add_argument("--bridge_out_norm", action="store_true",
                    help="Magnitude control: LayerNorm the QFormer cond-vector output to ~unit "
                         "RMS (FT-head convention) so the CFG delta has bounded scale. "
-                        "Currently wired for --bridge_kind qformer.")
+                        "Only used with --bridge_kind producer-consumer.")
     p.add_argument("--bridge_learnable_null", action="store_true",
-                   help="Learned null: use a LEARNABLE unconditional embedding "
+                   help="Learned null: use a learnable unconditional embedding "
                         "(LearnedEmbeddingSequence, opts out of the adapter zeros-rewrite) so CFG "
-                        "steers (cond − learned_null) not (cond − 0). For --bridge_kind qformer.")
+                        "steers toward (cond − learned_null) instead of (cond − 0). For --bridge_kind producer-consumer.")
     p.add_argument("--bridge_noise_gate", action="store_true",
                    help="Hand-set linear 1−t gate; prefer --bridge_tenc_fuse. "
                         "Scales the bridge contribution by w(t)=(1−t).")
     p.add_argument("--bridge_tenc_fuse", action="store_true",
                    help="Learned timestep fusion: make the QFormer/IP-Adapter "
-                        "cond TOKENS noise-aware — cond_t=LN(cond+MLP([cond, t_enc])), t_enc=native "
-                        "NoiseLevelEncoding, MLP final zero-init (no-op at step 0). The model LEARNS "
-                        "the noise-dependence instead of the hand-set 1−t gate. For --bridge_kind qformer.")
-    # ── Q-Former bridge (--bridge_kind qformer) ──────────────────────────────
+                        "cond tokens noise-aware: cond_t=LN(cond+MLP([cond, t_enc])), t_enc=native "
+                        "NoiseLevelEncoding, MLP final zero-init (no-op at step 0). The model learns "
+                        "the noise dependence instead of the hand-set 1−t gate. For --bridge_kind producer-consumer.")
+    # ── Q-Former bridge (--bridge_kind producer-consumer) ──────────────────────────────
     p.add_argument("--qformer_num_queries", type=int, default=16,
                    help="M: number of learned query tokens for the Q-Former bridge. "
                         "AtomsMapperProducerConsumer emits (B, M, 512); GemNet cond_adapt_use_ipa "
-                        "cross-attends over these M conditioning tokens. Only used when "
-                        "--bridge_kind qformer.")
+                        "cross-attends over these M conditioning tokens. Only used with "
+                        "--bridge_kind producer-consumer.")
     p.add_argument("--qformer_depth", type=int, default=2,
                    help="Number of {cross-attn, self-attn, MLP} Q-Former blocks. "
-                        "Only used when --bridge_kind qformer.")
+                        "Only used with --bridge_kind producer-consumer.")
     p.add_argument("--qformer_heads", type=int, default=8,
                    help="Number of attention heads inside each Q-Former block (must divide "
-                        "out_dim=512). Only used when --bridge_kind qformer.")
+                        "out_dim=512). Only used with --bridge_kind producer-consumer.")
     p.add_argument("--qformer_context_tokens", type=int, default=128,
                    help="N: number of LLM context hidden states (the N states immediately "
                         "before the first [atoms_0] token) prepended to the K [atoms_i] states "
                         "to form the Q-Former source sequence S = N + K. Plumbed to the ALM as "
-                        "qformer_n_context. Only used when --bridge_kind qformer.")
+                        "qformer_n_context. Only used with --bridge_kind producer-consumer.")
     p.add_argument("--qformer_input_atoms", type=int, default=0,
-                   help="L_in: when >0 (and --bridge_kind qformer), prepend up to L_in "
+                   help="L_in: when >0 (and --bridge_kind producer-consumer), prepend up to L_in "
                         "input-side <atoms> hidden states (the P_in(H) projected encoder "
-                        "features) to the Q-Former source, GUARANTEEING the input structure "
+                        "features) to the Q-Former source, so the input structure always "
                         "is in the producer context regardless of prompt length. Source "
                         "becomes [input_atoms(L_in) ++ context(N) ++ atoms_i(K)]; the Q-Former "
                         "is built with source_len = L_in+N+K, n_context = L_in+N.")
     p.add_argument("--qformer_dir_aux_lambda", type=float, default=0.0,
                    help="Weight for the direction-aux CE loss on the Q-Former output. When >0 "
-                        "(and --bridge_kind qformer), AtomsMapperProducerConsumer.direction_logits(am_out) "
+                        "(and --bridge_kind producer-consumer), AtomsMapperProducerConsumer.direction_logits(am_out) "
                         "predicts the ±1 task_direction sign; CE is computed on finite-direction "
-                        "rows only. Does NOT attach task_direction as a ChemGraph cond_field.")
+                        "rows only.")
     p.add_argument("--qformer_dir_aux_pool", choices=("mean", "query0"), default="mean",
                    help="How AtomsMapperProducerConsumer.direction_logits pools the M query tokens before "
                         "the 2-way direction head: 'mean' over queries or the first query 'query0'.")
     p.add_argument("--qformer_dir_margin_lambda", type=float, default=0.0,
-                   help="Weight for the directional COSINE-MARGIN loss (bridge-internal). Unlike "
-                        "the CE dir-aux (satisfied by tiny linear separability → cond stays at "
-                        "high cross-direction cosine), this forces pooled am_out to carry an "
-                        "ANGULAR directional component along ±dir_proto: relu(margin − sign(td)·"
-                        "cos(pooled, dir_proto)) on finite-direction rows. Drives the cross-direction "
-                        "cosine DOWN while leaving the orthogonal complement free for composition. "
-                        "No external cond_field, no extra forward, no pairs.")
+                   help="Weight for a cosine-margin loss that pushes pooled am_out along "
+                        "±dir_proto for higher/lower rows: relu(margin − sign(td)·"
+                        "cos(pooled, dir_proto)) on finite-direction rows.")
     p.add_argument("--qformer_dir_margin", type=float, default=0.3,
                    help="Target angular margin for --qformer_dir_margin_lambda: each higher row is "
                         "pushed to cos(pooled, dir_proto) ≥ margin, each lower row ≤ −margin. Larger "
@@ -1118,30 +1110,21 @@ def parse_args():
                         "--contrastive_lambda path already decorrelates mapper outputs across the "
                         "batch for any bridge_kind).")
     p.add_argument("--qformer_dir_contrastive_lambda", type=float, default=0.0,
-                   help="Weight for the same-input directional contrastive loss on the RAW LLM "
-                        "hidden states (extract_atoms_hidden_states output, NOT am_out). For each "
+                   help="Weight for a same-input directional contrastive loss. For each "
                         "directional row with an opposite-direction sibling sharing the same "
-                        "input_source_idx, the sibling's prompt is forwarded through the SAME bridge "
-                        "extractor and the loss is relu(cos(flatten(raw_i), flatten(partner_raw_i)) - "
-                        "target), averaged over rows that have a partner. Forces Qwen3 to encode "
-                        "higher/lower direction at the bridge-extracted positions (where the "
-                        "cross-direction cosine otherwise stays high). No learnable prototype, no "
-                        "MatterGen cond_field — bridge-internal.")
+                        "input_source_idx, the sibling's prompt is forwarded through the same bridge "
+                        "extractor and the loss is relu(cos(x_i, x_partner_i) - target), averaged "
+                        "over rows that have a partner. The layer x is set by "
+                        "--qformer_dir_contrastive_on.")
     p.add_argument("--qformer_dir_contrastive_target", type=float, default=0.5,
                    help="Max-allowed cosine for --qformer_dir_contrastive_lambda: the loss only "
-                        "penalizes a same-input higher/lower pair whose RAW-hidden-state cosine "
-                        "EXCEEDS this target (relu(cos - target)). Lower = stronger separation. "
-                        "0.5 leaves the pair free to share up to half its direction while still "
-                        "pulling the otherwise-high cosine down.")
+                        "penalizes a same-input higher/lower pair whose cosine "
+                        "exceeds this target (relu(cos - target)). Lower means stronger separation.")
     p.add_argument("--qformer_dir_contrastive_on", choices=["raw", "am_out"], default="raw",
-                   help="WHICH layer the directional contrastive acts on. 'raw': the "
-                        "flattened extract_atoms_hidden_states output (context_plus_atoms, S*4096) — the "
-                        "128 context tokens trivially differ by prompt word, so the loss is absorbed there "
-                        "without pressuring the MatterGen-facing signal (cond-token cosine unchanged). "
-                        "'am_out': the POST-MAPPER cond tokens (M*512) — the EXACT layer MatterGen "
-                        "consumes; runs the QFormer on the partner's raw states and minimizes "
-                        "relu(cos(flatten(am_out_i), flatten(am_out_partner_i)) - target). Excludes the "
-                        "trivially-differing context tokens → forces the QFormer OUTPUT to encode direction.")
+                   help="Layer the directional contrastive acts on. 'raw': the flattened "
+                        "extract_atoms_hidden_states output (S*4096). 'am_out': the post-mapper "
+                        "cond tokens (M*512) that MatterGen consumes; the Q-Former is also run on "
+                        "the partner's raw states.")
     p.add_argument("--init_atoms_tokens_from_eos", action="store_true",
                    help="CoT-style initialization: copy the LLM's <|im_end|> "
                         "embedding row into the K=8 [atoms_i] rows at construction. "
@@ -1158,9 +1141,9 @@ def parse_args():
                         "content. Pair with the existing pairs.parquet for the last-user-prompt-tokens "
                         "variant, or with a description-in-assistant-turn data variant. "
                         "'context_plus_atoms': "
-                        "Q-Former source — N=qformer_context_tokens context states immediately "
+                        "Q-Former source: N=qformer_context_tokens context states immediately "
                         "before [atoms_0] followed by the K [atoms_i] states, returning (B, N+K, "
-                        "hidden_dim). Set automatically when --bridge_kind qformer.")
+                        "hidden_dim). Set automatically when --bridge_kind producer-consumer.")
     p.add_argument("--description_in_assistant_turn", action="store_true",
                    help="At training time, move the description (the `narrative` column of "
                         "pairs.parquet) from the user turn into the assistant turn, before the "
@@ -1173,8 +1156,8 @@ def parse_args():
                         "'...-formation_energy-lower' -> ' Target: lower formation energy.') onto "
                         "the END of the assistant anchor, immediately before [atoms_0]. Puts the "
                         "directional word in the last context tokens the QFormer's queries attend "
-                        "most (otherwise the word is buried in the user turn). Pure TEXT processed "
-                        "by the LLM — NOT a hand-set vector/cond_field.")
+                        "most (otherwise the word is buried in the user turn). The tag is plain "
+                        "text processed by the LLM.")
     p.add_argument("--lora_attn_lr", type=float, default=None,
                    help="Override --lora_lr for LoRA on q_proj/k_proj/v_proj/o_proj. "
                         "If unset (default), all LoRA params share --lora_lr. When set, "
@@ -1188,30 +1171,27 @@ def parse_args():
                    help="Fraction of training steps that additionally include a text-only "
                         "LM-CE micro-batch from Stage 2 data (MaScQA), interleaved with the "
                         "diffusion step. Default 0.0 (off). Set 0.1 to fire one text batch "
-                        "every ~10 optimizer steps. Addresses the Stage-3a Q&A response-format "
-                        "regression.")
+                        "every ~10 optimizer steps. Helps preserve Stage 2 Q&A response format.")
     p.add_argument("--stage2_text_lambda", type=float, default=1.0,
                    help="Weight on the Stage-2-text LM CE loss in the combined gradient.")
     p.add_argument("--lm_loss_json_lambda", type=float, default=0.0,
                    help="Weight on the JSON-composition LM-CE loss. When >0, the dataset "
                         "prepends `{\"counts\": {El: cell_count}}` to the assistant turn and "
                         "supervises those JSON tokens (masking [atoms_i]); the main step adds "
-                        "lambda * LM-CE via a second ALM forward. Teaches the model to emit "
-                        "clean JSON jointly with the bridge — avoids the diffusion-LoRA "
-                        "repetition-collapse in the self-planner. Try 0.5.")
+                        "lambda * LM-CE via a second ALM forward, so the model keeps emitting "
+                        "clean composition JSON while the bridge trains. Try 0.5.")
     p.add_argument("--atoms_before_json", action="store_true",
-                   help="Variant A: emit [atoms_i] BEFORE the {\"counts\":...} JSON in the "
-                        "assistant turn (requires --lm_loss_json_lambda>0). The bridge then "
-                        "reads the atoms hidden states pre-composition-commit (causal: they "
-                        "cannot see the JSON to their right), surfacing the direction the "
-                        "JSON-first layout compresses away. Inference must match "
+                   help="Emit [atoms_i] before the {\"counts\":...} JSON in the "
+                        "assistant turn (requires --lm_loss_json_lambda>0), so the bridge "
+                        "reads the atoms hidden states before the composition is written. "
+                        "Inference must match "
                         "(generate_stage3.get_alm_embedding atoms_before_json=True).")
     p.add_argument("--stage2_text_batch_size", type=int, default=2,
                    help="Per-rank batch size for the interleaved text micro-batch. Keep "
-                        "small — text samples skip the atomistic splice but still cost "
+                        "small: text samples skip the atomistic splice but still cost "
                         "one full Qwen3 forward.")
     p.add_argument("--cond_adapt_depth", type=int, default=1,
-                   help="No-op (the qformer bridge uses a single IP-Adapter "
+                   help="No-op (the Q-Former bridge uses a single IP-Adapter "
                         "cross-attention layer). Retained for checkpoint-metadata "
                         "compatibility; leave at the default 1.")
     p.add_argument("--full_finetuning", action="store_true",
@@ -1222,7 +1202,7 @@ def parse_args():
                         "lr=5e-6). Significantly larger memory footprint; expect "
                         "to need batch_size=2 or grad_accum at batch_size=4.")
     p.add_argument("--llm_full_finetuning", action="store_true",
-                   help="Unfreeze the ENTIRE Qwen3-8B base LLM (all decoder block "
+                   help="Unfreeze the entire Qwen3-8B base LLM (all decoder block "
                         "weights, embeddings, lm_head). At Stage 3, Stage 2 LoRA "
                         "is merged into the base by load_alm, so unfreezing here "
                         "trains every Qwen3 weight. Mutually exclusive with "
@@ -1233,12 +1213,10 @@ def parse_args():
                         "default) to avoid catastrophic forgetting of Stage 2 "
                         "instruction-following.")
     p.add_argument("--llm_lr", type=float, default=5e-7,
-                   help="LR for the full-Qwen3-8B optimizer group when "
-                        "--llm_full_finetuning is set. Default 5e-7 (much smaller "
-                        "than --lora_lr's 1e-5 default, because full-FT touches "
-                        "every weight not just the LoRA delta).")
+                   help="LR for the full-LLM optimizer group under "
+                        "--llm_full_finetuning. Default 5e-7.")
     p.add_argument("--unfreeze_atoms_i_embeds", action="store_true",
-                   help="Stage-3b targeted-embedding-unfreeze: train ONLY the K=8 "
+                   help="Stage 3b targeted embedding unfreeze: train only the K=8 "
                         "[atoms_i] input-embedding rows (32K params) on top of LoRA, "
                         "via a gradient mask that zeros all other embed rows. Unlike "
                         "--llm_full_finetuning (8B full-FT → FSDP), the trainable set "
@@ -1246,12 +1224,12 @@ def parse_args():
                         "per GPU). Requires Stage 3b (--lora_lr > 0). atoms_i rows ride "
                         "the lora optimizer group (weight_decay=0).")
     p.add_argument("--no_alm_embedding_cond", action="store_true",
-                   help="CONTROL: drop the alm_embedding cond_field entirely (no-LLM-bridge "
+                   help="Control run: drop the alm_embedding cond_field entirely (no-LLM-bridge "
                         "baseline). Skips the ALM forward at training (much faster). When "
                         "set, --aux_target_kind must be `none` (no AtomsMapper → no aux head).")
     p.add_argument("--handset_direction_token", action="store_true",
                    help="Directional editing: with --num_output_atom_tokens 9, "
-                        "OVERWRITE the 9th [atoms_8] token's hidden block with a "
+                        "overwrite the 9th [atoms_8] token's hidden block with a "
                         "deterministic direction code (first-half one-hot=higher, "
                         "second-half=lower, all-zero=unconditional), scale-matched to the "
                         "8 real structure tokens' RMS. The 8 real tokens carry structure "
@@ -1260,17 +1238,17 @@ def parse_args():
     p.add_argument("--use_task_direction_cond", action="store_true",
                    help="Directional editing: add `task_direction` as a scalar "
                         "±1 cond_field (sinusoidal NoiseLevelEncoding, like dft_band_gap) "
-                        "ALONGSIDE the alm_embedding bridge. +1=higher, -1=lower, parsed "
+                        "alongside the alm_embedding bridge. +1=higher, -1=lower, parsed "
                         "from each row_id suffix; rows without a -higher/-lower suffix get "
-                        "NaN (unconditional). The bridge carries the input structure; this "
-                        "clean channel carries the direction bit. Forced by balanced data.")
+                        "NaN (unconditional). The bridge carries the input structure and "
+                        "this channel carries the direction bit.")
     p.add_argument("--fresh_lora_rank", type=int, default=None,
                    help="If set (Stage 3b only): merge the Stage 2 LoRA into base, then "
                         "attach a NEW small LoRA at this rank for Stage 3 training. Lets you "
-                        "decouple Stage 3 capacity from the Stage 2 LoRA rank — Stage 2 "
-                        "capability is baked into the merged base, Stage 3 adapts on top with "
-                        "a fresh randomly-initialized A/B. Pair with a higher --lora_lr "
-                        "(~1e-4..2e-4) since the LoRA starts at zero, not warm.")
+                        "decouple Stage 3 capacity from the Stage 2 LoRA rank: Stage 2 "
+                        "capability is baked into the merged base, and Stage 3 adapts on top with "
+                        "a freshly initialized A/B. Pair with a higher --lora_lr "
+                        "(~1e-4..2e-4) since the new LoRA starts from zero.")
     p.add_argument("--fresh_lora_alpha", type=int, default=None,
                    help="α for the fresh Stage 3 LoRA (default: 2 × fresh_lora_rank, matching "
                         "Stage 2 scaling=2.0). Drop to fresh_lora_rank for scaling=1.0.")
@@ -1278,7 +1256,7 @@ def parse_args():
                    help="Resume a fresh-LoRA run. Path to a step=N dir from a prior fresh-LoRA "
                         "training (contains lora_adapter/ with the trained r=fresh_lora_rank "
                         "weights). With --fresh_lora_rank set, --alm_checkpoint must point at "
-                        "the ORIGINAL Stage 2 ckpt (so the merged base is recovered exactly), "
+                        "the original Stage 2 ckpt (so the merged base is recovered exactly), "
                         "and these saved fresh-LoRA weights overwrite the random init. Pair "
                         "with --resume_atoms_mapper pointing at the same step=N's "
                         "atoms_mapper.pt to restore optimizer + AtomsMapper + cond_adapt/mixin.")
@@ -1354,12 +1332,12 @@ def main():
     if is_main_process():
         if fresh_lora:
             a = args.fresh_lora_alpha or 2 * args.fresh_lora_rank
-            mode = (f"Stage 3b — Stage 2 LoRA MERGED, fresh LoRA "
+            mode = (f"Stage 3b: Stage 2 LoRA merged, fresh LoRA "
                     f"(r={args.fresh_lora_rank}, α={a}) attached for Stage 3")
         elif stage_3b:
-            mode = "Stage 3b — LoRA UNFROZEN"
+            mode = "Stage 3b: LoRA unfrozen"
         else:
-            mode = "Stage 3a — LoRA frozen+merged"
+            mode = "Stage 3a: LoRA frozen+merged"
         print(f"[stage3a] Loading ALM from {args.alm_checkpoint} ({mode}) ...")
     # Resolve bridge_kind early; the Q-Former bridge forces the context_plus_atoms source.
     bridge_kind = _resolve_bridge_kind(args)
@@ -1598,10 +1576,10 @@ def main():
         n_lora = sum(p.numel() for p in lora_params)
         n_llm_full = sum(p.numel() for p in llm_full_params)
         if stage_3b:
-            print(f"[stage3a] LoRA: TRAINABLE (Stage 3b, lora_lr={args.lora_lr:.0e})")
+            print(f"[stage3a] LoRA: trainable (Stage 3b, lora_lr={args.lora_lr:.0e})")
             print(f"[stage3a] Trainable LoRA:         {n_lora/1e6:6.1f}M")
         elif llm_full_ft:
-            print(f"[stage3a] LLM: FULL-FT (Stage 4, llm_lr={args.llm_lr:.0e})")
+            print(f"[stage3a] LLM: full fine-tuning (llm_lr={args.llm_lr:.0e})")
             print(f"[stage3a] Trainable LLM (full):  {n_llm_full/1e9:6.2f}B")
         else:
             print(f"[stage3a] LoRA: FROZEN (Stage 3a, merged into base)")
@@ -1913,7 +1891,7 @@ def main():
         else:
             am_out = None
 
-        # qformer bridge: am_out is (B, M, out_dim) and contrastive/aux pool over M.
+        # Q-Former bridge: am_out is (B, M, out_dim) and contrastive/aux pool over M.
         am_out_is_seq = am_out is not None and am_out.dim() == 3
 
         # ── Contrastive regularization (decorrelate mapper outputs across batch) ──
@@ -1991,7 +1969,7 @@ def main():
                     metrics["qformer_cond_norm"] = am_out.norm(dim=-1).mean().detach()
                     metrics["qformer_cond_std"] = am_out.std().detach()
 
-        # ── Directional COSINE-MARGIN loss (bridge-internal cosine attack) ────
+        # ── Directional cosine-margin loss ──────────────────────────────────────
         # Forces pooled am_out angularly along +-dir_proto so cond_higher/lower become non-collinear.
         loss_dir_margin = torch.tensor(0.0, device=device)
         if (bridge_kind in ("producer-consumer", "producer-consumer-pool") and args.qformer_dir_margin_lambda > 0
@@ -2040,7 +2018,7 @@ def main():
                                         dtype=torch.long)
                 if (args.qformer_dir_contrastive_on == "am_out"
                         and atoms_mapper_module is not None and am_out is not None):
-                    # Compare POST-MAPPER cond tokens (the MatterGen-facing layer).
+                    # Compare post-mapper cond tokens (the MatterGen-facing layer).
                     partner_am = atoms_mapper_module(partner_raw.flatten(1).float())
                     main_v = am_out[idx_hp_t].flatten(1).float()         # (n_hp, M*out)
                     partner_v = partner_am.flatten(1).float()            # (n_hp, M*out)

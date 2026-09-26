@@ -58,15 +58,15 @@ def validity_geom(s: Structure, min_dist: float = 0.5) -> bool:
 def validity_charge(s: Structure) -> bool:
     """True iff a charge-neutral oxidation-state assignment exists (smact); matches CDVAE."""
     try:
-        import smact  # noqa: F401
+        from smact import element_dictionary, neutral_ratios
         from smact.screening import pauling_test
-    except Exception:
-        return False
+    except ImportError as e:
+        raise ImportError("validity_charge needs smact (pip install 'smact>=3.2'); "
+                          "without it every structure would score charge-invalid") from e
     try:
         comp = Composition(s.composition.reduced_formula)
         symbols = [str(el) for el in comp.elements]
         counts = [int(comp[el]) for el in comp.elements]
-        from smact import element_dictionary, neutral_ratios
         elem_objs = [element_dictionary().get(sym) for sym in symbols]
         if any(e is None for e in elem_objs):
             return False

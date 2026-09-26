@@ -41,7 +41,7 @@ def load_train_formulas(train_csv: Path) -> set[str]:
     import csv
     formulas = set()
     if not train_csv.exists():
-        return formulas
+        raise FileNotFoundError(f"novelty reference not found: {train_csv} (pass --train_csv)")
     with open(train_csv) as f:
         for row in csv.DictReader(f):
             cif = row.get("cif")
@@ -82,7 +82,8 @@ def main():
             sids.append(fp.stem)
         except Exception:
             pass
-    print(f"[mp20-hull] {len(structs)} structures parsed", flush=True)
+    n_unparsed = len(cif_files) - len(structs)
+    print(f"[mp20-hull] {len(structs)} structures parsed ({n_unparsed} unparseable CIFs)", flush=True)
 
     valid_geom = [validity_geom(s) for s in structs]
     valid_charge = []
@@ -98,16 +99,11 @@ def main():
 
     print(f"[mp20-hull] uniqueness via DisorderedStructureMatcher (mg-eval) ...", flush=True)
     matcher = mg_eval_matcher()
-    try:
-        uniq_idx = unique_indices(structs, matcher=matcher)
-        is_unique = [False] * len(structs)
-        for i in uniq_idx:
-            is_unique[i] = True
-        uniq_rate = sum(is_unique) / len(structs)
-    except Exception as e:
-        print(f"  uniqueness err: {e}", flush=True)
-        is_unique = [True] * len(structs)
-        uniq_rate = 1.0
+    uniq_idx = unique_indices(structs, matcher=matcher)
+    is_unique = [False] * len(structs)
+    for i in uniq_idx:
+        is_unique[i] = True
+    uniq_rate = sum(is_unique) / len(structs)
     print(f"[mp20-hull] uniqueness={uniq_rate:.3f}", flush=True)
 
     train_formulas = load_train_formulas(args.train_csv)
@@ -123,22 +119,18 @@ def main():
         reference = load_hull_reference()
 
     print(f"[mp20-hull] relaxing {len(structs)} via MatterSim ...", flush=True)
-    relaxed_atoms_list: list = [None] * len(structs)
-    energies_arr = None
-    try:
-        relaxed_atoms_list, energies_arr = relax_structures_mattersim(
-            structs,
-            device=args.mattersim_device,
-        )
-    except Exception as e:
-        print(f"[mp20-hull] relax err: {e}", flush=True)
+    # A relaxation failure raises: writing a result with every E_h missing would look like a real 0.0.
+    relaxed_atoms_list, energies_arr = relax_structures_mattersim(
+        structs,
+        device=args.mattersim_device,
+    )
 
     from pymatgen.io.ase import AseAtomsAdaptor
     print(f"[mp20-hull] computing E_h vs MP-2020 hull ...", flush=True)
     e_above = []
     n_err_logged = 0
     # energies_arr: total energy in eV, per structure
-    energies = energies_arr.tolist() if energies_arr is not None else [None] * len(relaxed_atoms_list)
+    energies = energies_arr.tolist()
     for s_init, ase_atoms, e_total in zip(structs, relaxed_atoms_list, energies):
         if ase_atoms is None or e_total is None:
             e_above.append(None)
@@ -181,6 +173,7 @@ def main():
 
     result = {
         "n_structures": len(structs),
+        "n_cif_unparsed": n_unparsed,
         "validity": {
             "geom_rate": sum(valid_geom) / len(structs),
             "charge_rate": sum(valid_charge) / len(structs),
@@ -206,14 +199,10 @@ def main():
         "relax_mlip": "MatterSim",
         "matcher": "DisorderedStructureMatcher (mg-eval default)",
         "novelty_method": "formula-level vs MP-20 train CSV",
-        "compare_to": {
-            "CrystalReasoner_SUN@0.016": sun016,
-            "CrysJEPA_SUN@0.1":          sun100,
-        },
     }
     args.out_path.parent.mkdir(parents=True, exist_ok=True)
     args.out_path.write_text(json.dumps(result, indent=2))
-    print(f"\n[mp20-hull] HEADLINE → {args.out_path}")
+    print(f"\n[mp20-hull] wrote {args.out_path}")
     for k, v in result.items():
         print(f"  {k}: {v}")
 

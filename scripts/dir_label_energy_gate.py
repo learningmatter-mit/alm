@@ -4,19 +4,17 @@
 Usage: python scripts/dir_label_energy_gate.py --parents mp_3d_2020 oqmd --n_pairs 150
 """
 
-import argparse, os, random, sys
+import argparse, os, random
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
 
-_ALM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_ALM_ROOT, "alm"))
-sys.path.insert(0, os.path.join(_ALM_ROOT, "helper_scripts"))
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from pymatgen.core import Composition
 from eval_edit import _ase_atoms_from_struct
-from eval.structure_metrics import relax_structures_mattersim, total_energy_per_atom
+from structure_metrics import relax_structures_mattersim, total_energy_per_atom
 from paths import DATA_ROOT
 
 NARR = Path(os.path.join(DATA_ROOT, "GPT-Narratives-for-Materials"))
@@ -133,7 +131,7 @@ def main():
         if not pairs:
             continue
 
-        # members already hold ASE Atoms; don't re-run _ase_atoms_from_struct (wants a struct dict)
+        # pairs already hold ASE Atoms
         flat, meta = [], []
         for k, (aA, aB, eA, eB) in enumerate(pairs):
             flat.append(aA); meta.append((k, "A"))
@@ -156,10 +154,10 @@ def main():
                 disagree += 1
         tot = agree + disagree
         rate = agree / tot if tot else float("nan")
-        print(f"\n[gate] === {parent} ORDERING AGREEMENT ===")
+        print(f"\n[gate] {parent}: ordering agreement")
         print(f"  scored={tot}  unscorable(NaN relax)={nan}")
         print(f"  DFT↔MatterSim same-sign ΔE = {agree}/{tot} = {rate:.3f}")
-        print(f"  VERDICT: {'USE DFT labels (high agreement)' if rate >= 0.8 else 'RELABEL with MatterSim (low agreement)'}\n", flush=True)
+        print(f"  recommendation: {'use DFT labels (high agreement)' if rate >= 0.8 else 'relabel with MatterSim (low agreement)'}\n", flush=True)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from paths import DATA_ROOT
 
 
@@ -110,7 +111,7 @@ def main() -> int:
     ap.add_argument("--pairs_parquet", type=Path,
                     default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs.parquet")))
     ap.add_argument("--templates_jsonl", type=Path,
-                    default=Path("helper_scripts/eval_prompts/ood_templates.jsonl"))
+                    default=Path(alm.__file__).parent / "eval" / "eval_prompts" / "ood_templates.jsonl")
     ap.add_argument("--out_path", type=Path,
                     default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_ood.parquet")))
     ap.add_argument("--batch_size", type=int, default=10000)

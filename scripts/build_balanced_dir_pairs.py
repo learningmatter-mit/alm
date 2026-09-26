@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import json
 import random
-import sys
 import os
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -15,10 +14,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-_ALM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_ALM_ROOT, "alm"))
-sys.path.insert(0, os.path.join(_ALM_ROOT, "helper_scripts"))
-
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from paths import DATA_ROOT
 
 NARR = Path(os.path.join(DATA_ROOT, "GPT-Narratives-for-Materials"))

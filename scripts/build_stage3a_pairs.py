@@ -9,6 +9,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from paths import DATA_ROOT
 
 
@@ -152,7 +153,7 @@ if __name__ == "__main__":
     parser.add_argument("--input_root", type=str, default=str(DEFAULT_INPUT_ROOT))
     parser.add_argument("--parents", nargs="+", default=DEFAULT_PARENTS)
     parser.add_argument("--out_path", type=str,
-                        default=os.path.join(DATA_ROOT, "stage3a/pairs.parquet"))
+                        default=os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs.parquet"))
     parser.add_argument("--max_atoms", type=int, default=20,
                         help="MatterGen Alex-MP-20 distribution; rows above are dropped.")
     parser.add_argument("--batch_size", type=int, default=4096)

@@ -86,7 +86,7 @@ def _collate(batch):
 def _eval_text_mcq(model, tokenizer, mcqs, args):
     """Text-only MCQ eval; returns (predictions, correct, total, n_leaked)."""
     predictions, correct, total, n_leaked = [], 0, 0, 0
-    samples_buf, gold_buf, id_buf = [], [], []
+    samples_buf, gold_buf = [], []
 
     def flush():
         nonlocal correct, total, n_leaked
@@ -105,7 +105,7 @@ def _eval_text_mcq(model, tokenizer, mcqs, args):
             correct += int(ok)
             if leaked:
                 n_leaked += 1
-        samples_buf.clear(); gold_buf.clear(); id_buf.clear()
+        samples_buf.clear(); gold_buf.clear()
 
     for q in mcqs:
         choices = q["choices"]
@@ -129,7 +129,6 @@ def _eval_text_mcq(model, tokenizer, mcqs, args):
             "id": q.get("id"),
         })
         gold_buf.append(q["gold"])
-        id_buf.append(q.get("id"))
         if len(samples_buf) >= args.batch_size:
             flush()
     flush()

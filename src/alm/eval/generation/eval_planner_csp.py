@@ -25,7 +25,7 @@ _ALM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ALM_ROOT)
 
 from loader import load_alm  # noqa: E402
-from paths import DATA_ROOT, RUNS  # noqa: E402
+from paths import CHECKPOINTS, DATA_ROOT, RUNS  # noqa: E402
 
 BENCHMARK_CSV = {
     "mp_20":   Path(os.path.join(DATA_ROOT, "eval_data/csp/mp_20/test.csv")),
@@ -272,13 +272,13 @@ def load_targets(benchmark: str = "mp_20"):
 
 
 def load_targets_parquet(parquet_path: Path, max_rows: int = 1000,
-                         max_n_atoms: int = 30, seed: int = 0):
-    """Load (row_id, Structure) from a stage3a-style parquet's `atoms_struct` column: last `max_rows` rows with n_atoms <= max_n_atoms (held-out)."""
+                         max_n_atoms: int = 30):
+    """Load (row_id, Structure) from a parquet's `atoms_struct` column: last `max_rows` rows with n_atoms <= max_n_atoms (held-out)."""
     import pyarrow.parquet as pq
     import numpy as np
     table = pq.read_table(parquet_path)
     n_total = table.num_rows
-    # stream chunks from the end to avoid loading the full 1.35M-row parquet into memory
+    # Walk the table backwards in chunks so the held-out tail rows are taken first.
     targets = []
     chunk_size = 50_000
     pos = n_total
@@ -318,10 +318,10 @@ def load_targets_parquet(parquet_path: Path, max_rows: int = 1000,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--alm_checkpoint", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "alm_checkpoints/stage2_r128_arxivIT/step=12000")))
+                    default=Path(os.path.join(CHECKPOINTS, "alm-core")))
     ap.add_argument("--mg_ckpt_dir", type=Path,
-                    default=Path(os.path.join(RUNS, "mg_csp_train")),
-                    help="Local MG-CSP training dir (contains checkpoints/ + config.yaml).")
+                    default=Path(os.path.join(RUNS, "csp_backbone")),
+                    help="MatterGen CSP checkpoint dir (contains checkpoints/ + config.yaml).")
     ap.add_argument("--max_rows", type=int, default=1000)
     ap.add_argument("--K", type=int, default=20)
     ap.add_argument("--guidance_factor", type=float, default=1.0)
@@ -500,15 +500,15 @@ def main():
         "mg_ckpt_dir": str(args.mg_ckpt_dir),
         "alm_checkpoint": str(args.alm_checkpoint),
         "use_oracle_comp": args.use_oracle_comp,
-        "note": ("LLM planner → MG-CSP CSP-mode" if not args.use_oracle_comp
-                 else "oracle composition → MG-CSP (no-LLM control)"),
+        "note": ("LLM planner composition, CSP-mode MatterGen" if not args.use_oracle_comp
+                 else "ground-truth composition, CSP-mode MatterGen (no-LLM control)"),
     }
     (args.out_dir / "metrics.json").write_text(json.dumps(headline, indent=2))
     with (args.out_dir / "predictions.jsonl").open("w") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
 
-    print(f"\n[planner-csp] HEADLINE on MP-20 ({n} rows, K={args.K}):")
+    print(f"\n[planner-csp] {src} ({n} rows, K={args.K}):")
     print(f"  M@1               = {headline['match_rate_n1']:.4f}  ({n_match_n1}/{n})")
     print(f"  M@K               = {headline['match_rate_nK']:.4f}  ({n_match_nK}/{n})")
     if not args.use_oracle_comp:

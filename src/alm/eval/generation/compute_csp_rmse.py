@@ -1,4 +1,8 @@
-"""Post-hoc RMSE@1 and RMSE@K for planner_csp eval outputs (--out_root = per-shard parent dir)."""
+"""Post-hoc RMSE@1 and RMSE@K for sharded CSP eval outputs (--out_root = per-shard parent dir).
+
+RMSE@1 is the matched RMSD of candidate 0; RMSE@K is the minimum matched RMSD over the K candidates
+(CDVAE/CrystaLLM convention, same as eval_csp.py and structure_metrics.py). Both average over matched rows.
+"""
 from __future__ import annotations
 
 import argparse
@@ -14,12 +18,6 @@ warnings.filterwarnings("ignore")
 from pymatgen.analysis.structure_matcher import StructureMatcher
 from pymatgen.core import Structure
 
-import os
-
-from paths import DATA_ROOT
-
-MP20_CSV = Path(os.path.join(DATA_ROOT, "eval_data/csp/mp_20/test.csv"))
-MPTS52_CSV = Path(os.path.join(DATA_ROOT, "eval_data/csp/mpts_52/test.csv"))
 TOL = dict(ltol=0.3, stol=0.5, angle_tol=10.0)
 
 
@@ -37,7 +35,7 @@ def load_gt_structures_csv(csv_path: Path):
 
 
 def load_gt_structures_parquet(parquet_path: Path, want_row_ids: set | None = None):
-    """GT structures from atoms_struct, keyed by row_id; want_row_ids filters streaming (doping parquet is 1M rows)."""
+    """GT structures from atoms_struct, keyed by row_id; want_row_ids filters while streaming large parquets."""
     import pyarrow.parquet as pq
     import numpy as np
     pf = pq.ParquetFile(str(parquet_path))
@@ -76,19 +74,17 @@ def load_gt_structures(source: Path, want_row_ids: set | None = None):
     return load_gt_structures_csv(source)
 
 
-def load_generated_cif(zip_path: Path, idx: int) -> Structure | None:
-    if not zip_path.exists():
-        return None
-    try:
-        with zipfile.ZipFile(zip_path) as z:
-            names = sorted(z.namelist())
-            if idx >= len(names):
-                return None
-            with z.open(names[idx]) as f:
-                cif_str = f.read().decode("utf-8")
-        return Structure.from_str(cif_str, fmt="cif")
-    except Exception:
-        return None
+def load_generated_cifs(zip_path: Path) -> list[Structure | None]:
+    """All candidates in the zip, in sorted-name order (candidate 0 first); None for unparseable CIFs."""
+    out: list[Structure | None] = []
+    with zipfile.ZipFile(zip_path) as z:
+        for name in sorted(z.namelist()):
+            try:
+                with z.open(name) as f:
+                    out.append(Structure.from_str(f.read().decode("utf-8"), fmt="cif"))
+            except Exception:
+                out.append(None)
+    return out
 
 
 def find_gens_zip(out_root: Path, row_id: str) -> Path | None:
@@ -106,30 +102,11 @@ def main():
                     help="Per-shard parent dir; predictions.jsonl read from here.")
     ap.add_argument("--max_rows", type=int, default=-1,
                     help="Cap for fast sanity (-1 = all).")
-    ap.add_argument("--gt_source", type=Path, default=None,
-                    help="Path to a CSV (MP-20/MPTS-52 test) or parquet "
-                         "(stage3a polymorph/doping/app/ood) with GT structures. "
-                         "Default: auto-detect from out_root path (planner_csp_mp_20 → MP-20 CSV; "
-                         "planner_csp_mpts_52 → MPTS-52 CSV; oracle_task_* → matching parquet).")
+    ap.add_argument("--gt_source", type=Path, required=True,
+                    help="CSV (MP-20/MPTS-52 test split) or parquet with an atoms_struct column "
+                         "holding the GT structures.")
     args = ap.parse_args()
 
-    if args.gt_source is None:
-        out_str = str(args.out_root)
-        if "planner_csp_mp_20" in out_str:
-            args.gt_source = MP20_CSV
-        elif "planner_csp_mpts_52" in out_str:
-            args.gt_source = MPTS52_CSV
-        elif "oracle_task_polymorph" in out_str:
-            args.gt_source = Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_polymorph_under_hull.parquet"))
-        elif "oracle_task_doping" in out_str:
-            args.gt_source = Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_doping_strain_sub1M.parquet"))
-        elif "oracle_task_app" in out_str:
-            args.gt_source = Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_app.parquet"))
-        elif "oracle_task_ood" in out_str:
-            args.gt_source = Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_ood.parquet"))
-        else:
-            raise SystemExit(f"can't auto-detect GT source from out_root={out_str}; "
-                             f"pass --gt_source explicitly")
     print(f"[rmse] gt_source: {args.gt_source}", flush=True)
 
     pred = args.out_root / "predictions.jsonl"
@@ -140,7 +117,7 @@ def main():
         rows = rows[: args.max_rows]
     print(f"[rmse] {len(rows)} rows from {pred}", flush=True)
 
-    # Only load GT for predicted row_ids (critical for 1M-row parquets).
+    # Only load GT for predicted row_ids (large parquets).
     want_ids = set(r["row_id"] for r in rows if r.get("row_id"))
     gt = load_gt_structures(args.gt_source, want_row_ids=want_ids)
     print(f"[rmse] {len(gt)} GT structures loaded from {args.gt_source.name} (of {len(want_ids)} requested)", flush=True)
@@ -161,31 +138,30 @@ def main():
             continue
         target = gt[mp_id]
 
-        idx = r.get("first_match_idx", -1)
-        if idx < 0:
+        if r.get("first_match_idx", -1) < 0:
             continue
         zip_path = find_gens_zip(args.out_root, mp_id)
         if zip_path is None:
             n_zip_missing += 1
             continue
-        s = load_generated_cif(zip_path, idx)
-        if s is None:
-            n_zip_missing += 1
-            continue
-        try:
-            rms = matcher.get_rms_dist(target, s)
-            if rms is None:
-                n_match_recompute_fail += 1
-                continue
-            rmsd, _max = rms
-        except Exception:
+        cands = load_generated_cifs(zip_path)
+        rmsds: list[float | None] = []
+        for s in cands:
+            rd = None
+            if s is not None:
+                try:
+                    rd = matcher.get_rms_dist(target, s)
+                except Exception:
+                    rd = None
+            rmsds.append(float(rd[0]) if rd is not None else None)
+        matched = [v for v in rmsds if v is not None]
+        if not matched:
             n_match_recompute_fail += 1
             continue
-        rmse_nK.append(rmsd)
+        rmse_nK.append(min(matched))
         n_matched_nK_with_rmse += 1
-        # M@1 counts only when the first sample (idx==0) was the match.
-        if idx == 0 and r.get("matched_n1"):
-            rmse_n1.append(rmsd)
+        if rmsds[0] is not None:
+            rmse_n1.append(rmsds[0])
             n_matched_n1_with_rmse += 1
 
     n = len(rows)
@@ -197,12 +173,12 @@ def main():
         "RMSE@K_n": n_matched_nK_with_rmse,
         "n_zip_missing": n_zip_missing,
         "n_match_recompute_fail": n_match_recompute_fail,
-        "note": ("RMSE@1 over rows where matched_n1=True (first sample matches). "
-                 "RMSE@K over rows where matched_nK=True (first matching sample within K)."),
+        "note": ("RMSE@1 = matched RMSD of candidate 0, over rows where it matches. "
+                 "RMSE@K = min matched RMSD over the K candidates, over rows with any match."),
     }
     out_path = args.out_root / "rmse_posthoc.json"
     out_path.write_text(json.dumps(headline, indent=2))
-    print(f"\n[rmse] HEADLINE → {out_path}")
+    print(f"\n[rmse] wrote {out_path}")
     for k, v in headline.items():
         print(f"  {k}: {v}")
 

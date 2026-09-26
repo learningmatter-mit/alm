@@ -36,7 +36,7 @@ GemNetTCtrl.forward  (mattergen/common/gemnet/gemnet_ctrl.py)
 diffusion score  →  L_diff  →  ∂/∂(producer)   # gradient reaches producer + upstream model
 ```
 
-The conditional branch runs for **every** row, even masked ones; CFG selects per row via `torch.where`. The zero-init final projection (producer side) and zero-init mixin / zero-init attention-V (consumer side) make the bridge a no-op at step 0, so a fine-tuned adapter starts identical to the base model.
+The conditional branch runs for **every** row, even masked ones; CFG selects per row via `torch.where`. The zero-init final projection (producer side) and zero-init mixin (consumer side) make the bridge a no-op at step 0, so a fine-tuned adapter starts identical to the base model. Under the default `IPA_INIT_MODE=A` the cross-attention V projection keeps its standard random init; zeroing both V and the mixin would leave neither with a gradient.
 
 ## 3. The 5 MatterGen touch-points
 
@@ -126,7 +126,7 @@ conditional_embedding_module:
 Tell `GemNetTCtrl` to cross-attend the sequence; a pooled `(B,512)` needs nothing and goes through the default concat-MLP path. In the adapter cfg's `adapter.gemnet`:
 
 ```yaml
-cond_adapt_use_ipa: ["alm_embedding"]   # post-block IP-Adapter cross-attn (zero-init V)
+cond_adapt_use_ipa: ["alm_embedding"]   # post-block IP-Adapter cross-attn (zero-init mixin)
 cond_adapt_n_heads: 4                    # MUST divide emb_size_atom (512)
 ```
 
@@ -166,9 +166,9 @@ Selected in `src/alm/train/stage3.py::_make_adapter_cfg` (arg `bridge_kind`):
 | bridge_kind | producer output | consumer path | `_make_adapter_cfg` |
 |---|---|---|---|
 | `pool` | `(B, 512)` | concat-MLP, pre-block (`h_adapt = MLP([h, cond])`), zero-init mixin | no `cond_adapt_use_*`; just `bridge_gate_init` |
-| `producer-consumer` | `(B, M, 512)` (M learned queries) | IP-Adapter cross-attn, **post-block**, zero-init V | `cond_adapt_use_ipa: [alm_embedding]`, `cond_adapt_n_heads` |
+| `producer-consumer` | `(B, M, 512)` (M learned queries) | IP-Adapter cross-attn, **post-block**, zero-init mixin (IPA_INIT_MODE=A) | `cond_adapt_use_ipa: [alm_embedding]`, `cond_adapt_n_heads` |
 | `producer-consumer-pool` | `(B, 512)` (same producer, mean-pooled in `forward`) | concat-MLP, pre-block (same as `pool`) | no `cond_adapt_use_*`; `bridge_gate_init` |
-| `consumer-only` | `(B, K, 512)` (per-position proj, no pool) | IP-Adapter cross-attn, **post-block**, zero-init V | `cond_adapt_use_ipa: [alm_embedding]`, `cond_adapt_n_heads` |
+| `consumer-only` | `(B, K, 512)` (per-position proj, no pool) | IP-Adapter cross-attn, **post-block**, zero-init mixin (IPA_INIT_MODE=A) | `cond_adapt_use_ipa: [alm_embedding]`, `cond_adapt_n_heads` |
 
 Sequence consumers require `cond_adapt_n_heads` to divide `512`. The unconditional YAML must match: `EmbeddingVector` for pooled, `EmbeddingSequence(K=M)` for sequence.
 
@@ -178,4 +178,4 @@ Sequence consumers require `cond_adapt_n_heads` to divide `512`. The uncondition
 - **`512` / `4096` / `K=8` are magic constants.** `512` is the diffusion `hidden_dim`, **hardcoded** in `_make_adapter_cfg` (the model config is not consulted). `4096` is the producer's `D_in`-per-token here; `K=8` is its token count. Change all three consistently when the dims differ, and keep the producer's emitted `out_dim == 512`.
 - **`"alm_embedding"` is special-cased for `bridge_gate`.** `GemNetTCtrl` creates and applies the per-block `bridge_gate` parameter **only** for a field literally named `"alm_embedding"`. A differently-named field takes the plain un-gated additive path. Rename in both `globals.py` and the gate check on any change.
 - **Producer `D_in` is implicit.** Nothing validates that the stamped embedding matches the producer's expected input width; a mismatch surfaces as a reshape error inside `forward`. Validate explicitly in `forward`; the learnable-query producer raises with the expected `source_len*hidden_dim`.
-- **`IPA_INIT_MODE` and `IPA_C_SCALE` read from `os.environ`.** The IP-Adapter consumer's V-projection and mixin init scheme answers to environment variables (`IPA_INIT_MODE` ∈ {A,B,C}, default `A` = zero-init V + zero-init mixin; `IPA_C_SCALE` default `1e-3`) instead of config. Set them in the launch env for reproducibility.
+- **`IPA_INIT_MODE` and `IPA_C_SCALE` read from `os.environ`.** The IP-Adapter consumer's V-projection and mixin init scheme answers to environment variables (`IPA_INIT_MODE` ∈ {A,B,C}, default `A` = standard random V + zero-init mixin; `B` = zero-init V + random mixin; `C` = both scaled by `IPA_C_SCALE`, default `1e-3`) instead of config. Set them in the launch env for reproducibility.

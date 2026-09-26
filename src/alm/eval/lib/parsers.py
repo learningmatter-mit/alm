@@ -118,7 +118,7 @@ if __name__ == "__main__":
         # Leaked-but-genuine: number is extractable; caller drops via detect_leak.
         ("![](https://i.imgur.com/HASH.png) {\"density\": 4.6}", 4.6),
         ("![](https://www.materialsproject.org/materials/101112) {\"density\": 4.6}", 4.6),
-        # Schema-corruption: leading "!" from arxiv-bucket bleed-through.
+        # Stray leading "!" before a JSON answer.
         ("!{\"k\": 1.5}", 1.5),
         ("!nan eV", None),
         ("nan eV", None),

@@ -1,4 +1,4 @@
-"""DNG-style generation for csp_backbone: oracle-composition CSP (K=1) over sampled prompts, CIFs out."""
+"""DNG-style generation with a CSP-mode MatterGen checkpoint: ground-truth composition CSP (K=1) over sampled prompts, CIFs out."""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,6 @@ import sys
 import os
 import time
 import warnings
-from collections import Counter
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -23,9 +22,9 @@ from eval_dng import _sample_prompts_from_parquet  # noqa: E402
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mg_ckpt_dir", type=Path, required=True,
-                    help="MG-CSP training dir (csp_backbone).")
+                    help="MatterGen CSP checkpoint dir (config.yaml + checkpoints/).")
     ap.add_argument("--pairs_parquet", type=Path, required=True,
-                    help="pairs.parquet (or other stage3a parquet) for prompt sampling.")
+                    help="Parquet of prompts to sample from.")
     ap.add_argument("--n_prompts", type=int, default=1000)
     ap.add_argument("--prompts_seed", type=int, default=42,
                     help="Prompt RNG seed.")
@@ -33,7 +32,7 @@ def main():
                     help="Generations per prompt. DNG convention K=1.")
     ap.add_argument("--guidance_factor", type=float, default=1.0)
     ap.add_argument("--max_n_atoms", type=int, default=30,
-                    help="Filter to comps with ≤30 atoms (csp_backbone training distrib).")
+                    help="Keep compositions with at most this many atoms (default 30).")
     ap.add_argument("--num_shards", type=int, default=1)
     ap.add_argument("--shard_idx", type=int, default=0)
     ap.add_argument("--out_dir", type=Path, required=True)
@@ -43,14 +42,15 @@ def main():
     print(f"[gen-dng] writing → {args.out_dir}", flush=True)
     t0 = time.time()
 
-    prompts, prompt_ids, elements_per_prompt = _sample_prompts_from_parquet(
+    prompts, prompt_ids, _, counts_per_prompt = _sample_prompts_from_parquet(
         args.pairs_parquet,
         n_prompts=args.n_prompts,
         seed=args.prompts_seed,
         parent_filter=None,
     )
-    kept = [(p, pid, els) for p, pid, els in zip(prompts, prompt_ids, elements_per_prompt)
-            if len(els) <= args.max_n_atoms]
+    # Filter on the full atom count (element multiset), not the number of distinct elements.
+    kept = [(p, pid, c) for p, pid, c in zip(prompts, prompt_ids, counts_per_prompt)
+            if sum(c.values()) <= args.max_n_atoms]
     print(f"  sampled {len(prompts)} prompts, {len(kept)} after ≤{args.max_n_atoms}-atom filter",
           flush=True)
 
@@ -68,7 +68,7 @@ def main():
     from mattergen.generator import CrystalGenerator
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  loading MG-CSP-fs from {args.mg_ckpt_dir} (device={device}) ...", flush=True)
+    print(f"  loading MatterGen CSP model from {args.mg_ckpt_dir} ({device})", flush=True)
     ckpt_info = MatterGenCheckpointInfo(model_path=str(args.mg_ckpt_dir), load_epoch="last")
 
     generator = CrystalGenerator(
@@ -83,10 +83,10 @@ def main():
     cif_root.mkdir(parents=True, exist_ok=True)
     records = []
 
-    for i, (prompt, pid, elems) in enumerate(kept):
+    for i, (prompt, pid, counts) in enumerate(kept):
         if i % 25 == 0:
             print(f"  [{i}/{len(kept)}] (t={time.time()-t0:.0f}s) ...", flush=True)
-        target_comp = dict(Counter(elems))
+        target_comp = dict(counts)
         try:
             structures = generator.generate(
                 target_compositions_dict=[target_comp] * args.K,

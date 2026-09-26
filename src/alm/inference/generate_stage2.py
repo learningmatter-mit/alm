@@ -1,6 +1,7 @@
 """Generate from a Stage 2 LoRA checkpoint and print prompt + ground-truth + model output."""
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from utils import (
 )
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "alm" / "eval"))
 from loader import load_alm
+from paths import DATA_ROOT
 
 
 def build_dataset(args, tok):
@@ -139,13 +141,13 @@ if __name__ == "__main__":
     p.add_argument("--repetition_penalty", type=float, default=1.1)
     p.add_argument("--lora_rank", type=int, default=64)
     p.add_argument("--lora_alpha", type=int, default=128)
-    p.add_argument("--arxiv_parquet", default="/tmp/jarvis_arxiv.parquet")
-    p.add_argument("--camel_jsonl",   default="/tmp/camel_ai.jsonl")
-    p.add_argument("--mascqa_json",   default="/tmp/MaScQA/mascqa-eval.json")
-    p.add_argument("--mascqa_xlsx",   default="/tmp/MaScQA/scoresheets/all_questions.xlsx")
-    p.add_argument("--data_parent_path",        default="/tmp/LLM4Mat-Bench")
-    p.add_argument("--cached_embs_parent_path", default="/tmp/cached_embs")
-    p.add_argument("--narrative_parquet_dir",   default="/tmp/GPT-Narratives-for-Materials")
-    p.add_argument("--narrative_cache_dir",     default="/tmp/cached_embs_narratives")
+    p.add_argument("--arxiv_parquet", default=os.path.join(DATA_ROOT, "jarvis_arxiv.parquet"))
+    p.add_argument("--camel_jsonl",   default=os.path.join(DATA_ROOT, "camel_ai.jsonl"))
+    p.add_argument("--mascqa_json",   default=os.path.join(DATA_ROOT, "MaScQA/mascqa-eval.json"))
+    p.add_argument("--mascqa_xlsx",   default=os.path.join(DATA_ROOT, "MaScQA/scoresheets/all_questions.xlsx"))
+    p.add_argument("--data_parent_path",        default=os.path.join(DATA_ROOT, "LLM4Mat-Bench"))
+    p.add_argument("--cached_embs_parent_path", default=os.path.join(DATA_ROOT, "cached_embs"))
+    p.add_argument("--narrative_parquet_dir",   default=os.path.join(DATA_ROOT, "GPT-Narratives-for-Materials"))
+    p.add_argument("--narrative_cache_dir",     default=os.path.join(DATA_ROOT, "cached_embs_narratives"))
     args = p.parse_args()
     main(args)

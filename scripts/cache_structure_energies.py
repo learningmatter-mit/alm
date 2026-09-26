@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import sys
 import os
 import warnings
 from pathlib import Path
@@ -16,22 +15,18 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# alm/ and external/mattergen on the path so structure_metrics + eval imports resolve.
-_ALM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_ALM_ROOT, "alm"))
-sys.path.insert(0, _ALM_ROOT)
-sys.path.insert(0, os.path.join(_ALM_ROOT, "external", "mattergen"))
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 
 from pymatgen.core import Structure  # noqa: E402
 from pymatgen.io.ase import AseAtomsAdaptor  # noqa: E402
 from paths import DATA_ROOT  # noqa: E402
 
-from eval.structure_metrics import (  # noqa: E402
+from structure_metrics import (  # noqa: E402
     relax_structures_mattersim,
     e_above_hull_per_atom,
     load_hull_reference,
 )
-from eval.eval_dng import _atoms_struct_to_pymatgen  # noqa: E402
+from eval_dng import _atoms_struct_to_pymatgen  # noqa: E402
 
 
 # Narrative buckets state DFT properties in prose only; permissive regexes pull them as a reference column.

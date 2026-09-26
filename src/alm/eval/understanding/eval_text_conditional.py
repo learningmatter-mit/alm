@@ -100,9 +100,7 @@ def main():
     ap.add_argument("--out_root", type=Path, default=None)
     ap.add_argument("--run_id", type=str, default=None)
     ap.add_argument("--bench_tag", type=str, default="text_cond",
-                    help="Bench-dir tag so different buckets sharing this eval don't collide: "
-                         "describe -> 'text_cond' (default), ood -> 'ood'. Output goes to "
-                         "stage3b_{bench_tag}_g{NN}/{run_id}.")
+                    help="Output directory tag. Results go to stage3b_{bench_tag}_g{NN}/{run_id}.")
     args = ap.parse_args()
 
     from generate_stage3 import generate_for_prompts, load_alm_and_pl_module  # noqa: E402
@@ -114,7 +112,7 @@ def main():
         mattergen_pretrained=args.mattergen_pretrained,
         device=device,
     )
-    # load_alm_and_pl_module's .to() can miss buffers/property_embeddings (CPU/cuda mismatch); force all here.
+    # Move the diffusion module and its model explicitly so every buffer lands on `device`.
     pl_module = pl_module.to(device)
     pl_module.diffusion_module = pl_module.diffusion_module.to(device)
     pl_module.diffusion_module.model = pl_module.diffusion_module.model.to(device)

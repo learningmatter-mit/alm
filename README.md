@@ -4,7 +4,7 @@
 
 Unifying natural language and atomistics to understand, generate, and optimize materials, introduced in [**Atomistic Language Modeling**](https://arxiv.org/abs/2606.21395).
 
-The **Atomistic Language Models (ALM)s** comprise an LLM backbone that (1) **understands** crystal structures (property prediction, Q&A), (2) **generates** them from natural-language descriptions, and (3) **edits/optimizes** them as instructed in text. This is achieved by bridging the LM (Qwen3) to a denoising-diffusion decoder through continuous projectors.
+The **Atomistic Language Models (ALMs)** comprise an LLM backbone that (1) **understands** crystal structures (property prediction, Q&A), (2) **generates** them from natural-language descriptions, and (3) **edits/optimizes** them as instructed in text. This is achieved by bridging the LM (Qwen3) to a denoising-diffusion decoder through continuous projectors.
 
 - **Understanding:** a frozen OrbV3 encoder embeds each atom, and a trainable MLP projects each embedding into the LLM feature space as soft tokens.
 - **Generation:** the embeddings of K=8 learnable `[atoms_i]` output tokens are projected through a producer-consumer bridge (a learnable-query producer feeding a cross-attention consumer) into the diffusion decoder for crystal structure prediction (CSP) and _de novo_ generation (DNG).
@@ -103,7 +103,7 @@ ALM Gen loads its r8 bridge LoRA directly (pass the subdir as `--alm_checkpoint`
 **Other training data** (for retraining from scratch):
 - **LLM4Mat-Bench:** download the folder from [Google Drive](https://drive.google.com/drive/folders/12n3H9BU3AoQn7ikeR7PUrmmPRZ4LyvdX?usp=share_link).
 - **GPT-Narratives:** [`yjeong/GPT-Narratives-for-Materials`](https://huggingface.co/datasets/yjeong/GPT-Narratives-for-Materials) (the `describe`, `csp`, and `ood` buckets derive from this via `scripts/build_*_pairs.py`).
-- **CSP/DNG benchmarks:** MP-20 and MPTS-52 via `helper` download scripts; MP-2020 hull via `scripts/fetch_mp_hull.py`.
+- **CSP/DNG benchmarks:** MP-20 and MPTS-52 split CSVs (as distributed with CrystaLLM) placed under `$ALM_DATA_ROOT/eval_data/csp/{mp_20,mpts_52}/`; MP-2020 hull via `scripts/fetch_mp_hull.py`.
 
 **Where things go** (set once, then the commands above/below work):
 ```bash

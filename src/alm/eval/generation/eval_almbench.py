@@ -14,8 +14,8 @@ _EVAL_EDIT = os.path.join(_HERE, "eval_edit.py")
 PRIMARY = {
     "atomtxt":   ("direction_correct_rate", "direction-correct"),
     "polymorph": ("polymorph_lower_energy_rate", "lower-E polymorph"),
-    "doping":    ("doping_correct_rate", "doping-correct"),
-    "app":       ("app_consistency", "app-consistency (judge)"),
+    "doping":    ("correct_substitution_rate", "correct substitution"),
+    "app":       ("overall_consistency_mean_per_prompt", "app-consistency (judge)"),
 }
 DIAGNOSTICS = ["structurally_valid", "gen_failed_rate", "n_scored"]
 
@@ -59,7 +59,7 @@ def main():
     ap.add_argument("--alm_checkpoint", required=True, help="Stage-2 step=N dir")
     ap.add_argument("--atoms_mapper", required=True, help="Stage-3 step=N/atoms_mapper.pt (edit/synthesis model)")
     ap.add_argument("--mattergen_model_path", default=None,
-                    help="from-scratch CSP-mode backbone dir (csp_backbone); editing conditions on the input structure")
+                    help="CSP-mode MatterGen checkpoint dir used as the editing decoder")
     ap.add_argument("--tasks", default="atomtxt,polymorph,doping,app",
                     help="comma list; default = all four ALM-Bench tasks")
     ap.add_argument("--guidance_factor", type=float, default=0.5, help="CFG g (operating point = 0.5)")
@@ -71,7 +71,7 @@ def main():
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     if "app" in tasks and not os.environ.get("OPENAI_API_KEY"):
-        print("[almbench] NOTE: OPENAI_API_KEY not set — skipping the 'app' task (LM-judge). "
+        print("[almbench] OPENAI_API_KEY not set; skipping the 'app' task (LM judge). "
               "Set the key to include it.")
         tasks = [t for t in tasks if t != "app"]
 

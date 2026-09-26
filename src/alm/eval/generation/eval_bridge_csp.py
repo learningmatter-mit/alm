@@ -19,7 +19,7 @@ from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.analysis.structure_matcher import StructureMatcher
 
 import eval_planner_csp as epc
-from generate_stage3 import load_alm_and_pl_module, get_alm_embedding
+from generate_stage3 import load_alm_and_pl_module, get_alm_embedding, _norm_bridge
 from paths import CHECKPOINTS, RUNS
 
 
@@ -105,14 +105,19 @@ def apply_bridge_lora(alm, lora_dir: Path, device):
 
 
 def _raw_alm_embedding_dim(atoms_mapper_path: Path, K: int, hidden_dim: int) -> int:
-    """Raw flattened ALM embedding dim expected by the saved bridge producer."""
+    """Flattened ALM embedding dim the saved bridge expects (matches get_alm_embedding's output).
+
+    Q-Former bridges read (input atoms + N context + K [atoms_i]) hidden states; pool reads K.
+    """
     try:
         ckpt = torch.load(atoms_mapper_path, map_location="cpu", weights_only=False)
     except TypeError:
         ckpt = torch.load(atoms_mapper_path, map_location="cpu")
-    bridge_kind = ckpt.get("bridge_kind", "pool")
-    if bridge_kind == "producer-consumer":
-        return int(ckpt.get("qformer_context_tokens", 128) + K) * int(hidden_dim)
+    bridge_kind = _norm_bridge(ckpt.get("bridge_kind", "pool"))
+    if bridge_kind in ("producer-consumer", "producer-consumer-pool"):
+        n_src = (int(ckpt.get("qformer_input_atoms", 0))
+                 + int(ckpt.get("qformer_context_tokens", 128)) + int(K))
+        return n_src * int(hidden_dim)
     return int(K) * int(hidden_dim)
 
 
@@ -136,7 +141,7 @@ def build_csp_sampler(pl_module, guidance_scale: float, diffusion_steps: int | N
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--alm_checkpoint", type=Path,
-                    default=Path(os.path.join(CHECKPOINTS, "alm_checkpoints/stage2_checkpoints/step=12000")))
+                    default=Path(os.path.join(CHECKPOINTS, "alm-core")))
     ap.add_argument("--atoms_mapper", type=Path, required=True,
                     help="step=N/atoms_mapper.pt (bridge + FT'd csp_backbone backbone).")
     ap.add_argument("--mattergen_model_path", type=str,
@@ -366,14 +371,14 @@ def main():
         "composition_source": args.composition_source,
         "benchmark": args.benchmark,
         "prompt_version": args.prompt_version,
-        "note": "planner-Stage3 bridge: JSON observed-atoms + alm_embedding CFG → csp_backbone CSP-mode",
+        "note": "planner composition + ALM bridge embedding, CSP-mode MatterGen decoder",
     }
     (args.out_dir / "metrics.json").write_text(json.dumps(headline, indent=2))
     with (args.out_dir / "predictions.jsonl").open("w") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
 
-    print(f"\n[bridge-csp] HEADLINE {args.benchmark} (scored {n_scored}/{n}, K={args.K}, g={args.guidance_factor}):")
+    print(f"\n[bridge-csp] {args.benchmark} (scored {n_scored}/{n}, K={args.K}, g={args.guidance_factor}):")
     print(f"  M@1 = {headline['match_rate_n1']:.4f}  ({n_match_n1}/{n_scored})")
     print(f"  M@K = {headline['match_rate_nK']:.4f}  ({n_match_nK}/{n_scored})")
     if args.composition_source == "planner":

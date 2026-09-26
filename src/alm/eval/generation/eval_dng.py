@@ -144,15 +144,15 @@ def _sample_prompts_from_parquet(parquet_path: Path, n_prompts: int, seed: int,
     if len(prompts) < n_prompts:
         raise RuntimeError(
             f"only sampled {len(prompts)}/{n_prompts} prompts from {parquet_path} "
-            f"(parent_filter={parent_filter}); raise --prompts_seed oversampling or "
-            f"loosen --prompts_parent_filter."
+            f"(parent_filter={parent_filter}); lower --num_samples or loosen "
+            f"--prompts_parent_filter."
         )
     if slice_end is None:
         slice_end = len(prompts)
     # Fail loud: an out-of-range slice_start would silently yield 0 gens / NaN metrics.
     if slice_start >= len(prompts):
         raise RuntimeError(
-            f"prompt slice_start={slice_start} >= n_prompts={len(prompts)} — this shard "
+            f"prompt slice_start={slice_start} >= n_prompts={len(prompts)}; this shard "
             f"would generate 0 structures. Check the launcher's slice/num_samples units "
             f"(prompt list length = num_samples/batch_size)."
         )
@@ -168,7 +168,7 @@ def main():
     ap.add_argument("--alm_checkpoint", required=True)
     ap.add_argument("--atoms_mapper", required=True)
     ap.add_argument("--num_samples", type=int, default=1024,
-                    help="Total unconditional structures to generate.")
+                    help="Total structures to generate.")
     ap.add_argument("--batch_size", type=int, default=16,
                     help="Per-call MatterGen batch size; total = ceil(num_samples/batch_size).")
     ap.add_argument("--diffusion_snr", type=float, default=None,

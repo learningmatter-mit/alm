@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 from ase.db import connect
 
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from paths import DATA_ROOT
 
 _REPO = Path(__file__).resolve().parents[1]

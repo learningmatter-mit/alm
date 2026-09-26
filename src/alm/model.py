@@ -24,17 +24,18 @@ class AtomisticLanguageModel(nn.Module):
         # in arbitrary order so causal masking imposes a meaningless ordering on a set.
         self.atom_bidirectional_attention = bool(atom_bidirectional_attention)
         if self.atom_bidirectional_attention and attn_implementation == "flash_attention_2":
-            print(f"[ALM] atom_bidirectional_attention=True forces "
-                  f"attn_implementation='sdpa' (flash_attn_2 requires strict causal)")
+            if is_main_process():
+                print(f"[ALM] atom_bidirectional_attention=True forces "
+                      f"attn_implementation='sdpa' (flash_attn_2 requires strict causal)")
             attn_implementation = "sdpa"
         # Pin all ranks to mem-efficient SDPA: shape-based kernel dispatch otherwise diverges across multi-node DDP ranks and times out NCCL.
         if self.atom_bidirectional_attention:
-            # No function-local torch import: it would shadow torch for the whole __init__ and UnboundLocalError earlier refs.
             torch.backends.cuda.enable_flash_sdp(False)
             torch.backends.cuda.enable_math_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
-            print(f"[ALM] pinned SDPA backend → mem_efficient only "
-                  f"(disables per-call dispatch divergence under multi-node DDP)")
+            if is_main_process():
+                print(f"[ALM] pinned SDPA backend → mem_efficient only "
+                      f"(disables per-call dispatch divergence under multi-node DDP)")
         self.use_last_prompt_token = bool(use_last_prompt_token)
         if bridge_source not in ('atoms_tokens', 'last_k_prompt', 'context_plus_atoms'):
             raise ValueError(

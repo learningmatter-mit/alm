@@ -85,7 +85,7 @@ def _parse_target_dv_pct(row_id: str):
     except ValueError:
         return None
 
-# atomtxt directional planner: text-only substitution prompt giving the input composition.
+# Planner prompt for --doping_via_planner: input composition + substitution instruction.
 _DOPING_PLANNER_TMPL = (
     "A crystal cell has the composition {counts} (element: number of atoms in the cell). "
     "Apply this edit to it: {instruction} "
@@ -239,11 +239,11 @@ def main() -> int:
     ap.add_argument("--doping_via_planner", action="store_true",
                     help="Doping: have the LLM planner emit the substituted composition "
                          "from text (input formula + edit), then CSP that composition "
-                         "bridge-OFF. The honest planner→CSP path; bypasses the bridge. "
+                         "with the bridge off (planner-to-CSP path). "
                          "correct_substitution then = planner emitted right comp AND CSP "
                          "produced a valid structure.")
     ap.add_argument("--alm_checkpoint", type=Path,
-                    default=Path(os.path.join(CHECKPOINTS, "alm_checkpoints/stage2_checkpoints/step=12000")),
+                    default=Path(os.path.join(CHECKPOINTS, "alm-core")),
                     help="Stage-2 base ckpt (merged r=64 LoRA + projector). The fresh "
                          "r=8 bridge LoRA is applied on top from the ckpt's lora_adapter/.")
     ap.add_argument("--atoms_mapper", type=Path, required=True,
@@ -269,11 +269,8 @@ def main() -> int:
     ap.add_argument("--diffusion_steps", type=int, default=None)
     ap.add_argument("--diffusion_seed", type=int, default=1337)
     ap.add_argument("--gen_retries", type=int, default=2,
-                    help="Per-row seed-bump retries on a GemNet empty-graph "
-                         "cuda/cpu device-mismatch. The empty-graph branch is in "
-                         "external/ (untouchable here); a fresh diffusion seed "
-                         "perturbs the trajectory and usually keeps the graph "
-                         "non-empty, recovering the row. 0 = no retry (old behavior).")
+                    help="Retries per row, each with a new seed, when generation fails "
+                         "with a GemNet empty-graph device error. 0 disables retries.")
     ap.add_argument("--strict_n_scored", action="store_true",
                     help="Hard-exit(2) when this shard scored 0 rows. Default OFF "
                          "for sharded runs: a shard that scored 0 writes "
@@ -327,10 +324,9 @@ def main() -> int:
                          "geometry via MatterSim single-point (max_n_steps=0), not the relaxed "
                          "energy. Sanity check on whether the bridge moves energy pre-relaxation.")
     ap.add_argument("--save_gens", type=Path, default=None,
-                    help="atomtxt: persist every generated structure + (input, prompt, direction, "
-                         "relaxed energies, direction_correct) to <save_gens>/gens_shard{idx}.parquet. "
-                         "With --fk this builds the reward-distillation dataset "
-                         "(filter to requested_direction=higher AND direction_correct).")
+                    help="atomtxt: write every generated structure with its input, prompt, "
+                         "requested direction, relaxed energies and direction_correct to "
+                         "<save_gens>/gens_shard{idx}.parquet.")
     ap.add_argument("--save_cifs", type=Path, default=None,
                     help="Showcase dump (all tasks): after scoring, for the first "
                          "--save_cifs_max rows whose per-task success flag is True, write "
@@ -348,20 +344,20 @@ def main() -> int:
                          "= what these ckpts were trained on).")
     ap.add_argument("--judge_model", default="gpt-4o-mini")
     ap.add_argument("--judge_concurrency", type=int, default=16)
-    # ── Direction-following inference experiments (bridge-only) ──
-    ap.add_argument("--cot_tokens", type=int, default=0,
+    dir_grp = ap.add_argument_group("directional editing (optional)")
+    dir_grp.add_argument("--cot_tokens", type=int, default=0,
                     help="CoT-then-atoms: sample this many free-form LLM tokens before "
                          "the K=[atoms_i] block so the bridge reads reasoning context. "
                          "0 = off (deterministic).")
-    ap.add_argument("--llm_temperature", type=float, default=1.0,
+    dir_grp.add_argument("--llm_temperature", type=float, default=1.0,
                     help="Sampling temperature for the CoT prefix (ignored if cot_tokens=0).")
-    ap.add_argument("--cot_top_p", type=float, default=0.9,
+    dir_grp.add_argument("--cot_top_p", type=float, default=0.9,
                     help="Nucleus cutoff for the CoT prefix (ignored if cot_tokens=0).")
-    ap.add_argument("--whiten_common_mode", action="store_true",
+    dir_grp.add_argument("--whiten_common_mode", action="store_true",
                     help="common-mode whitening (atomtxt): subtract the eval-set MEAN "
                          "bridge cond from every row before the consumer, leaving only the "
                          "directional residual. Two-pass.")
-    ap.add_argument("--atoms_before_json", action="store_true",
+    dir_grp.add_argument("--atoms_before_json", action="store_true",
                     help="For checkpoints whose model emits [atoms_i] BEFORE the {counts} "
                          "JSON: inference must build the assistant turn the same way, else "
                          "the bridge reads OOD positions.")
@@ -792,7 +788,7 @@ def main() -> int:
         for e in examples:
             f.write(json.dumps(e) + "\n")
 
-    print(f"\n[bridge-edit] HEADLINE task={args.task} (n_scored={n_scored}):", flush=True)
+    print(f"\n[bridge-edit] task={args.task} (n_scored={n_scored}):", flush=True)
     for k, v in headline.items():
         if isinstance(v, float):
             print(f"  {k:32s} = {v:.4f}", flush=True)
@@ -801,25 +797,17 @@ def main() -> int:
         print(f"[bridge-edit] DONE in {time.time()-t0:.0f}s", flush=True)
         return 0
 
-    # n_scored == 0 below: distinguish the failure classes loudly.
+    # n_scored == 0 below: report which failure class caused it.
     sharded = int(args.num_shards) > 1
     if n_gen_device_errors > 0 and n_gen_other_errors == 0:
-        print(f"\n[bridge-edit] *** ALL {n_gen_device_errors} ROW(S) FAILED ON THE SAME "
-              f"EXCEPTION: cuda/cpu device-mismatch from MatterGen's GemNet empty-graph "
-              f"branch (zero edges → CPU tensor meets a cuda weight). This is a "
-              f"PLUMBING/empty-graph failure, NOT a 0.0 result. Last error:\n"
-              f"    {str(last_gen_error)[:300]}\n"
-              f"[bridge-edit] Mitigations already applied this run: per-row seed-bump "
-              f"retries (--gen_retries={args.gen_retries}) + on-device conditioning stamp. "
-              f"If still 100% (planner mode-collapse to tiny binaries → all-out-of-cutoff "
-              f"cells), the durable fix is the empty-graph device arg in "
-              f"external/.../gemnet/layers/efficient.py (out of scope here). ***",
-              flush=True)
+        print(f"\n[bridge-edit] error: all {n_gen_device_errors} rows failed with a GemNet "
+              f"empty-graph cuda/cpu device mismatch (after --gen_retries={args.gen_retries}); "
+              f"no rows scored. Last error: {str(last_gen_error)[:300]}", flush=True)
     else:
-        print("\n[bridge-edit] *** n_scored == 0 — PLUMBING FAILURE (no rows scored, and "
-              f"NOT the all-device-mismatch signature: device_errors={n_gen_device_errors} "
-              f"other_errors={n_gen_other_errors} planner_parse_fail={n_planner_parse_fail}). "
-              "Check live-encode / planner-parse / generation logs above. ***", flush=True)
+        print("\n[bridge-edit] error: no rows scored "
+              f"(device_errors={n_gen_device_errors} other_errors={n_gen_other_errors} "
+              f"planner_parse_fail={n_planner_parse_fail}). "
+              "Check the encode, planner-parse and generation logs above.", flush=True)
 
     if sharded and not args.strict_n_scored:
         # Graceful degradation: exit 0 so one shard scoring 0 cannot poison the aggregated run.
@@ -1012,7 +1000,7 @@ def _score_atomtxt(args, rows, gens_per_row, device):
     for i in range(len(gens_per_row)):
         input_struct_per_row.append(_ase_to_struct(rows[i]["input_atoms_struct"]))
 
-    # density/volume are relaxed too (de-gamed): a pure lattice rescale relaxes back to the
+    # density/volume are also measured after relaxation: a pure lattice rescale relaxes back to the
     # input's equilibrium volume, so only a genuinely different material moves relaxed density.
     _RELAX_PROPS = ("formation_energy", "density", "volume")
     flat: list[Structure] = []
@@ -1083,7 +1071,7 @@ def _score_atomtxt(args, rows, gens_per_row, device):
         want = int(r.get("_direction", 0))
         if prop == "formation_energy":
             p_input = energy_by_key.get((i, -1), float("nan"))
-        elif prop in ("density", "volume"):  # de-gamed: relaxed-equilibrium geometry
+        elif prop in ("density", "volume"):  # relaxed-equilibrium geometry
             _ria = relaxed_atoms_by_key.get((i, -1))
             if _ria is not None:
                 p_input = (_density_from_atoms(_ria) if prop == "density"
@@ -1380,7 +1368,7 @@ def _score_strain(args, rows, gens_per_row, device):
         in_count = Counter(in_elems)
         n_in = max(1, len(in_elems))
         target_frac = in_count.get(donor, 0) / n_in
-        # naive (coords-identical) relabel, disallowed (same realness gate as doping).
+        # naive (coords-identical) relabel, disallowed (same relabel check as doping).
         naive_relabel = None
         if donor in in_count:
             try:
@@ -1471,11 +1459,8 @@ def _score_strain(args, rows, gens_per_row, device):
 
 def _score_text2struct(args, rows, gens_per_row):
     """describe/ood text->structure recovery vs GT: comp_match_rate + struct_match_rate (rough disordered matcher), no relax."""
-    try:
-        from mattergen.evaluation.utils.structure_matcher import DisorderedStructureMatcher
-        rough = DisorderedStructureMatcher(ltol=0.3, stol=0.5, angle_tol=10.0)
-    except Exception:
-        rough = StructureMatcher(ltol=0.3, stol=0.5, angle_tol=10.0)
+    from mattergen.evaluation.utils.structure_matcher import DisorderedStructureMatcher
+    rough = DisorderedStructureMatcher(ltol=0.3, stol=0.5, angle_tol=10.0)
     examples = []
     overall = Counter()
     n_scored = 0
@@ -1555,7 +1540,7 @@ def _score_app(args, rows, gens_per_row, target_comp_per_row, planner_text_per_r
     from ase.data import atomic_masses, atomic_numbers
     from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
     from structure_metrics import relax_structures_mattersim, total_energy_per_atom
-    from llm_judge import (batch_judge, build_app_consistency_messages, parse_score,
+    from llm_judge import (batch_judge, parse_score,
                                 reset_failure_counts, get_failure_counts)
 
     def _summary(struct: Structure) -> dict:
@@ -1604,20 +1589,28 @@ def _score_app(args, rows, gens_per_row, target_comp_per_row, planner_text_per_r
     else:
         relaxed_atoms = []
 
+    from eval_app_consistency import _app_messages  # shows a missing energy as unknown
+
     judge_items: list[dict] = []
     judge_back_row: list[int] = []
+    n_nan_energy = 0
+    failed_row_ids: list[str] = []  # NaN energy after relaxation: scored 0, not judged
     for row_i, raw_s, atoms in zip(flat_meta, flat, relaxed_atoms):
         try:
             struct = AseAtomsAdaptor.get_structure(atoms)
             summary = _summary(struct)
             fe = total_energy_per_atom(atoms)
-            if not (fe == fe):
-                fe = 0.0
+            if not (fe == fe) and args.skip_relax:
+                fe = None  # no relaxation was run, so the energy is unknown
+            elif not (fe == fe):
+                n_nan_energy += 1
+                failed_row_ids.append(rows[row_i]["row_id"])
+                continue
             judge_items.append({
                 "row_id": rows[row_i]["row_id"],
                 "prompt": rows[row_i]["user_prompt"],
                 "formation_energy_per_atom": fe,
-                # Realness gate: invalid raw output is forced to score 0 below (judge can't see broken crystals).
+                # Validity gate: invalid raw output is forced to score 0 below (the judge cannot see broken crystals).
                 "_valid": bool(_structurally_valid(raw_s)),
                 **summary,
             })
@@ -1629,7 +1622,7 @@ def _score_app(args, rows, gens_per_row, target_comp_per_row, planner_text_per_r
     print(f"[bridge-edit:app] dispatching {len(judge_items)} judge calls "
           f"(model={args.judge_model}, concurrency={args.judge_concurrency}) ...", flush=True)
     verdicts = asyncio.run(batch_judge(
-        items=judge_items, build_messages_fn=build_app_consistency_messages,
+        items=judge_items, build_messages_fn=_app_messages,
         model=args.judge_model, concurrency=args.judge_concurrency)) if judge_items else []
     fc = get_failure_counts()
     if fc:
@@ -1637,11 +1630,13 @@ def _score_app(args, rows, gens_per_row, target_comp_per_row, planner_text_per_r
 
     from collections import defaultdict
     judged: dict[str, list[int]] = defaultdict(list)
+    for rid in failed_row_ids:
+        judged[rid].append(0)
     examples = []
     n_gated_invalid = 0
     for item, verdict in zip(judge_items, verdicts):
         score = parse_score(verdict, default=0)
-        if not item.get("_valid", True):          # REALNESS GATE: invalid structure → 0
+        if not item.get("_valid", True):          # validity gate: invalid structure scores 0
             if score:
                 n_gated_invalid += 1
             score = 0
@@ -1651,7 +1646,7 @@ def _score_app(args, rows, gens_per_row, target_comp_per_row, planner_text_per_r
                          "judge_reason": verdict.get("reason") if verdict else None,
                          "extracted_application": verdict.get("extracted_application") if verdict else None})
 
-    # Honest denominator: every prompt contributes; one with no judged structure scores 0.
+    # Every prompt contributes to the denominator; one with no judged structure scores 0.
     per_prompt = {r["row_id"]: judged.get(r["row_id"], [0]) for r in rows}
     per_prompt_mean = {rid: float(np.mean(s)) for rid, s in per_prompt.items()}
     overall_mean = float(np.mean(list(per_prompt_mean.values()))) if per_prompt_mean else 0.0
@@ -1664,6 +1659,7 @@ def _score_app(args, rows, gens_per_row, target_comp_per_row, planner_text_per_r
         "fraction_score_2": score_2_rate,
         "n_prompts_scored": len(per_prompt),
         "n_gated_invalid": n_gated_invalid,
+        "n_nan_energy": n_nan_energy,
         "n_judge_calls": len(judge_items),
         "n_judge_failures": int(sum(fc.values())) if fc else 0,
         "n_planner_parse_fail": n_planner_parse_fail,
