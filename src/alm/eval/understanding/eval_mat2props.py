@@ -2,18 +2,15 @@
 
 import argparse
 import os
-import sys
 from pathlib import Path
 
 from torch.utils.data import DataLoader, Subset
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils import (
     GPTNarrativeDataset, _NARRATIVE_PROPERTIES, _property_task, custom_collate_fn,
 )
 
-from loader import load_alm
+from loader import load_alm, resolve_encoder
 from text_generation import generate_batch
 from parsers import detect_leak, extract_number
 from metrics import mae
@@ -47,15 +44,8 @@ def main():
     args = p.parse_args()
 
     model, tokenizer = load_alm(checkpoint=args.checkpoint, merge_lora=not args.no_merge_lora)
-    _ATOMISTIC_NAME_BY_DIM = {256: "orb_v3_direct_20_omat", 128: "uma-s-1p1",
-                              640: "pet-mad-xs", 1280: "pet-mad-s"}
-    if args.atomistic_feature_dim is None:
-        args.atomistic_feature_dim = int(model.projector[0].in_features)
-    if args.atomistic_model_name is None:
-        args.atomistic_model_name = _ATOMISTIC_NAME_BY_DIM.get(
-            args.atomistic_feature_dim, "orb_v3_direct_20_omat")
-    print(f"[eval_mat2props] atomistic_feature_dim={args.atomistic_feature_dim} "
-          f"→ atomistic_model_name={args.atomistic_model_name}")
+    args.atomistic_model_name, args.atomistic_feature_dim = resolve_encoder(
+        model, args.atomistic_model_name, args.atomistic_feature_dim)
 
     name = args.narrative_name
     parquet = Path(args.narrative_parquet_dir) / f"{name}_gpt_narratives.parquet"

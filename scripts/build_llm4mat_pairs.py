@@ -1,4 +1,4 @@
-"""Build pairs.parquet-style datasets from LLM4Mat-Bench subsets."""
+"""Build pairs-parquet-style datasets from LLM4Mat-Bench subsets."""
 
 import argparse
 import multiprocessing as mp
@@ -11,9 +11,10 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from paths import DATA_ROOT
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", module="pymatgen")
 
 SYSTEM_PROMPT = "You are an expert materials scientist."
 ASSISTANT_ANCHOR = "Structure: "
@@ -24,13 +25,13 @@ def parse_args():
     p.add_argument("--data_root", type=Path,
                    default=Path(os.path.join(DATA_ROOT, "LLM4Mat-Bench")))
     p.add_argument("--out_dir", type=Path,
-                   default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a")))
+                   default=Path(os.path.join(DATA_ROOT, "llm4mat_pairs")))
     p.add_argument("--max_atoms", type=int, default=20,
-                   help="Filter to structures with ≤max_atoms (matches Alex-MP-20 / MatterGen scale)")
+                   help="Keep structures with at most this many atoms (the Alex-MP-20 range MatterGen was trained on).")
     p.add_argument("--splits", type=str, default="train,validation",
-                   help="Comma-separated list of splits to include in the parquet")
+                   help="Comma-separated splits to include.")
     p.add_argument("--subsets", type=str, default=None,
-                   help="Comma-separated subset names (default: all)")
+                   help="Comma-separated subset names (default: all).")
     p.add_argument("--workers", type=int, default=16)
     return p.parse_args()
 

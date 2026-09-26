@@ -1,4 +1,4 @@
-"""Build pairs_ood.parquet by filling LLM-generated templates with per-row metadata."""
+"""Build the ALM-Bench `ood` bucket (alm_bench/ood.parquet) by filling LLM-generated templates with per-row metadata."""
 from __future__ import annotations
 
 
@@ -15,7 +15,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-from paths import DATA_ROOT
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
+from paths import ALM_BENCH
 
 
 PLACEHOLDERS_ALLOWED = {
@@ -56,17 +57,14 @@ def _meta_from_row(atoms_struct: dict, narrative: str) -> dict:
     elements_csv = ", ".join(unique_els)
     first_element = unique_els[0]
     lattice = np.asarray(atoms_struct["lattice_mat"], dtype=np.float64)
-    try:
-        volume = float(abs(np.linalg.det(lattice)))
-    except Exception:
-        volume = None
+    volume = float(abs(np.linalg.det(lattice)))
     if volume and volume > 0:
         # density g/cm^3: sum of atomic masses (amu) * 1.66054 / volume (A^3)
         from ase.data import atomic_masses, atomic_numbers
         try:
             mass_amu = sum(atomic_masses[atomic_numbers[el]] for el in elements)
             density = mass_amu * 1.66054 / volume
-        except Exception:
+        except KeyError:  # unknown element symbol
             density = None
     else:
         density = None
@@ -108,11 +106,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pairs_parquet", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs.parquet")))
+                    default=Path(os.path.join(ALM_BENCH, "pretraining/describe.parquet")))
     ap.add_argument("--templates_jsonl", type=Path,
-                    default=Path("helper_scripts/eval_prompts/ood_templates.jsonl"))
+                    default=Path(alm.__file__).parent / "eval" / "eval_prompts" / "ood_templates.jsonl")
     ap.add_argument("--out_path", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_ood.parquet")))
+                    default=Path(os.path.join(ALM_BENCH, "alm_bench/ood.parquet")))
     ap.add_argument("--batch_size", type=int, default=10000)
     args = ap.parse_args()
 
@@ -120,13 +118,11 @@ def main() -> int:
     templates: list[str] = []
     with open(args.templates_jsonl) as f:
         for line in f:
-            try:
-                obj = json.loads(line)
-                t = obj.get("template")
-                if t and isinstance(t, str):
-                    templates.append(t)
-            except Exception:
-                pass
+            if not line.strip():
+                continue
+            t = json.loads(line).get("template")
+            if t and isinstance(t, str):
+                templates.append(t)
     print(f"[build] {len(templates)} templates loaded")
     if not templates:
         raise SystemExit("no templates")

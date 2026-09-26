@@ -4,7 +4,7 @@
 
 Unifying natural language and atomistics to understand, generate, and optimize materials, introduced in [**Atomistic Language Modeling**](https://arxiv.org/abs/2606.21395).
 
-The **Atomistic Language Models (ALM)s** comprise an LLM backbone that (1) **understands** crystal structures (property prediction, Q&A), (2) **generates** them from natural-language descriptions, and (3) **edits/optimizes** them as instructed in text. This is achieved by bridging the LM (Qwen3) to a denoising-diffusion decoder through continuous projectors.
+The **Atomistic Language Models (ALMs)** comprise an LLM backbone that (1) **understands** crystal structures (property prediction, Q&A), (2) **generates** them from natural-language descriptions, and (3) **edits/optimizes** them as instructed in text. This is achieved by bridging the LM (Qwen3) to a denoising-diffusion decoder through continuous projectors.
 
 - **Understanding:** a frozen OrbV3 encoder embeds each atom, and a trainable MLP projects each embedding into the LLM feature space as soft tokens.
 - **Generation:** the embeddings of K=8 learnable `[atoms_i]` output tokens are projected through a producer-consumer bridge (a learnable-query producer feeding a cross-attention consumer) into the diffusion decoder for crystal structure prediction (CSP) and _de novo_ generation (DNG).
@@ -12,7 +12,7 @@ The **Atomistic Language Models (ALM)s** comprise an LLM backbone that (1) **und
 
 > **Steering MatterGen from your own model?** [`STEERING.md`](STEERING.md) is a self-contained recipe for conditioning MatterGen's diffusion on an arbitrary `(B, D_in)` embedding: the 5 fork touch-points, the producer-module contract, the cond_field YAML, CFG and guidance, and the bridge-kind matrix.
 
-This repository is the **lean release**: the code to retrain all three stages and to generate and evaluate outputs for every benchmark family in the paper.
+This repository contains the code to retrain all three stages and to run every benchmark in the paper.
 
 ## Repository layout
 
@@ -51,7 +51,7 @@ pip install -e .
 
 # Both options then need the MatterGen fork (required for Stage 3 / CSP / DNG; not on PyPI):
 bash external/setup_mattergen.sh
-cd external/mattergen && bash install_for_h200.sh && bash build_pyg_for_torch29.sh && cd ../..
+cd external/mattergen && bash install_cu128.sh && bash build_pyg_for_torch29.sh && cd ../..
 ```
 
 **FlashAttention-2.** The model loads with `attn_implementation="flash_attention_2"` by default (this is the exact configuration the released checkpoints were trained and evaluated with). Install it with `pip install flash-attn --no-build-isolation`; because it often has to compile against your specific CUDA/torch, prebuilt wheels save a lot of time (see **https://mjunya.com/flash-attention-prebuild-wheels/**). If you can't install it, pass `--attn_implementation sdpa` (or `load_alm(..., attn_implementation="sdpa")`) to fall back to PyTorch SDPA, which is correctness-equivalent and slightly slower.
@@ -96,22 +96,26 @@ Two repos under the [`LearningMatter`](https://huggingface.co/LearningMatter) or
 | `alm-gen/`          | **ALM Gen** (DNG): consumer-only bridge (r8) over `mattergen_base` | ~0.3 GB |
 | `alm-edit/`         | **ALM Edit** (CSP and editing): producer-consumer bridge + full-FT Qwen3-8B (`llm_full_ft/`) + `csp_backbone/` decoder | ~17 GB |
 
-**Dataset repo** `LearningMatter/ALM-Bench`: `alm_bench/` (atomtxt·app·ood·polymorph·doping + held-out `eval/`) delineated from `pretraining/` (describe·csp), ~4 GB.
+**Dataset repo** `LearningMatter/ALM-Bench`: `alm_bench/` (atomtxt, app, ood, polymorph, doping, plus held-out `eval/`) and `pretraining/` (describe, csp), ~4 GB.
+```bash
+hf download LearningMatter/ALM-Bench --repo-type dataset --local-dir $ALM_DATA_ROOT/ALM-Bench   # ALM_DATA_ROOT: see "Where things go" below
+```
+The data defaults assume this layout: the ALM Bench evals read `$ALM_DATA_ROOT/ALM-Bench/alm_bench/eval/<task>.parquet`, the DNG and text-conditional evals draw prompts and the novelty reference from `pretraining/describe.parquet`, and the `scripts/build_*_pairs.py` builders write `alm_bench/<bucket>.parquet` and `pretraining/{describe,csp}.parquet`.
 
 ALM Gen loads its r8 bridge LoRA directly (pass the subdir as `--alm_checkpoint`); ALM Edit is full-FT (auto-detected `llm_full_ft/`; pass `--bridge_lora_dir none`).
 
 **Other training data** (for retraining from scratch):
 - **LLM4Mat-Bench:** download the folder from [Google Drive](https://drive.google.com/drive/folders/12n3H9BU3AoQn7ikeR7PUrmmPRZ4LyvdX?usp=share_link).
 - **GPT-Narratives:** [`yjeong/GPT-Narratives-for-Materials`](https://huggingface.co/datasets/yjeong/GPT-Narratives-for-Materials) (the `describe`, `csp`, and `ood` buckets derive from this via `scripts/build_*_pairs.py`).
-- **CSP/DNG benchmarks:** MP-20 and MPTS-52 via `helper` download scripts; MP-2020 hull via `scripts/fetch_mp_hull.py`.
+- **CSP/DNG benchmarks:** MP-20 and MPTS-52 split CSVs (as distributed with CrystaLLM) placed under `$ALM_DATA_ROOT/eval_data/csp/{mp_20,mpts_52}/`; MP-2020 hull via `scripts/fetch_mp_hull.py`.
 
 **Where things go** (set once, then the commands above/below work):
 ```bash
 export ALM_CHECKPOINTS=./checkpoints              # where weights were downloaded
-export ALM_DATA_ROOT=/path/to/data               # LLM4Mat-Bench/, GPT-Narratives/, alm-data/ live here
+export ALM_DATA_ROOT=/path/to/data               # LLM4Mat-Bench/, GPT-Narratives-for-Materials/, ALM-Bench/ live here
 export ALM_EVAL_RESULTS_ROOT=./eval_results       # where eval scripts write metrics.json
 ```
-Then point `--data_parent_path`, `--pairs_parquets`, `--alm_checkpoint`, etc. at these locations (the `scripts/build_*` and `scripts/cache_*` utilities build the cached embeddings + `pairs*.parquet` each training stage consumes). To reproduce our exact training mixture, use the `alm-data` buckets directly.
+Then point `--data_parent_path`, `--pairs_parquets`, `--alm_checkpoint`, etc. at these locations (the `scripts/build_*` and `scripts/cache_*` utilities build the cached embeddings and the pairs parquets each training stage consumes). To reproduce the paper's training mixture, use the prebuilt buckets in the `ALM-Bench` dataset repo.
 
 ## Retraining
 
@@ -135,11 +139,12 @@ torchrun --nproc-per-node=8 -m alm.train.stage2 \
 ```
 
 ### Stage 3: producer-consumer bridge
-Requires the from-scratch CSP-mode MatterGen backbone (`csp_backbone`, built via `scripts/build_csp_backbone_cache.py` + a `mattergen-train --config-name=csp` run) and the 7-bucket `pairs*.parquet` (built by `scripts/build_*_pairs.py`).
+Requires the from-scratch CSP-mode MatterGen backbone (`csp_backbone`, built via `scripts/build_csp_backbone_cache.py` + a `mattergen-train --config-name=csp` run) and the 7 training buckets from the `ALM-Bench` dataset repo (or rebuilt with `scripts/build_*_pairs.py`, which write the same file names by default).
 ```bash
+B=$ALM_DATA_ROOT/ALM-Bench        # the downloaded dataset repo
 torchrun --nproc-per-node=8 -m alm.train.stage3 \
     --alm_checkpoint runs/stage2/step=12000 --out_dir runs/stage3 \
-    --pairs_parquets pairs.parquet,pairs_csp.parquet,pairs_ood.parquet,pairs_app.parquet,pairs_atomtxt.parquet,pairs_polymorph.parquet,pairs_doping.parquet \
+    --pairs_parquets $B/pretraining/describe.parquet,$B/pretraining/csp.parquet,$B/alm_bench/ood.parquet,$B/alm_bench/app.parquet,$B/alm_bench/atomtxt.parquet,$B/alm_bench/polymorph.parquet,$B/alm_bench/doping.parquet \
     --pairs_weights 0.08,0.15,0.08,0.04,0.40,0.15,0.10 \
     --bridge_kind producer-consumer --bridge_tenc_fuse --full_finetuning \
     --aux_target_kind composition --aux_lambda 1.0 --contrastive_lambda 0.02 \
@@ -178,7 +183,7 @@ python -m alm.eval.understanding.eval_language_retention --model alm --checkpoin
 python -m alm.eval.understanding.aggregate_results       --run_id step=12000      # headline table
 
 # Stage-3 CSP (MP-20 / MPTS-52): native CSP-mode backbone, composition-enforced
-python -m alm.eval.generation.eval_csp --ckpt_dir runs/csp_backbone \
+python -m alm.eval.generation.eval_csp --mattergen_model_path runs/csp_backbone \
     --max_rows 1000 --guidance_factor 0.5 --out_dir eval_results/csp
 #   (planner front-end variant: python -m alm.eval.generation.eval_planner_csp)
 
@@ -187,7 +192,13 @@ python -m alm.eval.generation.eval_dng \
     --alm_checkpoint runs/stage2/step=12000 \
     --atoms_mapper runs/stage3/step=30000/atoms_mapper.pt \
     --num_samples 1000 --guidance_factor 1.0 --out_root eval_results/dng --run_id alm_dng
-python -m alm.eval.generation.score_dng_hull --cif_dir eval_results/dng/alm_dng ...   # strict-SUN re-score
+# Flat-CIF DNG + MP-2020 hull re-score (SUN at E_hull <= 0.016, MSUN at <= 0.1); the generator writes
+# <out_dir>/cifs/ + summary_shard*.json, and score_dng_hull counts missing generations as failures
+python -m alm.eval.generation.gen_dng_bridge \
+    --atoms_mapper runs/stage3/step=30000/atoms_mapper.pt --mattergen_model_path runs/csp_backbone \
+    --out_dir eval_results/dng_bridge
+python -m alm.eval.generation.score_dng_hull \
+    --cif_dir eval_results/dng_bridge/cifs --out_path eval_results/dng_bridge/hull_scores.json
 
 # ALM Bench: text-conditioned editing, all four tasks in one command
 python -m alm.eval.generation.eval_almbench \

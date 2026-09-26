@@ -1,14 +1,10 @@
-"""MaScQA held-out evaluation (validation split: 131 stratified-by-topic Qs)."""
+"""MaScQA evaluation on the 131-question validation split, stratified by topic."""
 
 import argparse
 import os
-import sys
-from pathlib import Path
 
 from torch.utils.data import DataLoader
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils import MaScQADataset, custom_collate_fn
 
 from loader import load_alm
@@ -30,9 +26,7 @@ def main():
     p.add_argument("--max_new_tokens", type=int, default=64)
     p.add_argument("--no_merge_lora", action="store_true")
     p.add_argument("--atom_bidirectional_attention", action="store_true",
-                   help="Load under bidirectional atom attention. REQUIRED for bidir-trained "
-                        "Stage 2 ckpts — it's a runtime mask flag, not detectable from weights; "
-                        "omitting it loads them causal → mismatch.")
+                   help="Use bidirectional attention over atom tokens; set this for checkpoints trained with it.")
     p.add_argument("--block_leak_tokens", action="store_true",
                    help="Suppress markdown-image / URL token openers at decode time (off by default).")
     args = p.parse_args()
@@ -97,8 +91,13 @@ def main():
                "numerical_n_valid": len(num_pred), "numerical_n_leaked": num_leaks,
                "numerical_leak_rate": num_leaks / max(1, n_num_total),
                "numerical_validity_rate": len(num_pred) / max(1, n_num_total)}
+    if n_mcq_total:
+        # Unparseable and leaked MCQ answers count as wrong: accuracy is over all MCQ questions.
+        n_correct = sum(p_ == t_ for p_, t_ in zip(mcq_pred, mcq_tgt))
+        metrics["mcq_n_correct"] = n_correct
+        metrics["mcq_accuracy"] = n_correct / n_mcq_total
     if mcq_pred:
-        metrics["mcq_accuracy"] = accuracy(mcq_pred, mcq_tgt)
+        metrics["mcq_accuracy_valid_only"] = accuracy(mcq_pred, mcq_tgt)
     if num_pred:
         metrics["numerical_mae"] = mae(num_pred, num_tgt)
 

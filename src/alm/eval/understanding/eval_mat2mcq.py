@@ -4,13 +4,9 @@ import argparse
 import json
 import os
 import random
-import sys
-from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils import _atoms_struct_to_ase
 
 from loader import load_alm
@@ -83,10 +79,15 @@ def _collate(batch):
     }
 
 
+def _unparsed_rate(predictions):
+    """Fraction of answers with no parseable letter (already scored as wrong in accuracy)."""
+    return sum(r["parsed"] is None for r in predictions) / max(1, len(predictions))
+
+
 def _eval_text_mcq(model, tokenizer, mcqs, args):
     """Text-only MCQ eval; returns (predictions, correct, total, n_leaked)."""
     predictions, correct, total, n_leaked = [], 0, 0, 0
-    samples_buf, gold_buf, id_buf = [], [], []
+    samples_buf, gold_buf = [], []
 
     def flush():
         nonlocal correct, total, n_leaked
@@ -105,7 +106,7 @@ def _eval_text_mcq(model, tokenizer, mcqs, args):
             correct += int(ok)
             if leaked:
                 n_leaked += 1
-        samples_buf.clear(); gold_buf.clear(); id_buf.clear()
+        samples_buf.clear(); gold_buf.clear()
 
     for q in mcqs:
         choices = q["choices"]
@@ -129,7 +130,6 @@ def _eval_text_mcq(model, tokenizer, mcqs, args):
             "id": q.get("id"),
         })
         gold_buf.append(q["gold"])
-        id_buf.append(q.get("id"))
         if len(samples_buf) >= args.batch_size:
             flush()
     flush()
@@ -142,9 +142,7 @@ def main():
     p.add_argument("--narrative_parquet",
                    default=os.path.join(DATA_ROOT, "GPT-Narratives-for-Materials/mp_3d_2020_gpt_narratives.parquet"))
     p.add_argument("--mcq_jsonl", default=None,
-                   help="Park et al.'s generated MCQs (one JSON per line: "
-                        "{'id', 'question', 'choices': [4], 'gold': 'A'-'D'}). "
-                        "When set, --narrative_parquet is ignored.")
+                   help="JSONL of text MCQs ({'id', 'question', 'choices': [4], 'gold': 'A'-'D'}); overrides --narrative_parquet.")
     p.add_argument("--max_samples", type=int, default=500)
     p.add_argument("--split_seed", type=int, default=42)
     p.add_argument("--batch_size", type=int, default=4)
@@ -169,6 +167,7 @@ def main():
         metrics = {"n_total": total, "accuracy": (correct / max(1, total)),
                    "n_leaked": n_leaked,
                    "leak_rate": n_leaked / max(1, total),
+                   "unparsed_rate": _unparsed_rate(predictions),
                    "source": "mcq_jsonl"}
         write_run(run_dir("mat2mcq", args.checkpoint), metrics, predictions)
         print(metrics)
@@ -211,7 +210,8 @@ def main():
     flush()
 
     metrics = {"n_total": total, "accuracy": (correct / max(1, total)),
-               "n_leaked": n_leaked, "leak_rate": n_leaked / max(1, total)}
+               "n_leaked": n_leaked, "leak_rate": n_leaked / max(1, total),
+               "unparsed_rate": _unparsed_rate(predictions)}
     write_run(run_dir("mat2mcq", args.checkpoint), metrics, predictions)
     print(metrics)
 

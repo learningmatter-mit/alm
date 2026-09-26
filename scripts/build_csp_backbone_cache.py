@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Build the csp_backbone MatterGen cache (de-leaked train + MP-20 val/test)."""
+"""Build the csp_backbone MatterGen cache: a train split with MP-20/MPTS-52 eval structures removed, plus the MP-20 val/test splits."""
 
 import argparse
 import hashlib
@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 from ase.db import connect
 
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from paths import DATA_ROOT
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -57,7 +58,7 @@ def load_hull_lookup(ds: str) -> dict:
     id_col = next((c for c in ("material_id", "jarvis_id", "hea_id", "jid", "id", "structure_id")
                    if c in header), None)
     if id_col is None:
-        print(f"  [{ds}] WARN: no id column in train.csv ({header[:5]}...) — skipping hull lookup")
+        print(f"  [{ds}] no id column in train.csv ({header[:5]}...); skipping hull lookup")
         return {}
     df = pd.read_csv(csv_path, usecols=[id_col, col])
     df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -69,13 +70,13 @@ def load_hull_lookup(ds: str) -> dict:
 
 
 def load_exclusion(csv_paths: list[str]):
-    """CSP-eval material_ids (primary key) + structure fingerprints (catches non-mp ids) to de-leak."""
+    """CSP-eval material_ids (primary key) and structure fingerprints (catches non-mp ids) to exclude from train."""
     from pymatgen.core import Structure
     mpids, fps = set(), set()
     for p in csv_paths:
         p = Path(p)
         if not p.exists():
-            print(f"  [exclude] WARN: {p} missing — skipping", flush=True)
+            print(f"  [exclude] {p} missing; skipping", flush=True)
             continue
         df = pd.read_csv(p)
         if "material_id" in df.columns:
@@ -148,7 +149,7 @@ def collect_records(args, rng, exclude_mpids=None):
             if idx_path.exists():
                 forward = json.loads(idx_path.read_text())  # {material_id: db_row_id}
                 excl_db = {int(forward[m]) for m in exclude_mpids if m in forward}
-                print(f"[{ds}] de-leak: excluding {len(excl_db)} db rows "
+                print(f"[{ds}] excluding {len(excl_db)} db rows "
                       f"(of {len(exclude_mpids)} CSP-eval material_ids)", flush=True)
         recs = list(iter_filtered(ds, "train", args.max_atoms, args.hull_thresh, hull, excl_db))
         print(f"[{ds}] kept {len(recs)} metastable (atom<={args.max_atoms}, E_hull<={args.hull_thresh})",
@@ -182,15 +183,14 @@ def dedup(records, exclude_fps=None):
             seen.add(fp)
             out.append((sid, numbers, frac_pos, cell))
     if exclude_fps:
-        print(f"[dedup]   fingerprint-excluded {n_excl} CSP-eval structures (de-leak supplement)",
-              flush=True)
+        print(f"[dedup] excluded {n_excl} structures matching CSP eval fingerprints", flush=True)
     return out
 
 
 def write_cache(records, out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
     if not records:
-        print(f"  [{out_dir}] EMPTY — skipping write", flush=True)
+        print(f"  [{out_dir}] no records; skipping write", flush=True)
         return
     an_flat = np.concatenate([r[1] for r in records]).astype(np.int64)
     pos_flat = np.concatenate([r[2] for r in records]).astype(np.float64)
@@ -232,11 +232,11 @@ def main():
     ap.add_argument("--sample_per_nohull", type=int, default=100_000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--smoke", action="store_true",
-                    help="Smoke: only mp, sample_per_nohull=200 (skips no-hull subdatasets except 1).")
+                    help="Quick test: mp plus 200 oqmd samples, written to csp_backbone_smoke.")
     ap.add_argument("--no_exclude_csp_eval", action="store_true",
-                    help="(debug) DON'T de-leak — keep MP-20/MPTS-52 test+val in train.")
+                    help="Keep MP-20/MPTS-52 val/test structures in the training set.")
     ap.add_argument("--csp_eval_csvs", type=str, default=",".join(CSP_EVAL_CSVS),
-                    help="Comma list of CSP-eval csvs whose material_ids/structures are excluded from train.")
+                    help="Comma-separated CSP eval CSVs whose material_ids and structures are excluded from train.")
     args = ap.parse_args()
 
     if args.smoke:
@@ -258,7 +258,7 @@ def main():
     records = collect_records(args, rng, exclude_mpids)
     print(f"[collect] total before dedup: {len(records)}", flush=True)
     records = dedup(records, exclude_fps)
-    print(f"[dedup]   total after dedup: {len(records)}", flush=True)
+    print(f"[dedup] total after dedup: {len(records)}", flush=True)
 
     rng.shuffle(records)
     write_cache(records, args.out_root / "train")
@@ -266,7 +266,7 @@ def main():
     if not args.smoke:
         copy_mp20_split(args.out_root, "val")
         copy_mp20_split(args.out_root, "test")
-    print("[builder] DONE", flush=True)
+    print("[builder] done", flush=True)
 
 
 if __name__ == "__main__":

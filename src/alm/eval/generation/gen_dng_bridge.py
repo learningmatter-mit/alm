@@ -1,4 +1,8 @@
-"""DNG-style generation: text prompt -> bridged csp_backbone CSP-mode decoder -> flat CIFs for score_dng_hull.py."""
+"""DNG-style generation: text prompt to the bridged CSP-mode decoder, written as flat CIFs for score_dng_hull.py.
+
+summary_shard{idx}.json records n_expected (prompts x K, including planner failures);
+score_dng_hull.py --cif_dir <out_dir>/cifs sums it across shards so failed generations stay in the denominator.
+"""
 from __future__ import annotations
 
 import argparse
@@ -12,10 +16,6 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 
 import torch
-
-_ALM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _ALM_ROOT)
-
 from pymatgen.core import Structure  # noqa: E402
 from pymatgen.io.ase import AseAtomsAdaptor  # noqa: E402
 
@@ -26,7 +26,7 @@ from eval_bridge_csp import (  # noqa: E402
     build_csp_sampler,
 )
 from generate_stage3 import load_alm_and_pl_module, get_alm_embedding  # noqa: E402
-from paths import DATA_ROOT, CHECKPOINTS, RUNS  # noqa: E402
+from paths import CHECKPOINTS, RUNS, ALM_BENCH  # noqa: E402
 
 
 def main():
@@ -34,47 +34,40 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--alm_checkpoint", type=Path,
-                    default=Path(os.path.join(CHECKPOINTS, "alm_checkpoints/stage2_checkpoints/step=12000")),
-                    help="Stage-2 base ckpt (the bridge LoRA is overlaid on the merged base).")
+                    default=Path(os.path.join(CHECKPOINTS, "alm-core")),
+                    help="Stage-2 base checkpoint (the bridge LoRA is applied on top).")
     ap.add_argument("--atoms_mapper", type=Path, required=True,
-                    help="<bridge variant>/step=N/atoms_mapper.pt (bridge + cond layers).")
+                    help="atoms_mapper.pt from a Stage-3 step=N dir.")
     ap.add_argument("--mattergen_model_path", type=str,
                     default=os.path.join(RUNS, "csp_backbone"),
-                    help="LOCAL csp_backbone CSP-mode backbone dir (config.yaml + checkpoints/). "
-                         "MUST match the baseline's backbone so the comparison is matched.")
+                    help="Local MatterGen CSP checkpoint dir (config.yaml + checkpoints/).")
     ap.add_argument("--bridge_lora_dir", type=Path, default=None,
-                    help="Bridge LoRA dir (default: <atoms_mapper parent>/lora_adapter). "
-                         "'none' to skip (Stage-2 LoRA only).")
+                    help="Bridge LoRA dir (default: <atoms_mapper parent>/lora_adapter; 'none' skips it).")
     ap.add_argument("--pairs_parquet", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs.parquet")),
-                    help="pairs.parquet for prompt sampling (same source as the baseline).")
+                    default=Path(os.path.join(ALM_BENCH, "pretraining/describe.parquet")),
+                    help="Pairs parquet to sample prompts from (default: ALM-Bench pretraining/describe.parquet).")
     ap.add_argument("--n_prompts", type=int, default=1000,
-                    help="N prompts (match the baseline).")
+                    help="Number of prompts to sample.")
     ap.add_argument("--prompts_seed", type=int, default=42,
-                    help="Prompt RNG seed (match the baseline).")
+                    help="Prompt RNG seed.")
     ap.add_argument("--max_n_atoms", type=int, default=30,
-                    help="Drop comps with >max_n_atoms (csp_backbone distrib; match the baseline).")
+                    help="Skip compositions with more than this many atoms.")
     ap.add_argument("--min_n_atoms", type=int, default=3,
-                    help="Floor on the CSP cell atom count. Small cells (esp. heavy-element) go "
-                         "zero-edge mid-diffusion and crash on GemNet's CPU zero-tensor; matches "
-                         "build_sampler_and_loader's min_n_atoms. Planner formulas are scaled up "
-                         "toward max_n_atoms; comps that can't reach this floor are dropped.")
+                    help="Minimum cell atom count (very small cells lose all graph edges and crash GemNet); planner formulas are scaled up to reach it.")
     ap.add_argument("--K", type=int, default=1,
-                    help="Generations per prompt. DNG convention K=1 (matches baseline).")
+                    help="Generations per prompt (DNG convention: 1).")
     ap.add_argument("--guidance_factor", type=float, default=1.0,
-                    help="CFG guidance scale on the alm_embedding bridge "
-                         "(0 = pure conditional, bridge ON; for bridge-OFF use --bridge_off).")
+                    help="CFG guidance scale on the alm_embedding bridge (0 = pure conditional; use --bridge_off to disable the bridge).")
     ap.add_argument("--diffusion_steps", type=int, default=None)
     # FK SMC resamples among the K polymorphs of one composition (composition preserved).
     ap.add_argument("--fk_rewards", type=str, default="",
-                    help="FK reward spec, e.g. 'mattersim_energy:1.0'. Empty = no FK (default).")
+                    help="FK reward spec, e.g. 'mattersim_energy:1.0' (empty = no FK).")
     ap.add_argument("--fk_direction", type=str, default="lower",
                     choices=["lower", "higher"],
-                    help="Energy-reward direction: 'lower'=stability (quality steering).")
+                    help="Energy reward direction ('lower' steers toward stability).")
     ap.add_argument("--fk_resample_every", type=int, default=5)
     ap.add_argument("--fk_t_start_frac", type=float, default=0.5,
-                    help="Apply FK only after t < T·(1−frac) (low-noise half, where the "
-                         "Tweedie x̂₀ energy is meaningful). 0.5 = second half.")
+                    help="Fraction of the schedule after which FK resampling starts (0.5 = second half only).")
     ap.add_argument("--fk_lambda", type=float, default=1.0)
     ap.add_argument("--fk_potential", type=str, default="diff",
                     choices=["diff", "sum", "max"])
@@ -82,10 +75,10 @@ def main():
     ap.add_argument("--fk_keep_top_k", type=int, default=-1)
     ap.add_argument("--fk_log_w_clip", type=float, default=10.0)
     ap.add_argument("--bridge_off", action="store_true",
-                    help="Stamp a zero alm_embedding (ablation: JSON->csp_backbone == baseline path).")
+                    help="Stamp a zero alm_embedding (ablation: composition-only CSP).")
     ap.add_argument("--composition_source", choices=["teacher", "planner"], default="teacher",
-                    help="teacher (default) = use the prompt's deduped GT element set (== baseline). "
-                         "planner = have the ALM emit a JSON composition from the prompt text.")
+                    help="Target composition: 'teacher' uses the ground-truth composition; "
+                         "'planner' has the ALM propose one from the prompt.")
     ap.add_argument("--prompt_version", default="v5",
                     choices=["v1", "v2", "v3", "v4", "v5"],
                     help="Planner prompt template (only used when composition_source=planner).")
@@ -97,7 +90,7 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cif_root = args.out_dir / "cifs"
     cif_root.mkdir(parents=True, exist_ok=True)
-    print(f"[bridge-dng] writing -> {args.out_dir} "
+    print(f"[bridge-dng] writing to {args.out_dir} "
           f"(composition_source={args.composition_source}, g={args.guidance_factor}, "
           f"bridge_off={args.bridge_off})", flush=True)
     t0 = time.time()
@@ -109,7 +102,7 @@ def main():
         seed=args.prompts_seed,
         parent_filter=None,
     )
-    # Filter on REAL atom count (full multiset); deduped count-1 cells go zero-edge mid-diffusion and crash.
+    # Filter on the full atom count; very small cells have no edges and crash GemNet.
     kept = [(p, pid, els, jc) for p, pid, els, jc in
             zip(prompts, prompt_ids, elements_per_prompt, _json_counts)
             if args.min_n_atoms <= sum(jc.values()) <= args.max_n_atoms]
@@ -123,13 +116,13 @@ def main():
         print("[bridge-dng] no rows to process; exiting", flush=True)
         return 0
 
-    print(f"  loading ALM + bridged csp_backbone decoder ...", flush=True)
+    print("  loading ALM and bridged CSP decoder ...", flush=True)
     _ckdir = Path(args.atoms_mapper).parent
     _is_full_ft = (_ckdir / "llm_full_ft" / "qwen3_state_dict.pt").exists()
     _alm_ckpt = str(_ckdir) if _is_full_ft else str(args.alm_checkpoint)
     if _is_full_ft:
-        print(f"  full-FT checkpoint detected -> loading full Qwen3 from "
-              f"{_ckdir}/llm_full_ft (LoRA overlay skipped)", flush=True)
+        print(f"  full fine-tuned checkpoint: loading Qwen3 from {_ckdir}/llm_full_ft "
+              f"(LoRA overlay skipped)", flush=True)
     alm, tok, pl_module, K = load_alm_and_pl_module(
         alm_checkpoint=_alm_ckpt,
         atoms_mapper=str(args.atoms_mapper),
@@ -137,18 +130,18 @@ def main():
         device=device,
         model_path=args.mattergen_model_path,
     )
-    # Two-stage load: overlay the bridge variant's fresh LoRA on the Stage-2-merged ALM.
+    # Two-stage load: apply the bridge LoRA on top of the Stage-2-merged ALM.
     _bld = args.bridge_lora_dir
     if _bld is None:
         _bld = Path(args.atoms_mapper).parent / "lora_adapter"
     if _is_full_ft:
-        print("  [bridge-lora] SKIPPED (full-FT — full Qwen3 weights loaded directly)", flush=True)
+        print("  [bridge-lora] skipped: full fine-tuned LLM checkpoint", flush=True)
     elif str(_bld).lower() != "none":
         if not Path(_bld).exists():
             raise FileNotFoundError(f"bridge_lora_dir not found: {_bld}")
         apply_bridge_lora(alm, _bld, device)
     else:
-        print("  [bridge-lora] SKIPPED (--bridge_lora_dir none): using Stage-2 LoRA only", flush=True)
+        print("  [bridge-lora] skipped (--bridge_lora_dir none): using the Stage-2 LoRA only", flush=True)
     alm.eval()
     pl_module.eval()
 
@@ -157,8 +150,8 @@ def main():
     print(f"  decoder cond_fields={cond_fields} has_alm_embedding={has_alm} "
           f"(t={time.time()-t0:.0f}s)", flush=True)
     if not has_alm:
-        print("  [WARN] decoder has no alm_embedding cond_field — bridge inert; "
-              "this measures JSON->csp_backbone only.", flush=True)
+        print("  warning: decoder has no alm_embedding cond field, so the bridge has no effect",
+              flush=True)
     # bridge-off zero vector dim = raw flattened K*hidden (pool bridge).
     from eval_bridge_csp import _raw_alm_embedding_dim  # noqa: E402
     bridge_off_dim = _raw_alm_embedding_dim(args.atoms_mapper, K, alm.llm_hidden_dim)
@@ -171,7 +164,6 @@ def main():
     sampler = build_csp_sampler(pl_module, args.guidance_factor, args.diffusion_steps)
 
     if args.fk_rewards:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "alm" / "eval"))
         from fk_rewards import parse_rewards as _fk_parse_rewards  # noqa: E402
         from generate_stage3 import (  # noqa: E402
             _ensure_fk_hook_installed, _install_fk_on_sampler,
@@ -193,7 +185,7 @@ def main():
         st.log_w_clip = args.fk_log_w_clip
         st.stratify_resample_by_n_atoms = False
         _install_fk_on_sampler(sampler, st)
-        print(f"[fk] DNG-quality steering ON: rewards={args.fk_rewards} dir={args.fk_direction} "
+        print(f"[fk] steering: rewards={args.fk_rewards} dir={args.fk_direction} "
               f"N(K)={args.K} resample_every={st.resample_every} t_start_frac={st.t_start_frac} "
               f"lambda={st.lambda_} potential={st.potential} ess_thr={st.ess_threshold_frac}",
               flush=True)
@@ -206,11 +198,11 @@ def main():
             print(f"  [{i}/{len(kept)}] (t={time.time()-t0:.0f}s) ...", flush=True)
 
         if args.composition_source == "teacher":
-            # GT-composition ceiling arm (full multiset); leaks composition, not the headline.
+            # Oracle composition: use the ground-truth atom counts (upper bound).
             target_comp = dict(jc)
             json_counts_for_bridge = target_comp
         else:
-            # Planner (headline, de-novo): LLM proposes a formula, scaled to [min,max] n_atoms.
+            # Planner: the ALM proposes a formula, scaled up to at least min_n_atoms.
             _txt, parsed = epc.llm_plan(prompt, alm, tok,
                                         prompt_version=args.prompt_version)
             pfu, _fu = epc.comp_from_plan(parsed, args.prompt_version, target_atoms=None)
@@ -261,13 +253,9 @@ def main():
                 try:
                     s = AseAtomsAdaptor.get_structure(s)
                 except Exception:
-                    continue
-            try:
-                p = cif_root / f"{pid}__k{k}.cif"
-                p.write_text(s.to(fmt="cif"))
-                k_saved += 1
-            except Exception:
-                pass
+                    continue  # counted as failed through n_expected
+            (cif_root / f"{pid}__k{k}.cif").write_text(s.to(fmt="cif"))
+            k_saved += 1
         n_saved += k_saved
         records.append({
             "prompt_id": pid,
@@ -282,10 +270,15 @@ def main():
 
     (args.out_dir / f"records_shard{args.shard_idx}.jsonl").write_text(
         "\n".join(json.dumps(r) for r in records))
+    n_expected = len(kept) * args.K
+    (args.out_dir / f"summary_shard{args.shard_idx}.json").write_text(json.dumps({
+        "n_expected": n_expected, "n_saved": n_saved, "n_gen_failed": n_expected - n_saved,
+        "planner_parse_fail": n_planner_parse_fail, "planner_size_reject": n_size_reject,
+    }, indent=2))
     print(f"\n[bridge-dng] shard{args.shard_idx} done: {len(records)} rows, "
-          f"{n_saved} CIFs saved in {cif_root} "
-          f"(planner_parse_fail={n_planner_parse_fail}, t={time.time()-t0:.0f}s)",
-          flush=True)
+          f"{n_saved}/{n_expected} CIFs saved in {cif_root} "
+          f"(planner_parse_fail={n_planner_parse_fail}, planner_size_reject={n_size_reject}, "
+          f"t={time.time()-t0:.0f}s)", flush=True)
     return 0
 
 

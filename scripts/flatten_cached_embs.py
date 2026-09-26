@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from paths import DATA_ROOT
 
 

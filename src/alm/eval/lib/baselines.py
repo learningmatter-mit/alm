@@ -235,10 +235,10 @@ BASELINES = {
     # Language retention: no published baselines.
     "language_retention": {},
 
-    # Stage 3b crystal-generation baselines, verbatim from each paper's headline table.
+    # Crystal-generation baselines, copied from each paper's headline table.
 
     # CSP MP-20 (CrystaLLM split, OrderedStructureMatcher ltol=0.3/stol=0.5/angle_tol=10). CrystaLLM Table 3 + OMatG + DiffCSP.
-    "stage3b_csp_mp_20_n1_g10": {
+    "csp_mp_20_n1_g10": {
         "CrystaLLM-large":  {"csp": {"match_rate": 0.5870, "rmse": 0.0408}},
         "DiffCSP":          {"csp": {"match_rate": 0.5149, "rmse": 0.0631}},
         "OMatG-Linear-ODE": {"csp": {"match_rate": 0.6375, "rmse": 0.0720}},
@@ -250,7 +250,7 @@ BASELINES = {
         "FlowMM":           {"csp": {"match_rate": 0.6139, "rmse": 0.0566}},
         "CDVAE":            {"csp": {"match_rate": 0.3390, "rmse": 0.1045}},
     },
-    "stage3b_csp_mp_20_n20_g10": {
+    "csp_mp_20_n20_g10": {
         "CrystaLLM-large":  {"csp": {"match_rate": 0.7397, "rmse": 0.0349}},
         "DiffCSP":          {"csp": {"match_rate": 0.7793, "rmse": 0.0492}},
         "OMatG-Linear-ODE": {"csp": {"match_rate": 0.6983, "rmse": 0.0741}},
@@ -262,7 +262,7 @@ BASELINES = {
     },
 
     # CSP MPTS-52 (DiffCSP split), same matcher convention.
-    "stage3b_csp_mpts_52_n1_g10": {
+    "csp_mpts_52_n1_g10": {
         "CrystaLLM-large": {"csp": {"match_rate": 0.1921, "rmse": 0.1110}},
         "OMatG-Linear-ODE": {"csp": {"match_rate": 0.2515, "rmse": None}},
         # MCFlow (Seong '26) MPTS-52 K=1
@@ -273,7 +273,7 @@ BASELINES = {
         "MCFlow-B":         {"csp": {"match_rate": 0.2646, "rmse": 0.1572}},
         "MCFlow-L":         {"csp": {"match_rate": 0.2716, "rmse": 0.1401}},
     },
-    "stage3b_csp_mpts_52_n20_g10": {
+    "csp_mpts_52_n20_g10": {
         "CrystaLLM-large": {"csp": {"match_rate": 0.3375, "rmse": 0.1059}},
         "DiffCSP":          {"csp": {"match_rate": 0.3402, "rmse": 0.1749}},
         "OMatG-Linear-ODE": {"csp": {"match_rate": 0.2738, "rmse": None}},
@@ -285,7 +285,7 @@ BASELINES = {
     },
 
     # De-novo (DNG) eval, fractions in [0,1]. Sources: MatterGen (Zeni Nature 2025), Crystal-text-LLM Table 1, OMatG MP-20 DNG.
-    "stage3b_dng_g00": {
+    "dng_g00": {
         "MatterGen":         {"dng": {"sun": 0.3857, "metastable": 0.78, "stable": 0.13,
                                        "rmsd_to_relaxed_min": 0.021}},
         "Crystal-text-LLM-70B": {"dng": {"validity_geom": 0.996, "metastable": 0.498,
@@ -300,24 +300,8 @@ BASELINES = {
     },
 
     # Text-conditional eval. Chemeleon's composition-match is not directly comparable (structurally conditioned).
-    "stage3b_text_cond_g10": {
+    "text_cond_g10": {
         "Chemeleon": {"text_cond": {"composition_match_ratio": 0.6752}},
     },
 }
 
-
-# Crystal-generation citation strings for the paper bibliography.
-CRYSTAL_GEN_CITATIONS = {
-    "CrystaLLM": "Antunes et al., Nat Commun 15, 10570 (2024). arXiv:2307.04340",
-    "MatterGen": "Zeni et al., Nature 639, 624 (2025). arXiv:2312.03687",
-    "Crystal-text-LLM": "Gruver et al., ICLR 2024. arXiv:2402.04379",
-    "Chemeleon": "Park et al., Nat Commun 2025. doi:10.1038/s41467-025-59636-y",
-    "OMatG": "Hassan et al., 2025. arXiv:2502.02582",
-    "CDVAE": "Xie et al., ICLR 2022.",
-    "DiffCSP": "Jiao et al., NeurIPS 2023.",
-    "MCFlow": "Seong, Ahn, Han, Park, 2026. arXiv:2602.20210v2 (unified CSP+DNG MP-20 + LeMat-GenBench).",
-    "CrystalFlow": "(MCFlow Table 1 baseline.)",
-    "FlowMM": "(MCFlow Table 1 baseline.)",
-    "Crys-JEPA": "Liu et al., 2026. arXiv:2605.14759 (Table 1: V.S.U.N./S.U.N. MP-20 N=10k MLFF).",
-    "CrystalReasoner": "2026. arXiv:2605.14344 (Tables 1-2: S.U.N.@0.016 strict, N=1024, formula+SG cond).",
-}

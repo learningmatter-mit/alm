@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Build the ALM Bench `polymorph` editing pairs: for each same-composition pair (A, B) with E_hull(B) < E_hull(A), emit the edit A -> B.
 
-  python scripts/build_polymorph_pairs.py --out_dir <data_root>/stage3_outputs/stage3a
+  python scripts/build_polymorph_pairs.py --out_path <data_root>/ALM-Bench/alm_bench/polymorph.parquet
 """
 
 import argparse
@@ -12,7 +12,8 @@ from collections import defaultdict
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from paths import DATA_ROOT
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
+from paths import DATA_ROOT, ALM_BENCH
 
 PROMPTS = [
     "Generate a polymorph of this material below the convex hull.",
@@ -43,7 +44,8 @@ def _n_uniq(atoms: dict) -> int:
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--source", default=os.path.join(DATA_ROOT, "GPT-Narratives-for-Materials/mp_3d_2020_gpt_narratives.parquet"))
-    ap.add_argument("--out_dir", default=os.path.join(DATA_ROOT, "stage3_outputs/stage3a"))
+    ap.add_argument("--out_path", default=os.path.join(ALM_BENCH, "alm_bench/polymorph.parquet"),
+                    help="output parquet (the released ALM-Bench file name)")
     ap.add_argument("--id_col", default="material_id", help="id column for row_id; falls back to row index when absent")
     ap.add_argument("--max_per_formula", type=int, default=0, help="cap A->B pairs per formula (0 = no cap)")
     ap.add_argument("--seed", type=int, default=42)
@@ -80,8 +82,8 @@ def main():
                 "input_atoms_struct": _atoms_struct(A["atoms"]), "input_source_idx": rid(ai, A),
             })
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    dst = os.path.join(args.out_dir, "pairs_polymorph_under_hull.parquet")
+    os.makedirs(os.path.dirname(os.path.abspath(args.out_path)), exist_ok=True)
+    dst = args.out_path
     pq.write_table(pa.Table.from_pylist(out), dst)
     print(f"wrote {len(out)} polymorph pairs -> {dst}")
 

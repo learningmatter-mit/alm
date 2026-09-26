@@ -1,11 +1,14 @@
-"""CSP eval: direct CrystaLLM head-to-head on MP-20 and MPTS-52 via CDVAE matcher."""
+"""Prompted CSP recovery on CDVAE-format benchmarks (MP-20, MPTS-52), scored with the CDVAE structure matcher.
+
+Match rates divide by every test row; planner parse failures and rows with no usable generation
+count as misses (see n_gen_failed). RMSE averages over matched rows only (CDVAE convention).
+"""
 from __future__ import annotations
 
 
 import argparse
 import csv
 import os
-import sys
 from pathlib import Path
 
 import torch
@@ -13,8 +16,6 @@ from pymatgen.core.structure import Structure
 from pymatgen.io.cif import CifParser
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # alm/
 
 from runs import run_dir, write_run  # noqa: E402
 from structure_metrics import (  # noqa: E402
@@ -76,13 +77,23 @@ def _safe_float(s):
         return None
 
 
+def _match_rates(predictions: list[dict], suffix: str = "") -> tuple[float, float]:
+    """(M@1, M@K) over every test row; planner parse failures and rows with no usable generation count as misses."""
+    n = len(predictions)
+    if not n:
+        return 0.0, 0.0
+    m1 = sum(bool(p.get(f"matched_n1{suffix}")) for p in predictions)
+    mK = sum(bool(p.get(f"matched_nK{suffix}")) for p in predictions)
+    return m1 / n, mK / n
+
+
 def read_test_rows(benchmark: str, max_rows: int = -1, bench_root: Path | None = None):
     """Yield per-row dicts from a CDVAE-format benchmark's test split."""
     bench_root = bench_root or DEFAULT_BENCH_ROOT
     test_csv = bench_root / benchmark / "test.csv"
     if not test_csv.exists():
         raise FileNotFoundError(
-            f"missing {test_csv} — run scripts/download_csp_benchmarks.sh"
+            f"missing {test_csv}; run scripts/download_csp_benchmarks.sh"
         )
     with open(test_csv) as f:
         reader = csv.DictReader(f)
@@ -255,140 +266,95 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--alm_checkpoint", required=True,
-                    help="Stage 3b step= dir (with lora_adapter/ + projector_and_state.pt).")
+                    help="Stage-3 step=N dir (with lora_adapter/ and projector_and_state.pt).")
     ap.add_argument("--atoms_mapper", required=True,
-                    help="Path to atoms_mapper.pt produced by the Stage-3 trainer")
+                    help="atoms_mapper.pt produced by the Stage-3 trainer.")
     ap.add_argument("--benchmark", required=True, choices=["mp_20", "mpts_52", "perov_5", "carbon_24"],
                     help="CDVAE/CrystaLLM-format benchmark to evaluate against.")
     ap.add_argument("--n", type=int, default=20,
-                    help="Number of generations per composition (CrystaLLM reports 1 and 20; "
-                         "this CLI accepts any positive int — useful for resample-many test-time "
-                         "compute experiments where you crank N up to see if the upper-bound "
-                         "match rate climbs).")
+                    help="Generations per composition (CrystaLLM reports 1 and 20).")
     ap.add_argument("--prompt_template", default="rich_v1",
                     choices=list(PROMPT_TEMPLATES.keys()),
-                    help="Prompt format. `minimal` matches CrystaLLM's terse 'formula + sg' "
-                         "prompt. `rich_v1/v2/v3` mirror GPT-Narratives prose patterns the "
-                         "model saw at training time (dft_3d / mp_3d_2020 / oqmd respectively). "
-                         "Default `rich_v1` is the closest training-distribution match.")
+                    help="Prompt format: minimal (CrystaLLM-style formula and space group) or rich_v1/v2/v3 (dft_3d / mp_3d_2020 / oqmd narrative style).")
     ap.add_argument("--mask_elements", action=argparse.BooleanOptionalAction, default=True,
-                    help="Hard-mask atomic-number logits at sample time so generations only "
-                         "use elements that appear in the target row's `elements` field. "
-                         "Default ON. Disable with --no-mask_elements for the unrestricted "
-                         "baseline.")
+                    help="Mask atomic-number logits to the target row's elements (default on).")
     ap.add_argument("--max_rows", type=int, default=-1,
-                    help="Cap test rows for smoke runs; -1 = full set.")
+                    help="Maximum number of test rows (-1 = all).")
     ap.add_argument("--guidance_factor", type=float, default=1.0,
                     help="CFG guidance scale.")
     ap.add_argument("--diffusion_snr", type=float, default=None,
-                    help="Sampling temperature analog (scales Langevin-corrector "
-                         "SNR vs defaults pos=0.4 / cell=0.2). <1.0 = warmer, "
-                         ">1.0 = cooler, None = default. Same semantics as in "
-                         "eval_dng.py.")
+                    help="Scale on the Langevin corrector SNR (defaults pos=0.4, cell=0.2); below 1 is warmer.")
     ap.add_argument("--mattergen_pretrained", default="mattergen_base")
     ap.add_argument("--num_atoms_distribution", default="ALEX_MP_20")
     ap.add_argument("--composition_source", choices=["teacher", "planner"], default="teacher",
-                    help="teacher (default) uses ground-truth benchmark composition for the "
-                         "JSON prefix / composition cond fields. planner has the LLM emit "
-                         "JSON composition first, then conditions on those predicted counts.")
+                    help="teacher: condition on the ground-truth composition; planner: condition on LLM-predicted counts.")
     ap.add_argument("--planner_alm_checkpoint", type=Path, default=None,
-                    help="Optional separate clean ALM checkpoint for composition planning. "
-                         "Default: use the same ALM loaded for the bridge.")
+                    help="Optional separate checkpoint used only for composition planning (default: the bridge ALM).")
     ap.add_argument("--planner_prompt_version", default="v5",
                     choices=["v1", "v2", "v3", "v4", "v5"],
-                    help="Planner JSON format; v5 asks for per-formula-unit counts and "
-                         "the parser scales to the benchmark cell atom count.")
+                    help="Planner JSON format; v5 asks for per-formula-unit counts that the parser scales to the cell.")
     ap.add_argument("--planner_fallback_teacher", action="store_true",
-                    help="If --composition_source planner fails to parse a row, fall back "
-                         "to teacher-forced ground-truth counts instead of skipping it. "
-                         "Useful for plumbing smokes; leave off for honest planner evals.")
+                    help="Use ground-truth counts when the planner output does not parse (debugging only).")
     ap.add_argument("--bench_root", type=Path, default=DEFAULT_BENCH_ROOT)
     ap.add_argument("--out_root", type=Path, default=None,
                     help="Override $ALM_EVAL_RESULTS_ROOT.")
     ap.add_argument("--run_id", type=str, default=None)
     # Feynman-Kac steering (off by default).
     ap.add_argument("--fk_n_particles", type=int, default=0,
-                    help="0 = no FK (default). When > 0, replaces --n: each prompt produces "
-                         "fk_n_particles structures via FK steering. target_counts auto-extracted "
-                         "from each row's pretty_formula.")
+                    help="FK-steered particles per prompt, replacing --n (0 = off).")
     ap.add_argument("--fk_rewards", type=str,
                     default="stoich_match:1.0;count_l1:1.0;ratio_kl:1.0",
-                    help="Reward composition for FK.")
+                    help="FK reward specification.")
     ap.add_argument("--fk_resample_every", type=int, default=10)
     ap.add_argument("--fk_t_start_frac", type=float, default=0.5)
     ap.add_argument("--fk_lambda", type=float, default=0.5)
     ap.add_argument("--fk_potential", type=str, default="sum",
                     choices=["diff", "sum", "max"],
-                    help="Default 'sum' (suited to stationary count rewards).")
+                    help="FK potential ('sum' suits stationary count rewards).")
     ap.add_argument("--fk_ess_threshold_frac", type=float, default=0.5)
     ap.add_argument("--fk_keep_top_k", type=int, default=-1)
     ap.add_argument("--fk_log_w_clip", type=float, default=10.0)
     ap.add_argument("--fk_constrain_n_atoms_to_target_multiple", action="store_true",
-                    help="Restrict per-particle N_p to multiples of sum(target_counts) for "
-                         "the row. Recommended on.")
+                    help="Restrict per-particle N_p to multiples of sum(target_counts).")
     ap.add_argument("--fk_stratify_resample_by_n_atoms", action="store_true")
     ap.add_argument("--fk_n_atoms_exact_sum_target", action="store_true",
-                    help="Force N_p = sum(target_counts) exactly (no multiples). "
-                         "For SrTiO3 → only 5 atoms/cell. "
-                         "Pair with --fk_enforce_target_counts to guarantee exact stoichiometry.")
+                    help="Force N_p = sum(target_counts) exactly.")
     ap.add_argument("--fk_physical_bounds_path", type=Path, default=None,
-                    help="Path to JSON of empirical physical-prior bounds. Required if "
-                         "--fk_rewards includes 'physical_sanity'.")
+                    help="JSON of physical-prior bounds (required by the physical_sanity reward).")
     ap.add_argument("--fk_enforce_target_counts", action="store_true",
-                    help="Post-hoc Hungarian Z-override at end of denoising — forces exact "
-                         "target_counts on every particle by reassigning atom labels via "
-                         "Hungarian on the model's final probs. Positions/lattice untouched.")
-    # MatterSim relax before matching (geometry-rescue lever).
+                    help="Reassign atom types after denoising (Hungarian on the final probabilities) to match target_counts exactly.")
+    # Optional MatterSim relaxation before matching.
     ap.add_argument("--relax_before_match", action="store_true",
-                    help="Run MatterSim relax on every generation before passing to the "
-                         "structure matcher. Reports BOTH unrelaxed (standard convention) "
-                         "and relaxed match rates side-by-side. Relaxation can rescue "
-                         "right-formula-wrong-geometry rows (unit-cell doublings, rotations, "
-                         "near-correct lattices).")
+                    help="Also report match rates after relaxing each generation with MatterSim.")
     ap.add_argument("--mattersim_potential_path", type=str, default=None,
-                    help="Optional MatterSim checkpoint path; default uses MatterSim's "
-                         "bundled mattersim-v1.0.0-1M.")
+                    help="MatterSim checkpoint path (default: bundled mattersim-v1.0.0-1M).")
     # Row sharding for parallel multi-GPU runs.
     ap.add_argument("--shard_idx", type=int, default=0,
-                    help="0-indexed shard of rows this process handles. With "
-                         "--num_shards N, processes rows where (row_idx %% N) == shard_idx. "
-                         "Default 0 = no sharding.")
+                    help="This process's shard index; keeps rows where row_idx %% num_shards == shard_idx.")
     ap.add_argument("--num_shards", type=int, default=1,
-                    help="Total shards (1 = no sharding). Set N when launching N parallel "
-                         "processes on N GPUs; auto-suffixes --run_id with '_shard{i}of{N}' "
-                         "so per-GPU output dirs don't collide.")
+                    help="Number of stride shards; --run_id gets a '_shard{i}of{N}' suffix.")
     ap.add_argument("--row_start", type=int, default=0,
-                    help="Inclusive row index where this process starts. Composes with "
-                         "bash ranges for explicit per-GPU partitioning (alternative to "
-                         "stride sharding via --shard_idx/--num_shards). Default 0.")
+                    help="First row index (inclusive) for explicit range partitioning.")
     ap.add_argument("--row_end", type=int, default=-1,
-                    help="Exclusive row index where this process stops. Default -1 = end "
-                         "of test set. Auto-suffixes --run_id with '_rows{start}-{end}' so "
-                         "concurrent ranges write to disjoint dirs.")
+                    help="Last row index (exclusive, -1 = end); --run_id gets a '_rows{start}-{end}' suffix.")
     ap.add_argument("--diffusion_seed", type=int, default=1337,
-                    help="Seed for diffusion noise. Per-prompt offset added so "
-                         "reordering doesn't change individual outputs.")
-    # Peaked atomic_numbers init at sampler t=T.
+                    help="Diffusion noise seed; a per-prompt offset keeps outputs independent of prompt order.")
+    # Initialize atom types at t=T to the target composition.
     ap.add_argument("--init_types_at_target", action="store_true",
-                    help="Override atomic_numbers immediately after _sample_prior with "
-                         "a permuted target multiset (Z values, integer). Lets the "
-                         "denoiser see real types from t=T → positions can co-evolve. "
-                         "Requires --fk_n_atoms_exact_sum_target. Independent of FK; "
-                         "you can run with --fk_n_particles 0 (vanilla diffusion) to "
-                         "isolate the init-prior effect, or compose with FK.")
+                    help="Initialize atom types at t=T to a random permutation of the target composition (requires --fk_n_atoms_exact_sum_target).")
     args = ap.parse_args()
-    # argparse required=True allows empty strings (unset shell vars); fast-fail clearly.
+    # required=True still accepts empty strings from unset shell variables.
     if not str(args.alm_checkpoint).strip():
         ap.error("--alm_checkpoint is empty (likely an unset shell variable like $ALM_CKPT)")
     if not str(args.atoms_mapper).strip():
         ap.error("--atoms_mapper is empty (likely an unset shell variable)")
     ckpt_path = Path(args.alm_checkpoint)
-    # Full-FT ckpts store Qwen3 in llm_full_ft/qwen3_state_dict.pt and have no lora_adapter/.
+    # Fully fine-tuned checkpoints store Qwen3 in llm_full_ft/qwen3_state_dict.pt and have no lora_adapter/.
     _is_full_ft = (ckpt_path / "llm_full_ft" / "qwen3_state_dict.pt").is_file()
     if not _is_full_ft and not (ckpt_path / "lora_adapter").is_dir():
         ap.error(f"--alm_checkpoint {ckpt_path} contains neither a lora_adapter/ subdir "
                  "nor llm_full_ft/qwen3_state_dict.pt; check that the path points at a "
-                 "Stage 3b step= directory.")
+                 "Stage-3 step=N directory.")
     if not Path(args.atoms_mapper).is_file():
         ap.error(f"--atoms_mapper {args.atoms_mapper} is not a file; expected the "
                  "atoms_mapper.pt under the step= dir.")
@@ -403,10 +369,8 @@ def main():
                  "particle has exactly sum(target_counts) atoms to populate from the "
                  "target multiset.")
     if args.init_types_at_target and args.fk_enforce_target_counts:
-        print("[init_types] WARNING: --fk_enforce_target_counts is redundant with "
-              "--init_types_at_target (Hungarian post-hoc would overwrite an already "
-              "count-correct trajectory). Keeping it on is harmless but does extra work.",
-              flush=True)
+        print("[init_types] warning: --fk_enforce_target_counts has no effect with "
+              "--init_types_at_target", flush=True)
     if args.num_shards > 1:
         suffix = f"_shard{args.shard_idx}of{args.num_shards}"
         args.run_id = (args.run_id + suffix) if args.run_id else f"shard{args.shard_idx}of{args.num_shards}"
@@ -415,7 +379,7 @@ def main():
         suffix = f"_rows{args.row_start}-{end_tag}"
         args.run_id = (args.run_id + suffix) if args.run_id else f"rows{args.row_start}-{end_tag}"
 
-    # Timestamped progress logging: the "looks hung" stalls are silent ckpt load + first diffusion.
+    # Timestamped progress log: checkpoint load and the first diffusion call are slow and otherwise silent.
     import time as _time, datetime as _dt
     _t0 = _time.time()
     def _stage(msg):
@@ -437,7 +401,7 @@ def main():
     _stage("imports done")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    _stage(f"device={device}; loading ALM checkpoint + MatterGen pl_module (this is the slow step, ~30s) ...")
+    _stage(f"device={device}; loading ALM checkpoint and MatterGen pl_module ...")
     alm, tokenizer, pl_module, K = load_alm_and_pl_module(
         alm_checkpoint=args.alm_checkpoint,
         atoms_mapper=args.atoms_mapper,
@@ -462,7 +426,7 @@ def main():
     # Append prompt template to benchmark name so prompt-format experiments don't collide.
     tmpl_tag = "" if args.prompt_template == "minimal" else f"_{args.prompt_template}"
     benchmark_name = (
-        f"stage3b_csp_{args.benchmark}_n{args.n}_g{int(args.guidance_factor*10):02d}"
+        f"csp_{args.benchmark}_n{args.n}_g{int(args.guidance_factor*10):02d}"
         f"{tmpl_tag}"
     )
     if args.out_root is not None:
@@ -474,7 +438,7 @@ def main():
            f"planner_prompt_version={args.planner_prompt_version} "
            f"planner_fallback_teacher={args.planner_fallback_teacher}")
 
-    _stage(f"reading test CSV (this parses CIFs row-by-row, can take ~30-60s for 1000 rows) ...")
+    _stage("reading test CSV ...")
     rows = list(read_test_rows(args.benchmark, max_rows=args.max_rows, bench_root=args.bench_root))
     _stage(f"loaded {len(rows)} test rows from {args.benchmark}")
     # Row range slice [start, end) applied to the post-max_rows subset, before stride sharding.
@@ -489,7 +453,7 @@ def main():
               f"(stride pattern row_idx % {args.num_shards} == {args.shard_idx})", flush=True)
 
     if not rows:
-        print("[csp] no rows — nothing to do", flush=True)
+        print("[csp] no rows to evaluate", flush=True)
         return 0
 
     prompt_fn = PROMPT_TEMPLATES[args.prompt_template]
@@ -523,7 +487,6 @@ def main():
         planner_parse_fail = False
 
         if args.composition_source == "planner":
-            import eval_planner_csp as epc
             plan_prompt = epc.planner_prompt(str(r["formula"]), target_atoms)
             plan_text, parsed = epc.llm_plan(
                 plan_prompt, planner_alm, planner_tokenizer,
@@ -597,9 +560,8 @@ def main():
         return 0
 
     if args.composition_source == "planner":
-        denom = max(1, len(rows))
         _stage(f"planner composition: parse_fail={n_planner_parse_fail} "
-               f"correct={n_planner_correct}/{denom} "
+               f"correct={n_planner_correct}/{len(rows) + len(pre_predictions)} "
                f"fallback_teacher={args.planner_fallback_teacher}")
 
     gen_root = rd / "generations"
@@ -609,7 +571,7 @@ def main():
     )
     if args.mask_elements:
         print(f"[csp] hard-masking atomic-number logits to resolved composition elements "
-              f"(e.g. row 0 → {allowed_elements_per_prompt[0]})", flush=True)
+              f"(e.g. row 0: {allowed_elements_per_prompt[0]})", flush=True)
 
     fk_active = args.fk_n_particles > 0
     composition_count_per_prompt = [
@@ -622,7 +584,7 @@ def main():
         fk_target_counts_per_prompt = [
             _reduced_z_counts(c) for c in json_counts_per_prompt
         ]
-        _stage(f"FK target_counts (reduced) per row — example "
+        _stage(f"FK target_counts (reduced) per row, e.g. "
                f"row 0 ({rows[0]['formula']}): {fk_target_counts_per_prompt[0]}")
 
     physical_bounds = None
@@ -635,10 +597,7 @@ def main():
 
     n_rows_to_gen = len(prompts)
     n_per_row = args.fk_n_particles if fk_active else args.n
-    _stage(f"starting generation: {n_rows_to_gen} rows × {n_per_row} structures/row "
-           f"= {n_rows_to_gen * n_per_row} total. "
-           f"At ~30-60s/row this is ~{(n_rows_to_gen * 45)/60:.0f} min total.")
-    _stage("generate_for_prompts emits a [gen-batch] line per row → use those for live progress")
+    _stage(f"generating {n_rows_to_gen} rows x {n_per_row} structures")
     structures_per_prompt = generate_for_prompts(
         prompts=prompts,
         alm=alm, tokenizer=tokenizer, pl_module=pl_module,
@@ -701,8 +660,7 @@ def main():
             flat.extend(structs_only)
         if flat:
             _stage(f"running MatterSim relax on {len(flat)} structures "
-                   f"(across {len(per_prompt_counts)} rows; ~30s/struct → "
-                   f"~{(len(flat) * 30)/60:.0f} min) ...")
+                   f"across {len(per_prompt_counts)} rows ...")
             relaxed_atoms, _ = relax_structures_mattersim(
                 flat, device=device,
                 potential_path=args.mattersim_potential_path,
@@ -715,19 +673,15 @@ def main():
                 relaxed_per_prompt.append(relaxed_structs[cursor:cursor + k])
                 cursor += k
         else:
-            _stage("[relax] no structures to relax — skipping")
+            _stage("[relax] no structures to relax")
             relaxed_per_prompt = [[] for _ in per_prompt_counts]
 
     _stage(f"starting per-row scoring loop (CDVAE matcher: ltol=0.3, stol=0.5, angle_tol=10 deg) ...")
     matcher = cdvae_matcher()
     predictions = list(pre_predictions)
-    n_matched_n1 = 0
-    n_matched_nK = 0
     rmses_n1 = []
     rmses_nK = []
     # Relaxed counterparts (only populated when --relax_before_match).
-    n_matched_n1_r = 0
-    n_matched_nK_r = 0
     rmses_n1_r = []
     rmses_nK_r = []
     n_invalid_geom = 0
@@ -762,22 +716,19 @@ def main():
             })
             continue
         mm = match_many(gen_structs, ref, matcher=matcher)
-        v_geom = sum(validity_full(s)["geom"] for s in gen_structs) / len(gen_structs)
-        v_charge = sum(validity_full(s)["charge"] for s in gen_structs) / len(gen_structs)
+        # Unconvertible generations count as invalid.
+        v_geom = sum(validity_full(s)["geom"] for s in gen_structs) / len(gens)
+        v_charge = sum(validity_full(s)["charge"] for s in gen_structs) / len(gens)
         if mm["matched_n1"]:
-            n_matched_n1 += 1
             rmses_n1.append(mm["rmse_n1"])
         if mm["matched_nK"]:
-            n_matched_nK += 1
             rmses_nK.append(mm["rmse_nK"])
         mm_r = None
         if relaxed_per_prompt is not None and relaxed_per_prompt[ridx]:
             mm_r = match_many(relaxed_per_prompt[ridx], ref, matcher=matcher)
             if mm_r["matched_n1"]:
-                n_matched_n1_r += 1
                 rmses_n1_r.append(mm_r["rmse_n1"])
             if mm_r["matched_nK"]:
-                n_matched_nK_r += 1
                 rmses_nK_r.append(mm_r["rmse_nK"])
         pred = {
             "row_id": rid, "formula": formula, "space_group": sg,
@@ -810,12 +761,15 @@ def main():
                 cur_r1 = sum(1 for p in predictions if p.get('matched_n1_relaxed'))
                 cur_rK = sum(1 for p in predictions if p.get('matched_nK_relaxed'))
                 extra = f", relaxed: {cur_r1}@1 / {cur_rK}@K"
-            _stage(f"scored {n_done}/{len(rows)} rows so far  →  "
+            _stage(f"scored {n_done}/{len(rows)} rows so far: "
                    f"raw: {cur_match_n1}@1 / {cur_match_nK}@K{extra}")
             _last_heartbeat = _time.time()
 
     n = len(predictions)
     n_scored = sum(1 for p in predictions if not p["skipped"])
+    m1, mK = _match_rates(predictions)
+    n_gen_failed = sum(1 for p in predictions if p["skipped"] and not p.get("planner_parse_fail"))
+    # RMSE averages over matched rows only (CDVAE convention); match rates divide by all n rows.
     metrics = {
         "benchmark": args.benchmark,
         "n_test": n,
@@ -823,8 +777,10 @@ def main():
         "n_invalid_geom_skipped": n_invalid_geom,
         "n": args.n,
         "guidance_factor": args.guidance_factor,
-        "match_rate_n1": n_matched_n1 / n_scored if n_scored else 0.0,
-        "match_rate_nK": n_matched_nK / n_scored if n_scored else 0.0,
+        "match_rate_n1": m1,
+        "match_rate_nK": mK,
+        "n_gen_failed": n_gen_failed,
+        "gen_failed_rate": n_gen_failed / n if n else 0.0,
         "rmse_n1": float(sum(rmses_n1) / len(rmses_n1)) if rmses_n1 else None,
         "rmse_nK": float(sum(rmses_nK) / len(rmses_nK)) if rmses_nK else None,
         "rmse_n1_min": float(min(rmses_n1)) if rmses_n1 else None,
@@ -835,15 +791,15 @@ def main():
         "composition_source": args.composition_source,
         "planner_prompt_version": args.planner_prompt_version,
         "planner_parse_fail": n_planner_parse_fail,
+        # Unparseable plans count as incorrect.
         "planner_correct_rate": (
-            n_planner_correct / max(1, len(rows))
-            if args.composition_source == "planner" else 1.0
-        ),
+            n_planner_correct / n if n else 0.0
+        ) if args.composition_source == "planner" else 1.0,
         "planner_fallback_teacher": bool(args.planner_fallback_teacher),
     }
     if args.relax_before_match:
-        metrics["match_rate_n1_relaxed"] = n_matched_n1_r / n_scored if n_scored else 0.0
-        metrics["match_rate_nK_relaxed"] = n_matched_nK_r / n_scored if n_scored else 0.0
+        metrics["match_rate_n1_relaxed"], metrics["match_rate_nK_relaxed"] = _match_rates(
+            predictions, suffix="_relaxed")
         metrics["rmse_n1_relaxed"] = (
             float(sum(rmses_n1_r) / len(rmses_n1_r)) if rmses_n1_r else None
         )
@@ -851,10 +807,10 @@ def main():
             float(sum(rmses_nK_r) / len(rmses_nK_r)) if rmses_nK_r else None
         )
     write_run(rd, metrics, predictions)
-    _stage(f"wrote {rd}/metrics.json + {rd}/predictions.jsonl")
+    _stage(f"wrote {rd}/metrics.json and {rd}/predictions.jsonl")
 
     _total = _time.time() - _t0
-    _stage(f"DONE — total wallclock {_total:.0f}s ({_total/60:.1f} min)")
+    _stage(f"done: total wallclock {_total:.0f}s ({_total/60:.1f} min)")
 
     print()
     print(f"[csp] {args.benchmark} n={args.n} g={args.guidance_factor}")
@@ -863,7 +819,7 @@ def main():
     print(f"  rmse@1 (mean) = {metrics['rmse_n1']}")
     print(f"  rmse@K (mean) = {metrics['rmse_nK']}")
     if args.relax_before_match:
-        print(f"  ── relaxed (MatterSim) ──")
+        print("  relaxed (MatterSim):")
         print(f"  match_rate@1  = {metrics['match_rate_n1_relaxed']:.3f}")
         print(f"  match_rate@K  = {metrics['match_rate_nK_relaxed']:.3f}")
         print(f"  rmse@1 (mean) = {metrics['rmse_n1_relaxed']}")

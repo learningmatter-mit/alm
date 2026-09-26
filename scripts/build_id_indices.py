@@ -1,3 +1,4 @@
+"""Write {train,validation}.id_index.json (dataset id stored in row.data['smiles'] -> ASE DB row id) for each subdataset under --parent."""
 from ase.db import connect
 from tqdm import tqdm
 import json

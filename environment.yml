@@ -1,15 +1,14 @@
-# Conda/mamba environment for Atomistic Language Models (the `llm` env we train
-# and evaluate in). This is a clean, re-runnable reproduction: a Python-3.10
-# base + the CUDA-12 torch build, then the project's pip dependencies.
+# Conda environment for Atomistic Language Models: Python 3.10, CUDA-12 torch, and
+# the project's pip dependencies.
 #
 #   conda env create -f environment.yml      # or: mamba / micromamba
 #   conda activate alm
 #   bash external/setup_mattergen.sh          # fetch + patch the MatterGen fork
-#   cd external/mattergen && bash install_for_h200.sh && bash build_pyg_for_torch29.sh
+#   cd external/mattergen && bash install_cu128.sh && bash build_pyg_for_torch29.sh
 #
-# CUDA-12 ONLY. The torch wheel is pulled from the cu128 index below; never let
-# anything install CUDA-13-tagged nvidia-* wheels (they collide on shared .so
-# paths and break torch).
+# CUDA 12 only. The torch wheel comes from the cu128 index below. Do not install
+# CUDA-13-tagged nvidia-* wheels into this env; they collide on shared .so paths
+# and break torch.
 name: alm
 channels:
   - conda-forge

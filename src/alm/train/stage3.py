@@ -1,14 +1,9 @@
 """Stage 3a/3b joint bridge training (GILL/DreamLLM pattern); see argparse --help for usage."""
 
-# Map legacy checkpoint bridge_kind values to current names.
-_LEGACY_BRIDGE = {"qformer": "producer-consumer", "qformer_pool": "producer-consumer-pool", "ipadapter": "consumer-only"}
-def _norm_bridge(bk):
-    return _LEGACY_BRIDGE.get(bk, bk)
-
-
 import argparse
 import json
 import os
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -24,8 +19,9 @@ from mattergen.common.data.chemgraph import ChemGraph
 from mattergen.common.data.collate import collate as mg_collate
 from mattergen.common.data.transform import symmetrize_lattice, set_chemical_system_string
 
-# PYTHONPATH must include the repo's alm/ directory.
 from aux_heads import build_aux_head
+from bridge import canonical_bridge_kind
+from composition_utils import N_ELEMENTS
 from loader import load_alm
 from paths import DATA_ROOT
 
@@ -36,9 +32,6 @@ except ImportError:
     _WANDB = False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Data
-# ─────────────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
     "You are an expert materials scientist. When asked to generate a crystal "
@@ -46,7 +39,7 @@ SYSTEM_PROMPT = (
     "generation tokens."
 )
 
-# user_prompt and assistant_anchor are pre-baked into pairs.parquet at build time.
+# user_prompt and assistant_anchor are pre-baked into pairs parquet at build time.
 
 
 def _atoms_struct_to_tensors(struct: dict):
@@ -68,6 +61,31 @@ def _atoms_struct_to_tensors(struct: dict):
     return frac, cell, Z
 
 
+def _is_valid_geometry(struct: dict) -> bool:
+    """Reject geometries that NaN the diffusion score.
+
+    Drops n_atoms<=1, a non-finite or non-3x3 lattice, det<=0, volume per atom
+    above 100 A^3 (outside MatterGen's 15-50 schedule), and non-finite coords.
+    """
+    n = len(struct.get("elements") or [])
+    if n <= 1:
+        return False
+    lat = struct.get("lattice_mat")
+    lat = np.asarray(lat if lat is not None else [], dtype=np.float64)
+    if lat.shape != (3, 3) or not np.isfinite(lat).all():
+        return False
+    det = float(np.linalg.det(lat))
+    if det < 1e-3:
+        return False
+    if det / n > 100.0:
+        return False
+    coords = struct.get("coords")
+    coords = np.asarray(coords if coords is not None else [], dtype=np.float64)
+    if coords.size and not np.isfinite(coords).all():
+        return False
+    return True
+
+
 def _direction_tag(row_id) -> str:
     """row_id '...-{property}-{higher|lower}' -> ' Target: lower formation energy.' ('' if non-directional)."""
     s = str(row_id)
@@ -82,8 +100,8 @@ def _direction_tag(row_id) -> str:
     return f" Target: {d} {prop}."
 
 
-class Stage3aDataset(Dataset):
-    """Reads pairs.parquet; emits tokenized prompt + structure + optional aux_target."""
+class Stage3Dataset(Dataset):
+    """Reads pairs parquet; emits tokenized prompt + structure + optional aux_target."""
 
     def __init__(self, parquet_path: str, tokenizer, max_num_tokens: int = 2048,
                  aux_target_kind: str | None = None,
@@ -117,7 +135,7 @@ class Stage3aDataset(Dataset):
             self.task_direction_labels = labels
             if is_main_process():
                 n_pos = int((labels == 1.0).sum()); n_neg = int((labels == -1.0).sum())
-                print(f"[stage3a] task_direction: +1={n_pos} -1={n_neg} "
+                print(f"[stage3] task_direction: +1={n_pos} -1={n_neg} "
                       f"nan={self.n - n_pos - n_neg} of {self.n} rows ({parquet_path})")
         # Same-input opposite-direction partner map for the directional contrastive loss.
         self.dir_partner_idx = None
@@ -141,8 +159,8 @@ class Stage3aDataset(Dataset):
             self.dir_partner_idx = partner
             if is_main_process():
                 n_with_partner = int((partner >= 0).sum())
-                print(f"[stage3a] dir-contrastive partners: {n_paired_src} input_source_idx "
-                      f"with both directions → {n_with_partner} rows have a partner "
+                print(f"[stage3] dir-contrastive partners: {n_paired_src} input_source_idx "
+                      f"with both directions, {n_with_partner} rows have a partner "
                       f"({parquet_path})")
         self.tokenizer = tokenizer
         self.max_num_tokens = max_num_tokens
@@ -162,7 +180,7 @@ class Stage3aDataset(Dataset):
                 f"--description_in_assistant_turn requires a `narrative` column in "
                 f"{parquet_path}; columns are {list(self.rows.keys())}"
             )
-        # Echo the directional instruction onto the assistant turn just before [atoms_0] (pure text, not a cond_field).
+        # Echo the directional instruction onto the assistant turn just before [atoms_0].
         self.direction_in_assistant_turn = bool(direction_in_assistant_turn)
 
         # Input-side <atoms> splice; only fires for atomtxt buckets with a cache root.
@@ -179,8 +197,8 @@ class Stage3aDataset(Dataset):
                 idx_p = cer / parent / "embeddings" / f"{atomistic_model_name}_atom.flat.idx.json"
                 if not bin_p.exists() or not idx_p.exists():
                     if is_main_process():
-                        print(f"[stage3a] WARN: no cached {atomistic_model_name} features for {parent} "
-                              f"at {bin_p} — atomtxt rows from this parent will be dropped.")
+                        print(f"[stage3] WARN: no cached {atomistic_model_name} features for {parent} "
+                              f"at {bin_p}; atomtxt rows from this parent will be dropped.")
                     continue
                 with open(idx_p) as f:
                     self.cached_embs_idx[parent] = json.load(f)
@@ -188,7 +206,7 @@ class Stage3aDataset(Dataset):
                     bin_p, dtype=np.float32, mode="r"
                 ).reshape(-1, atomistic_feature_dim)
             if is_main_process():
-                print(f"[stage3a] cached {atomistic_model_name} input features loaded for parents: "
+                print(f"[stage3] cached {atomistic_model_name} input features loaded for parents: "
                       f"{list(self.cached_embs.keys())}")
 
         self.aux_target_kind = aux_target_kind
@@ -197,7 +215,7 @@ class Stage3aDataset(Dataset):
         if aux_target_kind == "composition":
             from composition_utils import composition_multihot, symbol_to_z
             sym2z = symbol_to_z()
-            self.aux_targets = np.zeros((self.n, 100), dtype=np.float32)
+            self.aux_targets = np.zeros((self.n, N_ELEMENTS), dtype=np.float32)
             atoms_structs = self.rows["atoms_struct"]
             for i in range(self.n):
                 struct = atoms_structs[i]
@@ -206,13 +224,11 @@ class Stage3aDataset(Dataset):
                 self.aux_targets[i] = composition_multihot(struct["elements"], sym2z)
             if is_main_process():
                 pos_per_row = self.aux_targets.sum(axis=1).mean()
-                print(f"[stage3a] aux_target=composition: precomputed (n={self.n}, dim=100), "
+                print(f"[stage3] aux_target=composition: precomputed (n={self.n}, dim={N_ELEMENTS}), "
                       f"avg ~{pos_per_row:.2f} elements/structure")
 
         elif aux_target_kind == "composition_count":
-            from composition_utils import (
-                composition_count_vec, MAX_COUNT, N_ELEMENTS, symbol_to_z,
-            )
+            from composition_utils import composition_count_vec, MAX_COUNT, symbol_to_z
             sym2z = symbol_to_z()
             # (n, N_ELEMENTS) integer counts clamped to MAX_COUNT, float32 for torch.stack.
             self.aux_targets = np.zeros((self.n, N_ELEMENTS), dtype=np.float32)
@@ -238,7 +254,7 @@ class Stage3aDataset(Dataset):
                     self.aux_targets[self.aux_targets > 0].mean()
                     if (self.aux_targets > 0).any() else 0.0
                 )
-                print(f"[stage3a] aux_target=composition_count: precomputed "
+                print(f"[stage3] aux_target=composition_count: precomputed "
                       f"(n={self.n}, dim={N_ELEMENTS}, MAX_COUNT={MAX_COUNT}), "
                       f"avg ~{pos_per_row:.2f} elements/structure, "
                       f"avg count-when-present {avg_count_when_pos:.2f}, "
@@ -265,11 +281,9 @@ class Stage3aDataset(Dataset):
         # Commit composition as a JSON prefix in the assistant turn; [atoms_i] stay at the end.
         _json_prefix = None
         if self.lm_loss_json:
-            import json as _json
-            from collections import Counter as _Counter
             _elems = atoms_struct.get("elements") or []
-            _cnt = {str(k): int(v) for k, v in _Counter(_elems).items()}
-            _json_prefix = _json.dumps({"counts": _cnt}, separators=(",", ":"))
+            _cnt = {str(k): int(v) for k, v in Counter(_elems).items()}
+            _json_prefix = json.dumps({"counts": _cnt}, separators=(",", ":"))
             if not self.atoms_before_json:
                 assistant_anchor = _json_prefix + "\n" + assistant_anchor
         if self.lm_loss_json and self.atoms_before_json:
@@ -318,27 +332,7 @@ class Stage3aDataset(Dataset):
         if hasattr(atoms_struct, "as_py"):
             atoms_struct = atoms_struct.as_py()
 
-        # Reject geometries that NaN the diffusion score: n_atoms<=1, VPA>100 A^3/atom
-        # (outside MatterGen's 15-50 schedule), non-finite/wrong-shape lattice, det<=0.
-        try:
-            import numpy as _np
-            _elems = atoms_struct.get("elements") or []
-            _n = len(_elems)
-            if _n <= 1:
-                return None
-            _lat = _np.asarray(atoms_struct.get("lattice_mat") or [], dtype=_np.float64)
-            if _lat.shape != (3, 3) or not _np.isfinite(_lat).all():
-                return None
-            _det = float(_np.linalg.det(_lat))
-            if abs(_det) < 1e-3 or _det <= 0:
-                return None
-            _vol = abs(_det)
-            if _vol / _n > 100.0:
-                return None
-            _coords = _np.asarray(atoms_struct.get("coords") or [], dtype=_np.float64)
-            if _coords.size and not _np.isfinite(_coords).all():
-                return None
-        except Exception:
+        if not _is_valid_geometry(atoms_struct):
             return None
 
         _tok = self._tokenize_prompt(user_prompt, assistant_anchor, atoms_struct)
@@ -403,8 +397,8 @@ class Stage3aDataset(Dataset):
         return sample
 
 
-def stage3a_collate(samples):
-    """Collate Stage3aDataset samples, filtering None entries."""
+def stage3_collate(samples):
+    """Collate Stage3Dataset samples, filtering None entries."""
     samples = [s for s in samples if s is not None]
     if not samples:
         return None
@@ -473,9 +467,6 @@ def stage3a_collate(samples):
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MatterGen loading
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_adapter_cfg(pretrained_name: str, full_finetuning: bool,
                       hidden_dim: int = 4096, K: int = 8, mid_dim: int = 2048,
@@ -495,9 +486,9 @@ def _make_adapter_cfg(pretrained_name: str, full_finetuning: bool,
                       bridge_tenc_fuse: bool = False):
     """Build the OmegaConf DictConfig for init_adapter_lightningmodule_from_pretrained."""
     if bridge_kind not in ("pool", "producer-consumer", "producer-consumer-pool", "consumer-only"):
-        raise ValueError(f"Unknown bridge_kind={bridge_kind!r}; expected pool|qformer|qformer_pool|ipadapter")
+        raise ValueError(f"Unknown bridge_kind={bridge_kind!r}; expected pool|producer-consumer|producer-consumer-pool|consumer-only")
 
-    # Skip alm_embedding for the discrete-cond-only / no-LLM-bridge control.
+    # No alm_embedding for the no-bridge baseline.
     property_embedding_cfg = {}
     if use_alm_embedding_cond:
         if bridge_kind == "producer-consumer":
@@ -696,9 +687,6 @@ def load_mattergen_adapter(pretrained_name: str, lr: float,
     return pl_module
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Checkpoint
-# ─────────────────────────────────────────────────────────────────────────────
 
 def save_checkpoint(step: int, alm, diffusion_module, optimizer, out_dir: Path,
                     include_optimizer: bool = True, aux_head=None, stage_3b: bool = False,
@@ -776,13 +764,10 @@ def save_checkpoint(step: int, alm, diffusion_module, optimizer, out_dir: Path,
         alm_module.llm.save_pretrained(str(lora_dir), save_embedding_layers=False)
         # save_embedding_layers=False drops the K=8 [atoms_i] rows; persist them explicitly.
         _state_blob = {"projector_state_dict": alm_module.projector.state_dict()}
-        try:
-            _emb_w = alm_module.llm.get_input_embeddings().weight.data
-            _ids = list(alm_module.output_atom_token_ids)
-            _state_blob["atoms_i_embed_rows"] = _emb_w[_ids].detach().cpu().clone()
-            _state_blob["output_atom_token_ids"] = _ids
-        except Exception as _e:
-            print(f"[save] WARN could not persist atoms_i rows: {_e}", flush=True)
+        _emb_w = alm_module.llm.get_input_embeddings().weight.data
+        _ids = list(alm_module.output_atom_token_ids)
+        _state_blob["atoms_i_embed_rows"] = _emb_w[_ids].detach().cpu().clone()
+        _state_blob["output_atom_token_ids"] = _ids
         torch.save(_state_blob, save_dir / "projector_and_state.pt")
     elif llm_full_ft:
         # FSDP gathers the per-layer FlatParameters onto rank-0 host RAM (offload_to_cpu).
@@ -833,9 +818,10 @@ def resume_checkpoint(ckpt_path: str, diffusion_module, optimizer, device, aux_h
         cur_sd = dm.model.state_dict()
         cur_sd.update(ckpt["mattergen_full_state_dict"])
         miss, unexp = dm.model.load_state_dict(cur_sd, strict=False)
-        print(f"[stage3a] resumed FULL MatterGen backbone (full-FT): "
-              f"{len(ckpt['mattergen_full_state_dict'])} tensors "
-              f"(missing={len(miss)}, unexpected={len(unexp)})")
+        if is_main_process():
+            print(f"[stage3] resumed full MatterGen backbone (full-FT): "
+                  f"{len(ckpt['mattergen_full_state_dict'])} tensors "
+                  f"(missing={len(miss)}, unexpected={len(unexp)})")
     elif "trainable_state_dict" in ckpt:
         cur_sd = dm.model.state_dict()
         cur_sd.update(ckpt["trainable_state_dict"])
@@ -845,24 +831,23 @@ def resume_checkpoint(ckpt_path: str, diffusion_module, optimizer, device, aux_h
         saved_kind = ckpt.get("aux_head_kind")
         if saved_kind == aux_head.target_kind and "aux_head_state_dict" in ckpt:
             aux_head.load_state_dict(ckpt["aux_head_state_dict"])
-            print(f"[stage3a] resumed aux_head ({aux_head.target_kind}) state")
-        else:
-            print(f"[stage3a] aux_head kind mismatch (ckpt={saved_kind!r}, "
-                  f"current={aux_head.target_kind!r}) — aux_head starts fresh")
+            if is_main_process():
+                print(f"[stage3] resumed aux_head ({aux_head.target_kind}) state")
+        elif is_main_process():
+            print(f"[stage3] aux_head kind mismatch (ckpt={saved_kind!r}, "
+                  f"current={aux_head.target_kind!r}); aux_head starts fresh")
 
     # Optimizer state is saved only periodically; weights-only resumes start fresh.
     if "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        print(f"[stage3a] resumed optimizer state from step {ckpt.get('step', 0)}")
-    else:
-        print(f"[stage3a] no optimizer state in ckpt — starting with fresh optimizer "
+        if is_main_process():
+            print(f"[stage3] resumed optimizer state from step {ckpt.get('step', 0)}")
+    elif is_main_process():
+        print(f"[stage3] no optimizer state in ckpt; starting with a fresh optimizer "
               f"(step {ckpt.get('step', 0)} weights restored)")
     return ckpt.get("step", 0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Build ChemGraph batch from raw structure tensors
-# ─────────────────────────────────────────────────────────────────────────────
 
 def build_chemgraph_batch(fracs, cells, Zs, n_atoms, device,
                           task_direction=None):
@@ -886,9 +871,6 @@ def build_chemgraph_batch(fracs, cells, Zs, n_atoms, device,
     return mg_collate(graphs)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DDP helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _group_grad_norm(params):
     """L2 norm of grads across a parameter group (skips grad-less params)."""
@@ -926,16 +908,13 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--alm_checkpoint", required=True,
                    help="Stage 2 checkpoint dir (lora_adapter/ + projector_and_state.pt)")
     p.add_argument("--pairs_parquet", default=None,
-                   help="Output of build_stage3a_pairs.py. Single-bucket mode. "
+                   help="One pairs parquet (e.g. ALM-Bench pretraining/describe.parquet, from build_describe_pairs.py). Single-bucket mode. "
                         "Mutually exclusive with --pairs_parquets.")
     p.add_argument("--pairs_parquets", default=None,
                    help="Comma-separated list of parquet paths for multi-bucket "
@@ -955,12 +934,10 @@ def parse_args():
                    help="MatterGen pretrained name (HF hub) or path")
     p.add_argument("--mattergen_model_path", type=str, default=None,
                    help="Local CSP-mode backbone dir. When set, "
-                        "the adapter loads this LOCAL ckpt instead of --mattergen_pretrained, "
+                        "the adapter loads this local checkpoint instead of --mattergen_pretrained, "
                         "wraps its plain GemNetT into GemNetTCtrl, and attaches the "
                         "alm_embedding cond field. CSP corruption (atoms observed, pos+cell "
-                        "denoised) + CSP loss are inherited from the backbone's saved config. "
-                        "This is the planner architecture: JSON-composition observed "
-                        "atoms + atoms_i->CFG task conditioning.")
+                        "denoised) + CSP loss are inherited from the backbone's saved config.")
     p.add_argument("--out_dir", required=True)
     p.add_argument("--total_steps", type=int, default=10000)
     p.add_argument("--batch_size", type=int, default=4,
@@ -968,13 +945,8 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4,
                    help="LR for AtomsMapper + cond_adapt/mixin layers + aux head.")
     p.add_argument("--lora_lr", type=float, default=0.0,
-                   help="LR for Stage 2 LoRA params on Qwen3. Default 0 (Stage 3a, frozen LLM). "
-                        "Set >0 to enter Stage 3b (unfreeze LoRA on Qwen3). Recommended: 1e-5 "
-                        "to 5e-5 — much lower than Stage 2's 2e-4 since the diffusion+aux "
-                        "gradient is noisier, and LoRA at high lr destroys Qwen3's "
-                        "hidden-state diversity. With aux composition loss "
-                        "as anchor, low-lr LoRA can refine [atoms_i] hidden states without "
-                        "drifting into the degenerate equilibrium.")
+                   help="LR for the Stage 2 LoRA. 0 freezes the LLM (Stage 3a); >0 trains LoRA "
+                        "(Stage 3b, 1e-5 to 5e-5 recommended with the composition aux loss).")
     p.add_argument("--contrastive_lambda", type=float, default=0.0,
                    help="Weight on the off-diag-cosine contrastive loss that decorrelates "
                         "AtomsMapper outputs across the batch. Default 0 (disabled). Note: "
@@ -986,8 +958,8 @@ def parse_args():
                    help="Auxiliary supervision target on AtomsMapper output. 'composition' "
                         "predicts a multi-hot Z=1..100 of the target structure (BCE). "
                         "'composition_count' adds a per-element CE on the exact integer count "
-                        "(clamped to MAX_COUNT=20) on top of the same presence BCE — drop-in "
-                        "replacement for 'composition' that pressures stoichiometry.")
+                        "(clamped to MAX_COUNT=20) on top of the same presence BCE, which adds "
+                        "pressure on stoichiometry.")
     p.add_argument("--aux_lambda", type=float, default=1.0,
                    help="Weight on the auxiliary loss in total = L_diff + λ_aux * L_aux + "
                         "λ_contrastive * L_contrastive.")
@@ -995,11 +967,8 @@ def parse_args():
                    help="Weight on the count-CE branch *inside* the composition_count head, "
                         "relative to the presence-BCE branch (= L_aux). 1.0 starts even.")
     p.add_argument("--use_last_prompt_token", action="store_true",
-                   help="Bypass the K random-init [atoms_i] embeddings and pool from "
-                        "the position immediately preceding the first [atoms_i] token. "
-                        "Returns K copies of that hidden state so AtomsMapper API stays "
-                        "the same. Tests whether the random-init [atoms_i] tokens are "
-                        "the bottleneck for archetype-knowledge preservation.")
+                   help="Use the hidden state just before [atoms_0] (repeated K times) "
+                        "instead of the [atoms_i] states.")
     p.add_argument("--aux_warmup_steps", type=int, default=0,
                    help="Pre-train AtomsMapper on aux loss only for N steps (zero-out L_diff). "
                         "Useful if mapper output starts uninformative; lets the aux head "
@@ -1019,280 +988,182 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--max_num_tokens", type=int, default=2048)
     p.add_argument("--num_output_atom_tokens", type=int, default=8,
-                   help="K — number of [atoms_{i}] output-side tokens emitted at the end "
-                        "of the assistant turn. Default 8. Reduce to 4 for the "
-                        "K=4 ablation; increase to 16 to give Qwen3 more capacity for "
-                        "spreading structural info across positions before AtomsMapper "
-                        "pooling. Each change requires a fresh Stage 3b run from the Stage 2 "
-                        "ckpt — load_alm migrates the saved [atoms_i] embedding rows to the "
-                        "new K (truncating prefix on shrink, freshly init'ing extras on grow).")
+                   help="K, the number of [atoms_i] output tokens appended to the assistant turn. "
+                        "Changing K requires a fresh Stage 3 run; load_alm truncates or extends "
+                        "the saved [atoms_i] rows to match.")
     p.add_argument("--atoms_mapper_mid_dim", type=int, default=2048,
-                   help="Hidden width of AtomsMapper's two-Linear-with-GELU MLP. Default "
-                        "2048. Bump to 4096 to give the K*4096 -> 512 "
-                        "projection more capacity for capturing geometric / structural detail "
-                        "before pooling into MatterGen's 512-d conditioning vector. Doubling "
-                        "mid_dim from 2048 to 4096 roughly doubles AtomsMapper params "
-                        "(~70M -> ~140M); the LLM-side cost is unchanged.")
+                   help="Hidden width of the pool/consumer-only bridge MLP.")
     p.add_argument("--p_unconditional", type=float, default=0.2,
                    help="CFG dropout probability (fraction of samples that use ZerosEmbedding)")
     p.add_argument("--bridge_kind", choices=("pool", "producer-consumer", "producer-consumer-pool", "consumer-only", "auto"), default="auto",
-                   help="LLM→MatterGen bridge architecture. 'producer-consumer' uses "
-                        "AtomsMapperProducerConsumer (M learned queries cross-attending the N context + K "
-                        "atoms hidden states → (B, M, 512)) consumed by GemNetTCtrl's post-block "
-                        "IP-Adapter cross-attention (zero-init V). 'producer-consumer-pool' mean-pools the M "
-                        "query tokens to a single 512-d vector for the additive concat-MLP path. "
-                        "'pool' uses AtomsMapper (per-position projection + terminal "
-                        "mean-pool) → single 512-d vector → concat-MLP cond_adapt. "
-                        "'consumer-only' is the IP-Adapter producer: K per-token "
-                        "MLP outputs consumed by GemNet IP-Adapter cross-attention. "
-                        "'auto' (default): sniff bridge_kind from --resume_atoms_mapper if set, "
-                        "else default to 'pool' for backward compatibility.")
+                   help="LLM-to-MatterGen bridge. 'producer-consumer': Q-Former (M learned queries "
+                        "over the N context + K atoms states, output (B, M, 512)) read by GemNet's "
+                        "IP-Adapter cross-attention. 'producer-consumer-pool': the same Q-Former "
+                        "mean-pooled to one 512-d vector for the additive path. 'pool': per-token MLP "
+                        "mean-pooled to one 512-d vector. 'consumer-only': K per-token MLP outputs "
+                        "read by the IP-Adapter cross-attention. 'auto': read from "
+                        "--resume_atoms_mapper, else 'pool'.")
     p.add_argument("--cond_adapt_n_heads", type=int, default=4,
-                   help="Number of attention heads for the qformer IP-Adapter cross-attention "
-                        "cond_adapt. Must divide MatterGen's emb_size_atom=512. Ignored when "
-                        "bridge_kind=pool.")
-    # ── CFG-interface controls (compose freely) ───────────────────────────────
+                   help="Attention heads for the IP-Adapter cross-attention cond_adapt "
+                        "(producer-consumer / consumer-only). Must divide 512.")
+    # CFG-interface controls (compose freely)
     p.add_argument("--bridge_out_norm", action="store_true",
-                   help="Magnitude control: LayerNorm the QFormer cond-vector output to ~unit "
+                   help="LayerNorm the Q-Former output to ~unit "
                         "RMS (FT-head convention) so the CFG delta has bounded scale. "
-                        "Currently wired for --bridge_kind qformer.")
+                        "Only used with --bridge_kind producer-consumer.")
     p.add_argument("--bridge_learnable_null", action="store_true",
-                   help="Learned null: use a LEARNABLE unconditional embedding "
-                        "(LearnedEmbeddingSequence, opts out of the adapter zeros-rewrite) so CFG "
-                        "steers (cond − learned_null) not (cond − 0). For --bridge_kind qformer.")
+                   help="Use a learnable unconditional embedding (LearnedEmbeddingSequence) so CFG "
+                        "steers along (cond - learned_null) instead of (cond - 0). "
+                        "For --bridge_kind producer-consumer.")
     p.add_argument("--bridge_noise_gate", action="store_true",
-                   help="Hand-set linear 1−t gate; prefer --bridge_tenc_fuse. "
-                        "Scales the bridge contribution by w(t)=(1−t).")
+                   help="Scale the bridge contribution by w(t)=(1-t). "
+                        "--bridge_tenc_fuse learns this dependence instead.")
     p.add_argument("--bridge_tenc_fuse", action="store_true",
-                   help="Learned timestep fusion: make the QFormer/IP-Adapter "
-                        "cond TOKENS noise-aware — cond_t=LN(cond+MLP([cond, t_enc])), t_enc=native "
-                        "NoiseLevelEncoding, MLP final zero-init (no-op at step 0). The model LEARNS "
-                        "the noise-dependence instead of the hand-set 1−t gate. For --bridge_kind qformer.")
-    # ── Q-Former bridge (--bridge_kind qformer) ──────────────────────────────
+                   help="Make the Q-Former cond tokens noise-aware: "
+                        "cond_t = LN(cond + MLP([cond, t_enc])), with a zero-init final layer "
+                        "(no-op at step 0). For --bridge_kind producer-consumer.")
+    # Q-Former bridge (--bridge_kind producer-consumer)
     p.add_argument("--qformer_num_queries", type=int, default=16,
                    help="M: number of learned query tokens for the Q-Former bridge. "
                         "AtomsMapperProducerConsumer emits (B, M, 512); GemNet cond_adapt_use_ipa "
-                        "cross-attends over these M conditioning tokens. Only used when "
-                        "--bridge_kind qformer.")
+                        "cross-attends over these M conditioning tokens. Only used with "
+                        "--bridge_kind producer-consumer.")
     p.add_argument("--qformer_depth", type=int, default=2,
                    help="Number of {cross-attn, self-attn, MLP} Q-Former blocks. "
-                        "Only used when --bridge_kind qformer.")
+                        "Only used with --bridge_kind producer-consumer.")
     p.add_argument("--qformer_heads", type=int, default=8,
                    help="Number of attention heads inside each Q-Former block (must divide "
-                        "out_dim=512). Only used when --bridge_kind qformer.")
+                        "out_dim=512). Only used with --bridge_kind producer-consumer.")
     p.add_argument("--qformer_context_tokens", type=int, default=128,
                    help="N: number of LLM context hidden states (the N states immediately "
                         "before the first [atoms_0] token) prepended to the K [atoms_i] states "
                         "to form the Q-Former source sequence S = N + K. Plumbed to the ALM as "
-                        "qformer_n_context. Only used when --bridge_kind qformer.")
+                        "qformer_n_context. Only used with --bridge_kind producer-consumer.")
     p.add_argument("--qformer_input_atoms", type=int, default=0,
-                   help="L_in: when >0 (and --bridge_kind qformer), prepend up to L_in "
-                        "input-side <atoms> hidden states (the P_in(H) projected encoder "
-                        "features) to the Q-Former source, GUARANTEEING the input structure "
-                        "is in the producer context regardless of prompt length. Source "
-                        "becomes [input_atoms(L_in) ++ context(N) ++ atoms_i(K)]; the Q-Former "
-                        "is built with source_len = L_in+N+K, n_context = L_in+N.")
+                   help="L_in: prepend up to L_in input <atoms> hidden states to the Q-Former "
+                        "source, so source = [input_atoms(L_in), context(N), atoms_i(K)]. "
+                        "0 disables.")
     p.add_argument("--qformer_dir_aux_lambda", type=float, default=0.0,
                    help="Weight for the direction-aux CE loss on the Q-Former output. When >0 "
-                        "(and --bridge_kind qformer), AtomsMapperProducerConsumer.direction_logits(am_out) "
+                        "(and --bridge_kind producer-consumer), AtomsMapperProducerConsumer.direction_logits(am_out) "
                         "predicts the ±1 task_direction sign; CE is computed on finite-direction "
-                        "rows only. Does NOT attach task_direction as a ChemGraph cond_field.")
+                        "rows only.")
     p.add_argument("--qformer_dir_aux_pool", choices=("mean", "query0"), default="mean",
                    help="How AtomsMapperProducerConsumer.direction_logits pools the M query tokens before "
                         "the 2-way direction head: 'mean' over queries or the first query 'query0'.")
     p.add_argument("--qformer_dir_margin_lambda", type=float, default=0.0,
-                   help="Weight for the directional COSINE-MARGIN loss (bridge-internal). Unlike "
-                        "the CE dir-aux (satisfied by tiny linear separability → cond stays at "
-                        "high cross-direction cosine), this forces pooled am_out to carry an "
-                        "ANGULAR directional component along ±dir_proto: relu(margin − sign(td)·"
-                        "cos(pooled, dir_proto)) on finite-direction rows. Drives the cross-direction "
-                        "cosine DOWN while leaving the orthogonal complement free for composition. "
-                        "No external cond_field, no extra forward, no pairs.")
+                   help="Weight on the cosine-margin loss "
+                        "relu(margin - sign(d) * cos(pooled am_out, dir_proto)) over directional rows.")
     p.add_argument("--qformer_dir_margin", type=float, default=0.3,
-                   help="Target angular margin for --qformer_dir_margin_lambda: each higher row is "
-                        "pushed to cos(pooled, dir_proto) ≥ margin, each lower row ≤ −margin. Larger "
-                        "= stronger directional separation (lower cross-direction cosine) at more "
-                        "cost to composition headroom. 0.3 ≈ leave ~95%% of the norm for composition.")
+                   help="Margin for --qformer_dir_margin_lambda: higher rows are pushed to "
+                        "cos >= margin, lower rows to cos <= -margin. Larger values separate "
+                        "directions more at some cost to composition accuracy.")
     p.add_argument("--qformer_contrastive_lambda", type=float, default=0.0,
-                   help="Reserved Q-Former-specific contrastive weight (default 0.0; the shared "
-                        "--contrastive_lambda path already decorrelates mapper outputs across the "
-                        "batch for any bridge_kind).")
+                   help="Unused; accepted so existing launch scripts still parse. "
+                        "Use --contrastive_lambda.")
     p.add_argument("--qformer_dir_contrastive_lambda", type=float, default=0.0,
-                   help="Weight for the same-input directional contrastive loss on the RAW LLM "
-                        "hidden states (extract_atoms_hidden_states output, NOT am_out). For each "
+                   help="Weight for a same-input directional contrastive loss. For each "
                         "directional row with an opposite-direction sibling sharing the same "
-                        "input_source_idx, the sibling's prompt is forwarded through the SAME bridge "
-                        "extractor and the loss is relu(cos(flatten(raw_i), flatten(partner_raw_i)) - "
-                        "target), averaged over rows that have a partner. Forces Qwen3 to encode "
-                        "higher/lower direction at the bridge-extracted positions (where the "
-                        "cross-direction cosine otherwise stays high). No learnable prototype, no "
-                        "MatterGen cond_field — bridge-internal.")
+                        "input_source_idx, the sibling's prompt is forwarded through the same bridge "
+                        "extractor and the loss is relu(cos(x_i, x_partner_i) - target), averaged "
+                        "over rows that have a partner. The layer x is set by "
+                        "--qformer_dir_contrastive_on.")
     p.add_argument("--qformer_dir_contrastive_target", type=float, default=0.5,
                    help="Max-allowed cosine for --qformer_dir_contrastive_lambda: the loss only "
-                        "penalizes a same-input higher/lower pair whose RAW-hidden-state cosine "
-                        "EXCEEDS this target (relu(cos - target)). Lower = stronger separation. "
-                        "0.5 leaves the pair free to share up to half its direction while still "
-                        "pulling the otherwise-high cosine down.")
+                        "penalizes a same-input higher/lower pair whose cosine "
+                        "exceeds this target (relu(cos - target)). Lower means stronger separation.")
     p.add_argument("--qformer_dir_contrastive_on", choices=["raw", "am_out"], default="raw",
-                   help="WHICH layer the directional contrastive acts on. 'raw': the "
-                        "flattened extract_atoms_hidden_states output (context_plus_atoms, S*4096) — the "
-                        "128 context tokens trivially differ by prompt word, so the loss is absorbed there "
-                        "without pressuring the MatterGen-facing signal (cond-token cosine unchanged). "
-                        "'am_out': the POST-MAPPER cond tokens (M*512) — the EXACT layer MatterGen "
-                        "consumes; runs the QFormer on the partner's raw states and minimizes "
-                        "relu(cos(flatten(am_out_i), flatten(am_out_partner_i)) - target). Excludes the "
-                        "trivially-differing context tokens → forces the QFormer OUTPUT to encode direction.")
+                   help="Layer the directional contrastive acts on. 'raw': the flattened "
+                        "extract_atoms_hidden_states output (S*4096). 'am_out': the post-mapper "
+                        "cond tokens (M*512) that MatterGen consumes; the Q-Former is also run on "
+                        "the partner's raw states.")
     p.add_argument("--init_atoms_tokens_from_eos", action="store_true",
-                   help="CoT-style initialization: copy the LLM's <|im_end|> "
-                        "embedding row into the K=8 [atoms_i] rows at construction. "
-                        "The K positions enter the LLM forward with a semantically "
-                        "meaningful 'assistant-turn-closes-here' embedding instead "
-                        "of random init. Causal attention + RoPE diverge them across "
-                        "positions during forward.")
+                   help="Initialize the [atoms_i] embedding rows from the <|im_end|> "
+                        "embedding instead of random init.")
     p.add_argument("--bridge_source", choices=("atoms_tokens", "last_k_prompt", "context_plus_atoms"),
                    default="atoms_tokens",
-                   help="Which hidden states to feed the bridge. 'atoms_tokens' (default): "
-                        "the K=8 random-init [atoms_i] output token positions in the assistant "
-                        "turn. 'last_k_prompt': the K hidden states immediately preceding the "
-                        "[atoms_0] anchor --- captures the LLM's processing of the actual prompt "
-                        "content. Pair with the existing pairs.parquet for the last-user-prompt-tokens "
-                        "variant, or with a description-in-assistant-turn data variant. "
-                        "'context_plus_atoms': "
-                        "Q-Former source — N=qformer_context_tokens context states immediately "
-                        "before [atoms_0] followed by the K [atoms_i] states, returning (B, N+K, "
-                        "hidden_dim). Set automatically when --bridge_kind qformer.")
+                   help="Hidden states fed to the bridge. 'atoms_tokens': the K [atoms_i] "
+                        "positions. 'last_k_prompt': the K states just before [atoms_0]. "
+                        "'context_plus_atoms': N=--qformer_context_tokens states before [atoms_0] "
+                        "followed by the K [atoms_i] states (forced for the Q-Former bridges).")
     p.add_argument("--description_in_assistant_turn", action="store_true",
-                   help="At training time, move the description (the `narrative` column of "
-                        "pairs.parquet) from the user turn into the assistant turn, before the "
-                        "[atoms_0..K] anchor. Combined with --bridge_source last_k_prompt, the "
-                        "last K hidden states the bridge reads are description-content tokens "
-                        "that the LLM has explicitly emitted. Requires the `narrative` column "
-                        "in the parquet.")
+                   help="Move the `narrative` column from the user turn into the assistant "
+                        "turn, before the [atoms_i] tokens. Requires a `narrative` column.")
     p.add_argument("--direction_in_assistant_turn", action="store_true",
-                   help="Echo the directional instruction (parsed from the row_id suffix, e.g. "
-                        "'...-formation_energy-lower' -> ' Target: lower formation energy.') onto "
-                        "the END of the assistant anchor, immediately before [atoms_0]. Puts the "
-                        "directional word in the last context tokens the QFormer's queries attend "
-                        "most (otherwise the word is buried in the user turn). Pure TEXT processed "
-                        "by the LLM — NOT a hand-set vector/cond_field.")
+                   help="Append the direction instruction parsed from row_id (e.g. "
+                        "' Target: lower formation energy.') to the assistant turn just before "
+                        "[atoms_0].")
     p.add_argument("--lora_attn_lr", type=float, default=None,
-                   help="Override --lora_lr for LoRA on q_proj/k_proj/v_proj/o_proj. "
-                        "If unset (default), all LoRA params share --lora_lr. When set, "
-                        "MLP LoRA (--lora_mlp_lr, defaults to --lora_lr) trains at a "
-                        "separate rate. Multimodal-LLM pattern: hit attention "
-                        "modules harder than MLP.")
+                   help="LR for LoRA on q/k/v/o_proj. Unset: all LoRA params use --lora_lr. "
+                        "See --lora_mlp_lr.")
     p.add_argument("--lora_mlp_lr", type=float, default=None,
                    help="Override --lora_lr for LoRA on gate_proj/up_proj/down_proj. "
                         "Defaults to --lora_lr when unset. See --lora_attn_lr.")
     p.add_argument("--p_stage2_text", type=float, default=0.0,
-                   help="Fraction of training steps that additionally include a text-only "
-                        "LM-CE micro-batch from Stage 2 data (MaScQA), interleaved with the "
-                        "diffusion step. Default 0.0 (off). Set 0.1 to fire one text batch "
-                        "every ~10 optimizer steps. Addresses the Stage-3a Q&A response-format "
-                        "regression.")
+                   help="Fraction of optimizer steps that add a text-only LM-CE micro-batch "
+                        "from MaScQA, to preserve text Q&A behavior. 0 disables.")
     p.add_argument("--stage2_text_lambda", type=float, default=1.0,
                    help="Weight on the Stage-2-text LM CE loss in the combined gradient.")
     p.add_argument("--lm_loss_json_lambda", type=float, default=0.0,
-                   help="Weight on the JSON-composition LM-CE loss. When >0, the dataset "
-                        "prepends `{\"counts\": {El: cell_count}}` to the assistant turn and "
-                        "supervises those JSON tokens (masking [atoms_i]); the main step adds "
-                        "lambda * LM-CE via a second ALM forward. Teaches the model to emit "
-                        "clean JSON jointly with the bridge — avoids the diffusion-LoRA "
-                        "repetition-collapse in the self-planner. Try 0.5.")
+                   help="Weight on the LM-CE loss over a {\"counts\": ...} JSON prefix in the "
+                        "assistant turn ([atoms_i] positions are masked), so the model emits valid "
+                        "composition JSON alongside the bridge tokens. 0 disables; 0.5 works well.")
     p.add_argument("--atoms_before_json", action="store_true",
-                   help="Variant A: emit [atoms_i] BEFORE the {\"counts\":...} JSON in the "
-                        "assistant turn (requires --lm_loss_json_lambda>0). The bridge then "
-                        "reads the atoms hidden states pre-composition-commit (causal: they "
-                        "cannot see the JSON to their right), surfacing the direction the "
-                        "JSON-first layout compresses away. Inference must match "
+                   help="Emit [atoms_i] before the {\"counts\":...} JSON in the "
+                        "assistant turn (requires --lm_loss_json_lambda>0), so the bridge "
+                        "reads the atoms hidden states before the composition is written. "
+                        "Inference must match "
                         "(generate_stage3.get_alm_embedding atoms_before_json=True).")
     p.add_argument("--stage2_text_batch_size", type=int, default=2,
-                   help="Per-rank batch size for the interleaved text micro-batch. Keep "
-                        "small — text samples skip the atomistic splice but still cost "
-                        "one full Qwen3 forward.")
+                   help="Per-rank batch size for the interleaved text micro-batch.")
     p.add_argument("--cond_adapt_depth", type=int, default=1,
-                   help="No-op (the qformer bridge uses a single IP-Adapter "
-                        "cross-attention layer). Retained for checkpoint-metadata "
-                        "compatibility; leave at the default 1.")
+                   help="Recorded in checkpoint metadata only; the IP-Adapter always uses "
+                        "one cross-attention layer. Leave at 1.")
     p.add_argument("--full_finetuning", action="store_true",
-                   help="Unfreeze the entire MatterGen base (GemNetT backbone "
-                        "+ property embeddings). Default: backbone frozen, only "
-                        "AtomsMapper+cond_adapt/mixin trainable. Setting this matches "
-                        "MatterGen's own conditional-checkpoint recipe (full FT at "
-                        "lr=5e-6). Significantly larger memory footprint; expect "
-                        "to need batch_size=2 or grad_accum at batch_size=4.")
+                   help="Also train the MatterGen backbone (default: only the bridge and "
+                        "cond_adapt/mixin train). Uses much more memory; reduce --batch_size if needed.")
     p.add_argument("--llm_full_finetuning", action="store_true",
-                   help="Unfreeze the ENTIRE Qwen3-8B base LLM (all decoder block "
-                        "weights, embeddings, lm_head). At Stage 3, Stage 2 LoRA "
-                        "is merged into the base by load_alm, so unfreezing here "
-                        "trains every Qwen3 weight. Mutually exclusive with "
-                        "--lora_lr > 0 (LoRA + full-FT stacking would double-count "
-                        "deltas). Requires bitsandbytes PagedAdamW8bit; an fp32 "
-                        "AdamW state for 8B params alone is 64 GB/rank which "
-                        "won't fit on H200. Pair with very small --llm_lr (5e-7 "
-                        "default) to avoid catastrophic forgetting of Stage 2 "
-                        "instruction-following.")
+                   help="Train every LLM weight (the Stage 2 LoRA is merged first; decoder "
+                        "layers are FSDP-sharded across ranks). Mutually exclusive with "
+                        "--lora_lr > 0. Use a small --llm_lr.")
     p.add_argument("--llm_lr", type=float, default=5e-7,
-                   help="LR for the full-Qwen3-8B optimizer group when "
-                        "--llm_full_finetuning is set. Default 5e-7 (much smaller "
-                        "than --lora_lr's 1e-5 default, because full-FT touches "
-                        "every weight not just the LoRA delta).")
+                   help="LR for the full-LLM optimizer group under "
+                        "--llm_full_finetuning. Default 5e-7.")
     p.add_argument("--unfreeze_atoms_i_embeds", action="store_true",
-                   help="Stage-3b targeted-embedding-unfreeze: train ONLY the K=8 "
-                        "[atoms_i] input-embedding rows (32K params) on top of LoRA, "
-                        "via a gradient mask that zeros all other embed rows. Unlike "
-                        "--llm_full_finetuning (8B full-FT → FSDP), the trainable set "
-                        "stays tiny + replicable, so the run is plain DDP (one model "
-                        "per GPU). Requires Stage 3b (--lora_lr > 0). atoms_i rows ride "
-                        "the lora optimizer group (weight_decay=0).")
+                   help="Also train the K [atoms_i] input-embedding rows (other rows stay "
+                        "frozen via a gradient mask), in the LoRA optimizer group. Requires "
+                        "--lora_lr > 0. Experimental: can drive the rows to NaN, which shows up "
+                        "only at guidance > 0.")
     p.add_argument("--no_alm_embedding_cond", action="store_true",
-                   help="CONTROL: drop the alm_embedding cond_field entirely (no-LLM-bridge "
-                        "baseline). Skips the ALM forward at training (much faster). When "
-                        "set, --aux_target_kind must be `none` (no AtomsMapper → no aux head).")
-    p.add_argument("--handset_direction_token", action="store_true",
-                   help="Directional editing: with --num_output_atom_tokens 9, "
-                        "OVERWRITE the 9th [atoms_8] token's hidden block with a "
-                        "deterministic direction code (first-half one-hot=higher, "
-                        "second-half=lower, all-zero=unconditional), scale-matched to the "
-                        "8 real structure tokens' RMS. The 8 real tokens carry structure "
-                        "(grad flows to LoRA); the 9th is hand-set, not learned. Reuses "
-                        "the task_direction ±1 parse (no separate cond_field added).")
-    p.add_argument("--use_task_direction_cond", action="store_true",
-                   help="Directional editing: add `task_direction` as a scalar "
-                        "±1 cond_field (sinusoidal NoiseLevelEncoding, like dft_band_gap) "
-                        "ALONGSIDE the alm_embedding bridge. +1=higher, -1=lower, parsed "
-                        "from each row_id suffix; rows without a -higher/-lower suffix get "
-                        "NaN (unconditional). The bridge carries the input structure; this "
-                        "clean channel carries the direction bit. Forced by balanced data.")
+                   help="Train without the alm_embedding condition and skip the ALM forward "
+                        "(no-bridge baseline). Requires --aux_target_kind none.")
+    p.add_argument("--handset_direction_token", "--handset_direction", dest="handset_direction_token", action="store_true",
+                   help="With --num_output_atom_tokens 9, replace the [atoms_8] hidden state "
+                        "with a fixed direction code (first half = higher, second half = lower, "
+                        "zeros = unconditional) scaled to the RMS of the other tokens.")
+    p.add_argument("--use_task_direction_cond", "--scalar_direction", dest="use_task_direction_cond", action="store_true",
+                   help="Add task_direction (+1 higher, -1 lower, NaN otherwise, parsed from "
+                        "row_id) as a scalar cond_field alongside alm_embedding.")
     p.add_argument("--fresh_lora_rank", type=int, default=None,
-                   help="If set (Stage 3b only): merge the Stage 2 LoRA into base, then "
-                        "attach a NEW small LoRA at this rank for Stage 3 training. Lets you "
-                        "decouple Stage 3 capacity from the Stage 2 LoRA rank — Stage 2 "
-                        "capability is baked into the merged base, Stage 3 adapts on top with "
-                        "a fresh randomly-initialized A/B. Pair with a higher --lora_lr "
-                        "(~1e-4..2e-4) since the LoRA starts at zero, not warm.")
+                   help="Stage 3b only: merge the Stage 2 LoRA into the base and train a new "
+                        "LoRA of this rank on top. Use a higher --lora_lr (~1e-4 to 2e-4) since "
+                        "the new LoRA starts from zero.")
     p.add_argument("--fresh_lora_alpha", type=int, default=None,
-                   help="α for the fresh Stage 3 LoRA (default: 2 × fresh_lora_rank, matching "
-                        "Stage 2 scaling=2.0). Drop to fresh_lora_rank for scaling=1.0.")
+                   help="Alpha for the new Stage 3 LoRA (default: 2 * fresh_lora_rank).")
     p.add_argument("--lora_resume_dir", default=None,
-                   help="Resume a fresh-LoRA run. Path to a step=N dir from a prior fresh-LoRA "
-                        "training (contains lora_adapter/ with the trained r=fresh_lora_rank "
-                        "weights). With --fresh_lora_rank set, --alm_checkpoint must point at "
-                        "the ORIGINAL Stage 2 ckpt (so the merged base is recovered exactly), "
-                        "and these saved fresh-LoRA weights overwrite the random init. Pair "
-                        "with --resume_atoms_mapper pointing at the same step=N's "
-                        "atoms_mapper.pt to restore optimizer + AtomsMapper + cond_adapt/mixin.")
+                   help="Resume a --fresh_lora_rank run from a step=N dir (the one containing "
+                        "lora_adapter/). --alm_checkpoint must still point at the Stage 2 "
+                        "checkpoint. Pair with --resume_atoms_mapper <same step=N>/atoms_mapper.pt.")
     p.add_argument("--resume_atoms_mapper", default=None,
                    help="Path to atoms_mapper.pt checkpoint to resume from")
     p.add_argument("--disable_wandb", action="store_true")
-    p.add_argument("--wandb_project", default="alm-stage3a")
+    p.add_argument("--wandb_project", default="alm-stage3")
     args = p.parse_args()
     # --no_alm_embedding_cond has no AtomsMapper, so the aux head must be off.
     if args.no_alm_embedding_cond and args.aux_target_kind != "none":
         raise ValueError(
-            f"--no_alm_embedding_cond requires --aux_target_kind=none (no "
-            f"AtomsMapper → no aux head). Got --aux_target_kind={args.aux_target_kind!r}. "
-            f"Either pass --aux_target_kind none, or drop --no_alm_embedding_cond."
+            f"--no_alm_embedding_cond requires --aux_target_kind none "
+            f"(got {args.aux_target_kind!r})."
         )
     # --use_last_prompt_token and a non-default --bridge_source are conflicting bridge mechanisms.
     if args.use_last_prompt_token and args.bridge_source != "atoms_tokens":
@@ -1309,13 +1180,8 @@ def _resolve_bridge_kind(args) -> str:
     """Resolve bridge_kind: 'auto' sniffs the resume ckpt (default 'pool'); explicit values assert-match a resume ckpt."""
     ckpt_bridge = None
     if args.resume_atoms_mapper:
-        try:
-            ckpt_meta = torch.load(
-                args.resume_atoms_mapper, map_location="cpu", weights_only=False
-            )
-        except TypeError:
-            ckpt_meta = torch.load(args.resume_atoms_mapper, map_location="cpu")
-        ckpt_bridge = _norm_bridge(ckpt_meta.get("bridge_kind", "pool"))
+        ckpt_meta = torch.load(args.resume_atoms_mapper, map_location="cpu", weights_only=False)
+        ckpt_bridge = canonical_bridge_kind(ckpt_meta.get("bridge_kind", "pool"))
 
     if args.bridge_kind == "auto":
         return ckpt_bridge if ckpt_bridge is not None else "pool"
@@ -1340,7 +1206,7 @@ def main():
     # Stage 3b (lora_lr>0): PEFT live, only lora_A/B trainable; aux loss anchors [atoms_i] against collapse.
     stage_3b = args.lora_lr > 0
     fresh_lora = stage_3b and args.fresh_lora_rank is not None
-    llm_full_ft = bool(getattr(args, "llm_full_finetuning", False))
+    llm_full_ft = args.llm_full_finetuning
     if llm_full_ft and stage_3b:
         raise ValueError("--llm_full_finetuning is mutually exclusive with "
                          "--lora_lr > 0. Set lora_lr=0 to merge Stage 2 LoRA "
@@ -1348,19 +1214,18 @@ def main():
     if fresh_lora and args.fresh_lora_rank <= 0:
         raise ValueError("--fresh_lora_rank must be a positive int")
     if args.fresh_lora_rank is not None and not stage_3b and not llm_full_ft:
-        raise ValueError("--fresh_lora_rank requires Stage 3b (--lora_lr > 0) "
-                         "or --llm_full_finetuning (in which case fresh_lora_rank "
-                         "is ignored — full Qwen3 weights are trained, no LoRA).")
+        raise ValueError("--fresh_lora_rank requires --lora_lr > 0 or --llm_full_finetuning "
+                         "(ignored under full fine-tuning).")
     if is_main_process():
         if fresh_lora:
             a = args.fresh_lora_alpha or 2 * args.fresh_lora_rank
-            mode = (f"Stage 3b — Stage 2 LoRA MERGED, fresh LoRA "
+            mode = (f"Stage 3b: Stage 2 LoRA merged, fresh LoRA "
                     f"(r={args.fresh_lora_rank}, α={a}) attached for Stage 3")
         elif stage_3b:
-            mode = "Stage 3b — LoRA UNFROZEN"
+            mode = "Stage 3b: LoRA unfrozen"
         else:
-            mode = "Stage 3a — LoRA frozen+merged"
-        print(f"[stage3a] Loading ALM from {args.alm_checkpoint} ({mode}) ...")
+            mode = "Stage 3a: LoRA frozen+merged"
+        print(f"[stage3] Loading ALM from {args.alm_checkpoint} ({mode}) ...")
     # Resolve bridge_kind early; the Q-Former bridge forces the context_plus_atoms source.
     bridge_kind = _resolve_bridge_kind(args)
     _alm_bridge_source = args.bridge_source
@@ -1392,8 +1257,8 @@ def main():
         atomistic_feature_dim, "orb_v3_direct_20_omat"
     )
     if is_main_process():
-        print(f"[stage3a] atomistic_feature_dim={atomistic_feature_dim} "
-              f"(auto-detected) → atomistic_model_name={atomistic_model_name}")
+        print(f"[stage3] atomistic_feature_dim={atomistic_feature_dim} "
+              f"(auto-detected), atomistic_model_name={atomistic_model_name}")
     if fresh_lora:
         # Stage 2 LoRA is merged into base; attach a fresh small LoRA for Stage 3.
         from peft import LoraConfig, get_peft_model
@@ -1419,13 +1284,13 @@ def main():
             missing, unexpected = alm.llm.load_state_dict(sd, strict=False)
             if is_main_process():
                 # unexpected (saved keys we couldn't place) should be 0.
-                print(f"[stage3a] resumed fresh-LoRA weights from {args.lora_resume_dir} "
+                print(f"[stage3] resumed fresh-LoRA weights from {args.lora_resume_dir} "
                       f"(loaded {len(sd)} tensors, {len(unexpected)} unexpected)")
     if stage_3b:
         for name, p in alm.named_parameters():
             p.requires_grad_("lora_A" in name or "lora_B" in name)
         # Train only the K [atoms_i] embed rows via a backward hook zeroing all other rows.
-        if getattr(args, "unfreeze_atoms_i_embeds", False):
+        if args.unfreeze_atoms_i_embeds:
             emb = alm.llm.get_input_embeddings()
             emb.weight.requires_grad_(True)
             _ids = list(alm.output_atom_token_ids)
@@ -1434,9 +1299,8 @@ def main():
             _row_mask[_ids] = 1.0
             emb.weight.register_hook(lambda g, _m=_row_mask: g * _m)
             if is_main_process():
-                print(f"[stage3a] targeted-unfreeze: embed_tokens trainable, grad masked "
-                      f"to K={len(_ids)} [atoms_i] rows (token_ids={_ids}); DDP one-per-GPU "
-                      f"(no FSDP). atoms_i rows train at lora_lr={args.lora_lr:.0e}.")
+                print(f"[stage3] training the {len(_ids)} [atoms_i] embedding rows "
+                      f"at lora_lr={args.lora_lr:.0e}")
         alm.llm.gradient_checkpointing_enable()
         alm.llm.enable_input_require_grads()
     elif llm_full_ft:
@@ -1462,7 +1326,7 @@ def main():
             )
             num_layers = len(alm.llm.model.layers)
             if is_main_process():
-                print(f"[stage3a] FSDP per-decoder-layer wrap "
+                print(f"[stage3] FSDP per-decoder-layer wrap "
                       f"({num_layers} layers, FULL_SHARD, bf16 mixed precision, "
                       f"world_size={world_size}); embed_tokens + lm_head stay replicated")
             for i in range(num_layers):
@@ -1479,19 +1343,18 @@ def main():
     alm.eval()
     K = len(alm.output_atom_token_ids)
 
-    # ── bridge_kind already resolved above (before load_alm) ─────────────────
     if is_main_process():
-        print(f"[stage3a] bridge_kind={bridge_kind!r} "
+        print(f"[stage3] bridge_kind={bridge_kind!r} "
               f"(cli={args.bridge_kind!r}, "
               f"cond_adapt_n_heads={args.cond_adapt_n_heads}, "
               f"alm_bridge_source={_alm_bridge_source!r})")
 
-    # ── Load MatterGen adapter ───────────────────────────────────────────────
+    # Load MatterGen adapter
     if is_main_process():
         _backbone_src = (f"LOCAL model_path={args.mattergen_model_path} (CSP-mode, atoms observed)"
                          if args.mattergen_model_path
                          else f"HF {args.mattergen_pretrained} (DNG-mode)")
-        print(f"[stage3a] Loading MatterGen adapter from {_backbone_src} ...")
+        print(f"[stage3] Loading MatterGen adapter from {_backbone_src} ...")
     diffusion_pl = load_mattergen_adapter(
         pretrained_name=args.mattergen_pretrained,
         lr=args.lr,
@@ -1518,16 +1381,15 @@ def main():
     diffusion_pl = diffusion_pl.to(device)
     diffusion_module = diffusion_pl.diffusion_module
 
-    # Override the pre_corruption_fn's p_unconditional if needed
     if hasattr(diffusion_module.pre_corruption_fn, "p_unconditional"):
         diffusion_module.pre_corruption_fn.p_unconditional = args.p_unconditional
     # iid per-field dropout: else a NaN task_direction AND-gates the mask and starves alm_embedding.
     if args.use_task_direction_cond and hasattr(diffusion_module.pre_corruption_fn, "dropout_fields_iid"):
         diffusion_module.pre_corruption_fn.dropout_fields_iid = True
         if is_main_process():
-            print("[stage3a] dropout_fields_iid=True (decouple task_direction CFG from alm_embedding)")
+            print("[stage3] dropout_fields_iid=True (decouple task_direction CFG from alm_embedding)")
 
-    # ── Param groups + optimizer ─────────────────────────────────────────────
+    # Param groups + optimizer
     mapper_params = [p for p in diffusion_module.parameters() if p.requires_grad]
     # No-LLM-bridge control: no AtomsMapper module exists.
     if args.no_alm_embedding_cond:
@@ -1598,29 +1460,29 @@ def main():
         n_lora = sum(p.numel() for p in lora_params)
         n_llm_full = sum(p.numel() for p in llm_full_params)
         if stage_3b:
-            print(f"[stage3a] LoRA: TRAINABLE (Stage 3b, lora_lr={args.lora_lr:.0e})")
-            print(f"[stage3a] Trainable LoRA:         {n_lora/1e6:6.1f}M")
+            print(f"[stage3] LoRA: trainable (Stage 3b, lora_lr={args.lora_lr:.0e})")
+            print(f"[stage3] Trainable LoRA:         {n_lora/1e6:6.1f}M")
         elif llm_full_ft:
-            print(f"[stage3a] LLM: FULL-FT (Stage 4, llm_lr={args.llm_lr:.0e})")
-            print(f"[stage3a] Trainable LLM (full):  {n_llm_full/1e9:6.2f}B")
+            print(f"[stage3] LLM: full fine-tuning (llm_lr={args.llm_lr:.0e})")
+            print(f"[stage3] Trainable LLM (full):  {n_llm_full/1e9:6.2f}B")
         else:
-            print(f"[stage3a] LoRA: FROZEN (Stage 3a, merged into base)")
-        print(f"[stage3a] Trainable AtomsMapper:  {n_am/1e6:6.1f}M")
-        print(f"[stage3a] Trainable cond_adapt:   {n_ca/1e6:6.1f}M")
-        print(f"[stage3a] Trainable cond_mixin:   {n_cm/1e6:6.1f}M (zero-init)")
+            print(f"[stage3] LoRA: FROZEN (Stage 3a, merged into base)")
+        print(f"[stage3] Trainable AtomsMapper:  {n_am/1e6:6.1f}M")
+        print(f"[stage3] Trainable cond_adapt:   {n_ca/1e6:6.1f}M")
+        print(f"[stage3] Trainable cond_mixin:   {n_cm/1e6:6.1f}M (zero-init)")
         if aux_head is not None:
-            print(f"[stage3a] Trainable aux_head:     {n_aux/1e6:6.3f}M ({aux_head.target_kind}, "
+            print(f"[stage3] Trainable aux_head:     {n_aux/1e6:6.3f}M ({aux_head.target_kind}, "
                   f"target_dim={aux_head.target_dim})")
         else:
-            print(f"[stage3a] aux_head:               disabled (--aux_target_kind=none)")
-        print(f"[stage3a] Trainable total:        {(n_mapper + n_lora + n_llm_full)/1e6:6.1f}M")
+            print(f"[stage3] aux_head:               disabled (--aux_target_kind=none)")
+        print(f"[stage3] Trainable total:        {(n_mapper + n_lora + n_llm_full)/1e6:6.1f}M")
 
     if stage_3b:
         if asym_lora:
             attn_lr = args.lora_attn_lr if args.lora_attn_lr is not None else args.lora_lr
             mlp_lr  = args.lora_mlp_lr  if args.lora_mlp_lr  is not None else args.lora_lr
             if is_main_process():
-                print(f"[stage3a] LoRA lr asymmetric: attn={attn_lr:.1e} ({len(lora_attn_params)} t), "
+                print(f"[stage3] LoRA lr asymmetric: attn={attn_lr:.1e} ({len(lora_attn_params)} t), "
                       f"mlp={mlp_lr:.1e} ({len(lora_mlp_params)} t)")
             groups = [
                 {"params": mapper_params,    "lr": args.lr, "name": "mapper"},
@@ -1641,7 +1503,7 @@ def main():
         # FSDP shards the AdamW state across ranks; the wrap happened earlier.
         n_llm = sum(p.numel() for p in llm_full_params)
         if is_main_process():
-            print(f"[stage3a] LLM full-FT: {n_llm/1e9:.2f}B params at llm_lr={args.llm_lr:.0e} "
+            print(f"[stage3] LLM full-FT: {n_llm/1e9:.2f}B params at llm_lr={args.llm_lr:.0e} "
                   f"(FSDP FULL_SHARD; per-rank AdamW state ~{n_llm * 8 / 1e9 / max(world_size,1):.1f} GB)")
         optimizer = torch.optim.AdamW(
             [
@@ -1655,15 +1517,15 @@ def main():
             mapper_params, lr=args.lr, weight_decay=0.0, betas=(0.9, 0.95),
         )
 
-    # ── Resume ───────────────────────────────────────────────────────────────
+    # Resume
     start_step = 0
     if args.resume_atoms_mapper is not None:
         start_step = resume_checkpoint(args.resume_atoms_mapper, diffusion_module,
                                        optimizer, device, aux_head=aux_head)
         if is_main_process():
-            print(f"[stage3a] Resumed from step {start_step}")
+            print(f"[stage3] Resumed from step {start_step}")
 
-    # ── DDP wrap ─────────────────────────────────────────────────────────────
+    # DDP wrap
     if world_size > 1:
         diffusion_module = DDP(
             diffusion_module,
@@ -1676,7 +1538,7 @@ def main():
             alm = DDP(alm, device_ids=[local_rank], find_unused_parameters=True)
         # llm_full_ft: no outer DDP wrap; alm.llm is FSDP-wrapped, the rest is frozen.
 
-    # ── Dataset / DataLoader ─────────────────────────────────────────────────
+    # Dataset / DataLoader
     # (a) --pairs_parquet -> DistributedSampler; (b) --pairs_parquets -> ConcatDataset + BucketedDistributedSampler.
     if args.pairs_parquets and args.pairs_parquet:
         raise ValueError("--pairs_parquet and --pairs_parquets are mutually exclusive")
@@ -1702,7 +1564,7 @@ def main():
         weights = [w / wsum for w in weights_raw]
         buckets = []
         for path in bucket_paths:
-            buckets.append(Stage3aDataset(
+            buckets.append(Stage3Dataset(
                 path, tokenizer, max_num_tokens=args.max_num_tokens,
                 aux_target_kind=args.aux_target_kind,
                 num_output_atom_tokens=args.num_output_atom_tokens,
@@ -1722,23 +1584,22 @@ def main():
         bucket_offsets, off = [], 0
         for n in bucket_lengths:
             bucket_offsets.append(off); off += n
-        # total_steps x grad_accum_steps x world_size (one sample-index per microbatch).
+        # One sample index per microbatch: total_steps x world_size.
         total_microbatches = (
             args.total_steps
-            * max(1, getattr(args, "grad_accum_steps", 1))
             * max(1, world_size)
         )
         if is_main_process():
-            print(f"[stage3a] multi-bucket sampling — {len(buckets)} buckets:")
-            print(f"[stage3a]   {'bucket':40s}  {'rows':>10s}  {'weight':>7s}  "
+            print(f"[stage3] multi-bucket sampling, {len(buckets)} buckets:")
+            print(f"[stage3]   {'bucket':40s}  {'rows':>10s}  {'weight':>7s}  "
                   f"{'visits':>10s}  {'visits/row':>11s}")
             for path, n_rows, w in zip(bucket_paths, bucket_lengths, weights):
                 visits = int(total_microbatches * w)
                 vpr = visits / max(n_rows, 1)
                 short = path.split("/")[-1]
-                print(f"[stage3a]   {short:40s}  {n_rows:>10,}  {w:>7.3f}  "
+                print(f"[stage3]   {short:40s}  {n_rows:>10,}  {w:>7.3f}  "
                       f"{visits:>10,}  {vpr:>11.3f}")
-            print(f"[stage3a] total_microbatches={total_microbatches:,}")
+            print(f"[stage3] total_microbatches={total_microbatches:,}")
         rank = dist.get_rank() if dist.is_initialized() else 0
         sampler = BucketedDistributedSampler(
             bucket_lengths=bucket_lengths,
@@ -1750,7 +1611,7 @@ def main():
             seed=42,
         )
     else:
-        dataset = Stage3aDataset(
+        dataset = Stage3Dataset(
             args.pairs_parquet, tokenizer, max_num_tokens=args.max_num_tokens,
             aux_target_kind=args.aux_target_kind,
             num_output_atom_tokens=args.num_output_atom_tokens,
@@ -1771,18 +1632,18 @@ def main():
         batch_size=args.batch_size,
         sampler=sampler,
         shuffle=(sampler is None),
-        collate_fn=stage3a_collate,
+        collate_fn=stage3_collate,
         num_workers=2,
         pin_memory=True,
         drop_last=True,
     )
 
-    # ── W&B ──────────────────────────────────────────────────────────────────
+    # W&B
     use_wandb = _WANDB and is_main_process() and not args.disable_wandb
     if use_wandb:
         wandb.init(project=args.wandb_project, config=vars(args))
 
-    # ── Training loop ────────────────────────────────────────────────────────
+    # Training loop
     global_step = start_step
     diffusion_module.train()
 
@@ -1799,7 +1660,7 @@ def main():
                     yield batch
             epoch += 1
 
-    # ── Optional Stage-2 text data interleave ────────────────────────────────
+    # Optional Stage-2 text data interleave
     # When --p_stage2_text > 0, add a MaScQA LM-CE forward every Nth step to refresh Q&A format.
     text_loader_iter = None
     if args.p_stage2_text > 0.0:
@@ -1831,7 +1692,7 @@ def main():
                 epoch += 1
         text_loader_iter = _inf_text_loader()
         if is_main_process():
-            print(f"[stage3a] Stage-2 text mixing ON: p={args.p_stage2_text}, "
+            print(f"[stage3] Stage-2 text mixing ON: p={args.p_stage2_text}, "
                   f"lambda={args.stage2_text_lambda}, source=MaScQA (n={len(text_ds)})")
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1859,7 +1720,7 @@ def main():
         if not skip_alm:
             if stage_3b or llm_full_ft:
                 # alm is DDP-wrapped; one forward also returns LM-CE when JSON-loss is on
-                # (a separate 2nd forward breaks multi-node DDP -> SIGABRT at step 1).
+                # (a separate second forward breaks the multi-node DDP reducer).
                 if args.lm_loss_json_lambda > 0.0:
                     _lab = batch["labels"].to(device)
                     _lab_list = [_lab[b] for b in range(B)]
@@ -1871,7 +1732,7 @@ def main():
                     hidden_states = alm(
                         input_ids_list, attn_mask_list, labels=None,
                         atom_embeds=atom_embeds, output_atoms_hidden_states=True,
-                    )  # (B, K, hidden_dim) — autograd live, DDP grad-sync hooks armed
+                    )  # (B, K, hidden_dim); autograd live so DDP grad-sync hooks fire
                 alm_emb = hidden_states.flatten(1).float()
             else:
                 # Stage 3a: alm unwrapped + frozen.
@@ -1882,13 +1743,13 @@ def main():
                 alm_emb = hidden_states.flatten(1).float().detach()
 
         # Hand-set the 9th [atoms_8] block via the shared direction_code helper (matches inference).
-        if getattr(args, "handset_direction_token", False) and not skip_alm:
+        if args.handset_direction_token and not skip_alm:
             td = batch.get("task_direction")
             if td is not None:
                 from direction_code import apply_handset_direction
                 alm_emb = apply_handset_direction(alm_emb, K, td)
 
-        # ── Build ChemGraph and attach alm_embedding ─────────────────────────
+        # Build ChemGraph and attach alm_embedding
         # Attach task_direction as a cond_field only under --use_task_direction_cond
         # (else it would AND-gate the NaN mask and starve alm_embedding).
         chemgraph = build_chemgraph_batch(
@@ -1898,7 +1759,7 @@ def main():
         if not skip_alm:
             chemgraph["alm_embedding"] = alm_emb
 
-        # ── Diffusion loss ───────────────────────────────────────────────────
+        # Diffusion loss
         dm_inner = _unwrap(diffusion_module)
         loss_diff, metrics = dm_inner.calc_loss(chemgraph)
 
@@ -1913,10 +1774,10 @@ def main():
         else:
             am_out = None
 
-        # qformer bridge: am_out is (B, M, out_dim) and contrastive/aux pool over M.
+        # Q-Former bridge: am_out is (B, M, out_dim) and contrastive/aux pool over M.
         am_out_is_seq = am_out is not None and am_out.dim() == 3
 
-        # ── Contrastive regularization (decorrelate mapper outputs across batch) ──
+        # Contrastive regularization (decorrelate mapper outputs across batch)
         if args.contrastive_lambda > 0 and B > 1 and am_out is not None:
             am_for_contrastive = am_out.mean(dim=1) if am_out_is_seq else am_out
             am_norm = torch.nn.functional.normalize(am_for_contrastive, dim=-1)
@@ -1930,7 +1791,7 @@ def main():
         else:
             loss_contrastive = torch.tensor(0.0, device=device)
 
-        # ── Auxiliary supervised loss on AtomsMapper output ──────────────────
+        # Auxiliary supervised loss on AtomsMapper output
         # Aux head predicts a composition fingerprint from am_out, pinning its output to structure.
         if aux_head is not None:
             aux_raw = batch["aux_target"]
@@ -1965,8 +1826,8 @@ def main():
         else:
             loss_aux = torch.tensor(0.0, device=device)
 
-        # ── Q-Former direction-aux loss ──────────────────────────────────────
-        # CE predicting the +-1 task_direction sign from am_out (finite rows only); supervision, not a cond_field.
+        # Q-Former direction-aux loss
+        # CE predicting the +-1 task_direction sign from am_out (finite rows only).
         loss_qformer_dir = torch.tensor(0.0, device=device)
         if (bridge_kind in ("producer-consumer", "producer-consumer-pool") and args.qformer_dir_aux_lambda > 0
                 and am_out is not None
@@ -1981,7 +1842,7 @@ def main():
                 if n_finite > 0:
                     dir_logits = atoms_mapper_module.direction_logits(
                         am_out, pool=args.qformer_dir_aux_pool)    # (B, 2)
-                    dir_target = (td > 0).long()                   # >0 → 1, <0 → 0
+                    dir_target = (td > 0).long()                   # higher -> 1, lower -> 0
                     dl_f = dir_logits[finite]
                     dt_f = dir_target[finite]
                     loss_qformer_dir = torch.nn.functional.cross_entropy(dl_f, dt_f)
@@ -1991,7 +1852,7 @@ def main():
                     metrics["qformer_cond_norm"] = am_out.norm(dim=-1).mean().detach()
                     metrics["qformer_cond_std"] = am_out.std().detach()
 
-        # ── Directional COSINE-MARGIN loss (bridge-internal cosine attack) ────
+        # Directional cosine-margin loss
         # Forces pooled am_out angularly along +-dir_proto so cond_higher/lower become non-collinear.
         loss_dir_margin = torch.tensor(0.0, device=device)
         if (bridge_kind in ("producer-consumer", "producer-consumer-pool") and args.qformer_dir_margin_lambda > 0
@@ -2015,9 +1876,8 @@ def main():
                     if (sgn < 0).any():
                         metrics["qformer_dir_cos_neg"] = dcos_f[sgn < 0].mean().detach()
 
-        # ── Same-input directional contrastive loss on the RAW LLM hidden states ──
-        # Forward the opposite-direction sibling and push the two hidden-state tensors
-        # apart: relu(cos - target) over has_partner rows. No prototype, no cond_field.
+        # Same-input directional contrastive loss: forward the opposite-direction sibling and
+        # penalize relu(cos - target) between the two rows (raw hidden states or am_out).
         loss_dir_contrastive = torch.tensor(0.0, device=device)
         if (args.qformer_dir_contrastive_lambda > 0 and not skip_alm
                 and (stage_3b or llm_full_ft)
@@ -2040,7 +1900,7 @@ def main():
                                         dtype=torch.long)
                 if (args.qformer_dir_contrastive_on == "am_out"
                         and atoms_mapper_module is not None and am_out is not None):
-                    # Compare POST-MAPPER cond tokens (the MatterGen-facing layer).
+                    # Compare post-mapper cond tokens (the MatterGen-facing layer).
                     partner_am = atoms_mapper_module(partner_raw.flatten(1).float())
                     main_v = am_out[idx_hp_t].flatten(1).float()         # (n_hp, M*out)
                     partner_v = partner_am.flatten(1).float()            # (n_hp, M*out)
@@ -2055,7 +1915,7 @@ def main():
                 metrics["qformer_dir_contrastive_cos"] = cos_hp.mean().detach()
                 metrics["qformer_dir_contrastive_n"] = torch.tensor(float(len(idx_hp)))
 
-        # ── Combined loss with optional warmup ────────────────────────────────
+        # Combined loss with optional warmup
         # During aux warmup, zero L_diff so AtomsMapper learns from aux before diffusion comes online.
         diff_factor = 1.0
         if args.aux_warmup_steps > 0 and global_step < args.aux_warmup_steps and aux_head is not None:
@@ -2068,7 +1928,7 @@ def main():
                 + args.qformer_dir_margin_lambda * loss_dir_margin
                 + args.qformer_dir_contrastive_lambda * loss_dir_contrastive)
 
-        # JSON-composition LM loss was computed in the bridge forward above; just weight + add it.
+        # The JSON-composition LM loss came from the bridge forward above.
         loss_lm_json = torch.tensor(0.0, device=device)
         if lm_json_loss_raw is not None:
             loss_lm_json = args.lm_loss_json_lambda * lm_json_loss_raw
@@ -2114,7 +1974,7 @@ def main():
         optimizer.step()
         global_step += 1
 
-        # ── Logging ──────────────────────────────────────────────────────────
+        # Logging
         if global_step % args.log_every == 0 and is_main_process():
             log = {"loss": loss.item(), "step": global_step}
             log.update({k: v.item() for k, v in metrics.items()})
@@ -2147,16 +2007,13 @@ def main():
                     aux_str = (f"  aux={aux_loss.item():.3f}"
                                f" P={metrics['aux/precision'].item():.3f}"
                                f" R={metrics['aux/recall'].item():.3f}")
-                elif "aux/cosine_sim" in metrics:
-                    aux_str = (f"  aux={aux_loss.item():.3f}"
-                               f" cos={metrics['aux/cosine_sim'].item():.3f}")
                 else:
                     aux_str = f"  aux={aux_loss.item():.3f}"
             lora_str = ""
             if stage_3b and "lora" in grad_norms:
                 lora_str = (f" lora={grad_norms['lora']:.2e}"
                             f"  |w_lora|={log['weight_norm/lora']:.2e}")
-            print(f"[stage3a] step={global_step}/{args.total_steps}  loss={loss.item():.4f}  "
+            print(f"[stage3] step={global_step}/{args.total_steps}  loss={loss.item():.4f}  "
                   f"|g|: am={grad_norms['atoms_mapper']:.2e} "
                   f"ca={grad_norms['cond_adapt']:.2e} cm={grad_norms['cond_mixin']:.2e}"
                   f"{lora_str}  "
@@ -2173,7 +2030,7 @@ def main():
             if use_wandb:
                 wandb.log(log, step=global_step)
 
-        # ── Checkpoint ───────────────────────────────────────────────────────
+        # Checkpoint
         # Periodic saves are weights-only; every save_optimizer_every-th also writes optimizer.
         # Under FSDP the state_dict gather is collective, so all ranks must enter together.
         if global_step % args.save_every == 0 and (is_main_process() or llm_full_ft):
@@ -2196,7 +2053,7 @@ def main():
                             qformer_context_tokens=args.qformer_context_tokens,
                             qformer_input_atoms=args.qformer_input_atoms)
             if is_main_process():
-                print(f"[stage3a] Saved checkpoint at step {global_step}"
+                print(f"[stage3] Saved checkpoint at step {global_step}"
                       f" {'(with optimizer)' if include_opt else '(weights only)'}")
             # Barrier: under FSDP only rank 0 writes, so sync before the next collective op.
             if llm_full_ft and torch.distributed.is_initialized():
@@ -2208,7 +2065,7 @@ def main():
         and global_step % (args.save_every * args.save_optimizer_every) == 0
     )
     if is_main_process() and periodic_covers_final:
-        print(f"[stage3a] Final step={global_step} already saved by the "
+        print(f"[stage3] Final step={global_step} already saved by the "
               f"periodic-with-optimizer save; skipping redundant final save.")
     elif not periodic_covers_final and (is_main_process() or llm_full_ft):
         save_checkpoint(global_step, alm, diffusion_module, optimizer, out_dir,
@@ -2228,7 +2085,7 @@ def main():
                         qformer_context_tokens=args.qformer_context_tokens,
                         qformer_input_atoms=args.qformer_input_atoms)
     if is_main_process():
-        print(f"[stage3a] Training complete. Final step: {global_step}")
+        print(f"[stage3] Training complete. Final step: {global_step}")
         if use_wandb:
             wandb.finish()
 

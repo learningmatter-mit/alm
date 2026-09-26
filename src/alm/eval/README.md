@@ -7,19 +7,19 @@ After `pip install -e .`, run each script as `python -m alm.eval.understanding.<
 ## Shared modules
 - `lib/loader.py`: `load_alm(checkpoint, ...)` (LoRA + projector, optional merge) and the base-Qwen3 reference loader for language-retention.
 - `lib/text_generation.py`: batched greedy `inputs_embeds` generation; `atomistic=True/False` switch (`generate_batch`).
-- `parsers.py`: `extract_number`, `extract_choice` (run the file directly for a smoke test).
-- `metrics.py`: `mae`, `rmse`, `mad_mae_ratio`, `accuracy`, `weighted_f1`.
-- `structure_metrics.py`: validity, match-rate, and RMSD for generated structures.
-- `runs.py`: resolves the per-run output dir and writes `metrics.json` / `predictions.jsonl`.
-- `baselines.py`: static cited numbers from each benchmark paper (update as you fill the table).
+- `lib/parsers.py`: `extract_number`, `extract_choice` (run the file directly for a smoke test).
+- `lib/metrics.py`: `mae`, `rmse`, `mad_mae_ratio`, `accuracy`, `weighted_f1`.
+- `lib/structure_metrics.py`: validity, match-rate, and RMSD for generated structures.
+- `lib/runs.py`: resolves the per-run output dir and writes `metrics.json` / `predictions.jsonl`.
+- `lib/baselines.py`: published baseline numbers used in the headline tables.
 
 ## Per-benchmark scripts (understanding)
 
 | Script | Source | Metric |
 |---|---|---|
-| `eval_llm4mat.py` | LLM4Mat-Bench held-out (`_DATASET_PROPERTIES` in `alm/utils.py`) | per-config × per-property MAE + MAD:MAE + validity_rate |
+| `eval_llm4mat.py` | LLM4Mat-Bench held-out (`_DATASET_PROPERTIES` in `alm/utils/__init__.py`) | per-config × per-property MAE + MAD:MAE + validity_rate |
 | `eval_matterchat.py` | MP test split (LLM4Mat-Bench mp/test proxy) | per-task MAE/RMSE or accuracy/weighted_f1 |
-| `eval_mattext.py` | HF `n0w0f/MatText` test configs (live OrbV3 from CIF) | MAE per task |
+| `eval_mattext.py` | HF `n0w0f/MatText` `*-train-filtered` configs, one `--fold` split (live OrbV3 from CIF) | MAE per task |
 | `eval_gnome_fe.py` | LLM4Mat-Bench `gnome` split, formation energy | MAE + RMSE + MAD:MAE |
 | `eval_mat2props.py` | GPT-Narratives parquet; last 10% held-out unless `--id_list` | per-property MAE |
 | `eval_mat2mcq.py` | 4-way element-MCQ synthesized from GPT-Narratives `atoms` (deterministic per `split_seed`) | accuracy |
@@ -38,7 +38,7 @@ python -m alm.eval.understanding.eval_mattext --checkpoint <stage2>/step=12000 \
     --tasks perovskites,kvrh,gvrh --max_samples 1000
 
 # Language retention: ALM vs the Qwen3-8B base reference:
-python -m alm.eval.understanding.eval_language_retention --checkpoint <stage2>/step=12000 --task all --max_samples 200
+python -m alm.eval.understanding.eval_language_retention --model alm --checkpoint <stage2>/step=12000 --task all --max_samples 200
 python -m alm.eval.understanding.eval_language_retention --model base --task all --max_samples 200
 
 # MaScQA (held-out 131 Qs):
@@ -48,7 +48,12 @@ python -m alm.eval.understanding.eval_mascqa --checkpoint <stage2>/step=12000
 python -m alm.eval.understanding.aggregate_results --run_id step=12000
 ```
 
+## Scoring conventions
+- Classification accuracies (MatterChat classification tasks, Mat2MCQ, MMLU, GPQA, GSM8K, MaScQA MCQ) count unparseable and leaked answers as wrong, so the denominator is every question. The `*_valid_only` keys give the same metric over parseable answers only, and `validity_rate` / `leak_rate` report the failures.
+- Regression metrics (MAE, RMSE, MAD:MAE) can only use outputs that contain a number; `validity_rate` reports the fraction that did.
+
 ## Data notes
-- Stage the eval datasets with the `scripts/` data-prep utilities (`cache_embeddings_*`, `build_*`); set `ALM_DATA_ROOT` to where they live. See the top-level README "Models & data".
+- The generation evals (ALM Bench editing, DNG) read the `LearningMatter/ALM-Bench` dataset from `$ALM_DATA_ROOT/ALM-Bench`: each `eval_edit.py --task` / `eval_{atomtxt_direction,polymorph,doping,app_consistency}.py` defaults to `alm_bench/eval/<task>.parquet` (`strain` uses `eval/doping.parquet`; `describe`, which has no held-out split, samples `pretraining/describe.parquet`), and the DNG evals use `pretraining/describe.parquet` for prompts and the novelty reference.
+- Stage the eval datasets with the `scripts/` data-prep utilities (`cache_embeddings_atomistic.py`, `build_*`); set `ALM_DATA_ROOT` to where they live. See the top-level README "Models & data".
 - LLM4Mat-Bench `test` split ships CSVs but no `*.db` / `*_test_atom.flat.bin` cache, so pass `--split validation` until you cache test-split embeddings.
-- The `alex_mp_20` LLM4Mat-Bench config is not cached by default; `eval_llm4mat.py` skips it unless you cache it via `scripts/cache_embeddings_atomistic_orbv3.py`.
+- The `alex_mp_20` LLM4Mat-Bench config is not cached by default; `eval_llm4mat.py` skips it unless you cache it via `scripts/cache_embeddings_atomistic.py --source ase_db --dataset_name alex_mp_20 --split <split> --data_path <LLM4Mat-Bench>/alex_mp_20/<split>.db`.

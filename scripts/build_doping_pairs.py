@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Build ALM Bench `doping` editing pairs from isostructural single-swap substitutions.
 
-  python scripts/build_doping_pairs.py --out_dir <data_root>/stage3_outputs/stage3a
+  python scripts/build_doping_pairs.py --out_path <data_root>/ALM-Bench/alm_bench/doping.parquet
 """
 
 import argparse
@@ -12,7 +12,8 @@ from collections import Counter, defaultdict
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from paths import DATA_ROOT
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
+from paths import DATA_ROOT, ALM_BENCH
 
 PROMPTS = [
     "Dope this material by replacing all {X} atoms with {Y}.",
@@ -53,7 +54,8 @@ def _single_swap(ca: Counter, cb: Counter):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--source", default=os.path.join(DATA_ROOT, "GPT-Narratives-for-Materials/mp_3d_2020_gpt_narratives.parquet"))
-    ap.add_argument("--out_dir", default=os.path.join(DATA_ROOT, "stage3_outputs/stage3a"))
+    ap.add_argument("--out_path", default=os.path.join(ALM_BENCH, "alm_bench/doping.parquet"),
+                    help="output parquet (released ALM-Bench file name); the released doping bucket is a 1M-row subsample of this output")
     ap.add_argument("--id_col", default="material_id", help="id column for row_id; falls back to row index when absent")
     ap.add_argument("--max_per_group", type=int, default=0, help="cap pairs per isostructural group (0 = no cap)")
     ap.add_argument("--seed", type=int, default=42)
@@ -103,8 +105,8 @@ def main():
                 "input_atoms_struct": _atoms_struct(A["atoms"]), "input_source_idx": rid(ai, A),
             })
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    dst = os.path.join(args.out_dir, "pairs_doping_strain.parquet")
+    os.makedirs(os.path.dirname(os.path.abspath(args.out_path)), exist_ok=True)
+    dst = args.out_path
     pq.write_table(pa.Table.from_pylist(out), dst)
     print(f"wrote {len(out)} doping/substitution pairs -> {dst}")
 

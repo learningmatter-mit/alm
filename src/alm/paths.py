@@ -5,3 +5,5 @@ DATA_ROOT = os.environ.get("ALM_DATA_ROOT", "./data")
 CHECKPOINTS = os.environ.get("ALM_CHECKPOINTS", "./checkpoints")
 RUNS = os.environ.get("ALM_RUNS", "./runs")
 EVAL_RESULTS = os.environ.get("ALM_EVAL_RESULTS_ROOT", "./eval_results")
+# Local copy of the LearningMatter/ALM-Bench dataset repo (alm_bench/, alm_bench/eval/, pretraining/).
+ALM_BENCH = os.path.join(DATA_ROOT, "ALM-Bench")

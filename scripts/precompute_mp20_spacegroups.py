@@ -52,7 +52,7 @@ def run_split(split_dir: Path, symprec: float) -> None:
     uniq = len(np.unique(sgs))
     print(f"    -> wrote {out.name}  | SG=1 frac={p1_frac:.3f}  distinct_SGs={uniq}  failures={n_fail}", flush=True)
     if p1_frac > 0.9:
-        print("    !! WARNING: >90% P1 — likely wrong coords convention or degenerate structures", flush=True)
+        print("    warning: >90% P1; check the coordinate convention or look for degenerate structures", flush=True)
 
 
 def main() -> int:
@@ -71,7 +71,7 @@ def main() -> int:
             print(f"  SKIP {s}: no atomic_numbers.npy", flush=True)
             continue
         run_split(d, args.symprec)
-    print("[sg-precompute] DONE", flush=True)
+    print("[sg-precompute] done", flush=True)
     return 0
 
 

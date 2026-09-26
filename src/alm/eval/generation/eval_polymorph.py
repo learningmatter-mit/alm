@@ -23,10 +23,10 @@ from pymatgen.analysis.structure_matcher import StructureMatcher
 from pymatgen.core import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
-from paths import DATA_ROOT  # noqa: E402
+from paths import ALM_BENCH  # noqa: E402
 
 
-def _ase_to_struct(atoms_struct: dict) -> Structure | None:
+def _struct_from_dict(atoms_struct: dict) -> Structure | None:
     try:
         elements = [str(e).strip() for e in atoms_struct["elements"]]
         coords = np.asarray(atoms_struct["coords"], dtype=np.float64)
@@ -56,8 +56,7 @@ def _select_rows(parquet_path: Path, max_rows: int, seed: int) -> list[dict]:
 
 
 def _ase_atoms_from_struct(atoms_struct: dict):
-    """ASE Atoms from inline input_atoms_struct (live OrbV3; cache is row-index keyed, would miss on material_id)."""
-    from ase import Atoms
+    """ASE Atoms from the inline input_atoms_struct (live OrbV3 input; the cache is keyed by row index, not material_id)."""
     elements = [str(e) for e in atoms_struct["elements"]]
     coords = np.asarray(atoms_struct["coords"], dtype=np.float64)
     lattice = np.asarray(atoms_struct["lattice_mat"], dtype=np.float64)
@@ -104,6 +103,10 @@ def _counts_from_atoms_struct(atoms_struct: dict) -> dict[str, int]:
     return {str(el): int(n) for el, n in counts.items() if int(n) > 0}
 
 
+SCORE_KEYS = ("composition_match", "structurally_distinct", "structurally_valid", "polymorph_success")
+FAILED_SCORE = {"parsed": False, **{k: False for k in SCORE_KEYS}}
+
+
 def _score_generation(
     gen: Structure | Atoms,
     input_struct: Structure,
@@ -113,11 +116,7 @@ def _score_generation(
         try:
             gen = AseAtomsAdaptor.get_structure(gen)
         except Exception:
-            return {
-                "parsed": False, "composition_match": False,
-                "structurally_distinct": False, "structurally_valid": False,
-                "polymorph_success": False,
-            }
+            return dict(FAILED_SCORE)
     comp_match = _composition_match(gen, input_struct)
     valid = _structurally_valid(gen)
     distinct = True
@@ -125,7 +124,7 @@ def _score_generation(
         try:
             distinct = not matcher.fit(input_struct, gen)
         except Exception:
-            distinct = True  # matcher error => treat as distinct (conservative)
+            distinct = True  # count as distinct if the matcher fails
     success = comp_match and distinct and valid
     return {
         "parsed": True,
@@ -138,15 +137,42 @@ def _score_generation(
     }
 
 
+def score_prompt(gens: list, input_struct: Structure | None, K: int,
+                 matcher: StructureMatcher) -> list[dict]:
+    """Score up to K candidates; a bad input, a missing generation or an unconvertible candidate is a failed (all-False) slot."""
+    per_candidate = []
+    if input_struct is not None:
+        per_candidate = [_score_generation(g, input_struct, matcher) for g in gens[:K]]
+    per_candidate.extend(dict(FAILED_SCORE) for _ in range(K - len(per_candidate)))
+    return per_candidate
+
+
+def summarize(examples: list[dict], K: int) -> dict:
+    """Per-candidate rates over len(examples) * K slots; failed slots count as wrong."""
+    cands = [c for e in examples for c in e["per_candidate_scores"]]
+    n_expected = len(examples) * K
+    n_scored = sum(c["parsed"] for c in cands)
+    n_gen_failed = n_expected - n_scored
+    headline = {"n_scored": n_scored, "n_expected": n_expected,
+                "n_gen_failed": n_gen_failed,
+                "gen_failed_rate": n_gen_failed / n_expected if n_expected else 0.0,
+                "n_prompts": len(examples),
+                "n_prompts_failed": sum(1 for e in examples if e["n_parsed"] == 0)}
+    if n_expected > 0:
+        for k in SCORE_KEYS:
+            headline[k] = sum(bool(c[k]) for c in cands) / n_expected
+    headline["per_prompt_mean_success"] = (
+        float(np.mean([e["polymorph_success_rate"] for e in examples])) if examples else 0.0)
+    return headline
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--alm_checkpoint", required=True)
     ap.add_argument("--atoms_mapper", required=True)
     ap.add_argument("--polymorph_parquet", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_polymorph_under_hull.parquet")))
-    ap.add_argument("--cached_embs_root", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "cached_embs_narratives")))
+                    default=Path(os.path.join(ALM_BENCH, "alm_bench/eval/polymorph.parquet")))
     ap.add_argument("--mattergen_pretrained", default="mattergen_base")
     ap.add_argument("--out_dir", type=Path, required=True)
     ap.add_argument("--max_rows", type=int, default=100)
@@ -154,9 +180,6 @@ def main() -> int:
     ap.add_argument("--guidance_factor", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--diffusion_seed", type=int, default=1337)
-    ap.add_argument("--score_e_hull", action="store_true",
-                    help="Also relax via MatterSim and report fraction of polymorphs "
-                         "below input's E_hull (slow; off by default).")
     # StructureMatcher tolerances: CDVAE / CrystaLLM defaults
     ap.add_argument("--ltol", type=float, default=0.3)
     ap.add_argument("--stol", type=float, default=0.5)
@@ -165,7 +188,7 @@ def main() -> int:
 
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[eval_polymorph] writing → {args.out_dir}", flush=True)
+    print(f"[eval_polymorph] writing to {args.out_dir}", flush=True)
     t0 = time.time()
 
     rows = _select_rows(args.polymorph_parquet, args.max_rows, args.seed)
@@ -173,14 +196,13 @@ def main() -> int:
     parents = {r["parent"] for r in rows}
     print(f"[eval_polymorph] parents: {parents}", flush=True)
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from generate_stage3 import (
         load_alm_and_pl_module, get_alm_embedding,
         build_sampler_and_loader, draw_samples_from_sampler,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[eval_polymorph] loading ALM + MatterGen on {device} (live OrbV3) ...", flush=True)
-    # cached_embeddings off: input_source_idx is material_id, not a cache row-index key, so live-encode
+    # Live-encode the input: input_source_idx is a material_id, not a cache row-index key.
     alm, tokenizer, pl_module, K_tokens = load_alm_and_pl_module(
         alm_checkpoint=args.alm_checkpoint,
         atoms_mapper=args.atoms_mapper,
@@ -202,7 +224,8 @@ def main() -> int:
             input_atoms = _ase_atoms_from_struct(r["input_atoms_struct"])
             atom_embed = _live_orbv3_features(alm, input_atoms, device)
         except Exception as e:
-            print(f"[eval_polymorph] {r['row_id']}: live-encode failed ({type(e).__name__}: {e}) → skip", flush=True)
+            print(f"[eval_polymorph] {r['row_id']}: live-encode failed ({type(e).__name__}: {e}); "
+                  f"counted as {args.K} failed candidates", flush=True)
             structures_per_prompt.append([])
             continue
         json_counts = _counts_from_atoms_struct(r["input_atoms_struct"])
@@ -230,58 +253,39 @@ def main() -> int:
 
     matcher = StructureMatcher(ltol=args.ltol, stol=args.stol, angle_tol=args.angle_tol)
     examples = []
-    overall = Counter()
-    n_scored = 0
     for i, gens in enumerate(structures_per_prompt):
         r = rows[i]
-        input_struct = _ase_to_struct(r["input_atoms_struct"])
-        if input_struct is None or not gens:
-            continue
-        per_candidate = []
-        for g in gens:
-            if isinstance(g, Atoms):
-                try:
-                    g = AseAtomsAdaptor.get_structure(g)
-                except Exception:
-                    continue
-            sc = _score_generation(g, input_struct, matcher)
-            per_candidate.append(sc)
-            n_scored += 1
-            for k in ("composition_match", "structurally_distinct",
-                      "structurally_valid", "polymorph_success"):
-                if sc[k]:
-                    overall[k] += 1
+        input_struct = _struct_from_dict(r["input_atoms_struct"])
+        per_candidate = score_prompt(gens, input_struct, args.K, matcher)
         examples.append({
             "row_id": r["row_id"],
             "parent": r["parent"],
             "user_prompt": r["user_prompt"],
-            "input_formula": str(input_struct.composition.reduced_formula),
+            "input_formula": (str(input_struct.composition.reduced_formula)
+                              if input_struct is not None else None),
             "per_candidate_scores": per_candidate,
             "n_candidates": len(per_candidate),
-            "polymorph_success_rate": np.mean([sc["polymorph_success"] for sc in per_candidate]) if per_candidate else 0.0,
+            "n_parsed": sum(c["parsed"] for c in per_candidate),
+            "polymorph_success_rate": float(np.mean([sc["polymorph_success"] for sc in per_candidate])),
         })
 
-    headline = {"n_scored": n_scored, "n_prompts": len(examples),
-                "guidance_factor": args.guidance_factor, "K": args.K,
-                "ltol": args.ltol, "stol": args.stol, "angle_tol": args.angle_tol}
-    if n_scored > 0:
-        for k in ("composition_match", "structurally_distinct",
-                  "structurally_valid", "polymorph_success"):
-            headline[k] = overall[k] / n_scored
-    headline["per_prompt_mean_success"] = float(np.mean([e["polymorph_success_rate"] for e in examples])) if examples else 0.0
+    headline = summarize(examples, args.K)
+    headline.update({"guidance_factor": args.guidance_factor, "K": args.K,
+                     "ltol": args.ltol, "stol": args.stol, "angle_tol": args.angle_tol})
 
     (args.out_dir / "metrics.json").write_text(json.dumps(headline, indent=2))
     with (args.out_dir / "predictions.jsonl").open("w") as f:
         for e in examples:
             f.write(json.dumps(e) + "\n")
 
-    print(f"\n[eval_polymorph] HEADLINE ({n_scored} candidates across {len(examples)} prompts):", flush=True)
+    print(f"\n[eval_polymorph] {headline['n_scored']}/{headline['n_expected']} candidates scored across "
+          f"{len(examples)} prompts (gen_failed_rate={headline['gen_failed_rate']:.3f}):", flush=True)
     print(f"  composition_match             = {headline.get('composition_match', 0):.3f}", flush=True)
     print(f"  structurally_distinct         = {headline.get('structurally_distinct', 0):.3f}", flush=True)
     print(f"  structurally_valid            = {headline.get('structurally_valid', 0):.3f}", flush=True)
     print(f"  polymorph_success_rate        = {headline.get('polymorph_success', 0):.3f}", flush=True)
     print(f"  per_prompt_mean_success       = {headline['per_prompt_mean_success']:.3f}", flush=True)
-    print(f"[eval_polymorph] DONE in {time.time()-t0:.0f}s", flush=True)
+    print(f"[eval_polymorph] done in {time.time()-t0:.0f}s", flush=True)
     return 0
 
 

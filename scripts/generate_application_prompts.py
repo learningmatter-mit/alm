@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import random
 import re
 from collections import Counter
 from pathlib import Path
@@ -14,7 +15,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-from paths import DATA_ROOT
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
+from paths import DATA_ROOT, ALM_BENCH
 
 
 GENERATION_CUE_PATTERN = re.compile(
@@ -137,8 +139,7 @@ DOMAINS = [
 ]
 
 
-def _build_prompt(formula: str, properties: dict,
-                   target_domain: str) -> list[dict]:
+def _build_prompt(properties: dict, target_domain: str) -> list[dict]:
     # Pass structured `properties` (not the explanation text) to avoid mode collapse onto templated prose.
     prop_lines = []
     for k, v in properties.items():
@@ -165,9 +166,8 @@ def _build_prompt(formula: str, properties: dict,
         "  insulator), pick a DIFFERENT specific domain consistent with the "
         "  properties. Be specific.\n"
         "- DO NOT include any chemical formula or element symbols in your output.\n"
-        "- DO NOT mention 'scintillator', 'scintillation', or 'radiation detection' — "
-        "  these are over-represented in our training data; suppress them. (Even if "
-        "  the property values would suggest it, choose another framing.)\n"
+        "- DO NOT mention 'scintillator', 'scintillation', or 'radiation detection', "
+        "  even if the property values would suggest it; choose another framing.\n"
         "- Reference at most one property numerically in your output (e.g. "
         "  '~1.5 eV bandgap'); be qualitative ('wide-bandgap', 'low-density', "
         "  'highly magnetic') rather than quoting the raw number for the rest.\n\n"
@@ -232,7 +232,7 @@ async def _one_call(
 ) -> str | None:
     payload = {
         "model": model,
-        "messages": _build_prompt(formula, properties, target_domain),
+        "messages": _build_prompt(properties, target_domain),
         "temperature": 1.0,
         "top_p": 0.95,
         "max_tokens": max_tokens,
@@ -309,8 +309,7 @@ async def _process_rows(args, rows: list[dict]) -> list[dict]:
     out_rows: list[dict] = []
 
     # Pre-sample a target domain per row; seeded for reproducibility.
-    import random as _rnd
-    domain_rng = _rnd.Random(args.seed)
+    domain_rng = random.Random(args.seed)
     row_domains = [domain_rng.choice(DOMAINS) for _ in rows]
 
     async with aiohttp.ClientSession() as session:
@@ -334,8 +333,7 @@ async def _process_rows(args, rows: list[dict]) -> list[dict]:
             if n % 1000 == 0:
                 print(f"[gen] {n}/{len(rows)} done; kept {n_ok} so far; "
                       f"failures: {dict(failure_counts.most_common(5))}", flush=True)
-    print(f"[gen] FINAL — {n} processed, {n_ok} kept; "
-          f"failures: {dict(failure_counts)}", flush=True)
+    print(f"[gen] {n} processed, {n_ok} kept; failures: {dict(failure_counts)}", flush=True)
     return out_rows
 
 
@@ -346,14 +344,13 @@ def main() -> int:
                     help="Comma-separated vLLM endpoints for round-robin.")
     ap.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
     ap.add_argument("--pairs_parquet", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs.parquet")))
+                    default=Path(os.path.join(ALM_BENCH, "pretraining/describe.parquet")))
     ap.add_argument("--narratives_root", type=Path,
                     default=Path(os.path.join(DATA_ROOT, "GPT-Narratives-for-Materials")))
     ap.add_argument("--out_path", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_app.parquet")))
+                    default=Path(os.path.join(ALM_BENCH, "alm_bench/app.parquet")))
     ap.add_argument("--max_rows", type=int, default=200000,
-                    help="Cap on rows to process. Default 200K — enough for a "
-                         "meaningful bucket without spending excessive vLLM time.")
+                    help="Max rows to send to the LLM (0 = no cap).")
     ap.add_argument("--concurrency", type=int, default=128)
     ap.add_argument("--max_tokens", type=int, default=128)
     ap.add_argument("--seed", type=int, default=42)
@@ -366,8 +363,7 @@ def main() -> int:
     pf = pq.ParquetFile(args.pairs_parquet)
     schema = pf.schema_arrow
 
-    import random as _rnd
-    rng = _rnd.Random(args.seed)
+    rng = random.Random(args.seed)
     candidates: list[dict] = []
     n_seen = 0
     n_skipped = 0
@@ -391,7 +387,7 @@ def main() -> int:
                 "properties": props,
             })
     print(f"[main] candidates: {len(candidates):,} of {n_seen:,} seen "
-          f"({n_skipped:,} skipped — no properties)")
+          f"({n_skipped:,} skipped, no properties)")
 
     if args.max_rows > 0 and len(candidates) > args.max_rows:
         rng.shuffle(candidates)
@@ -416,7 +412,7 @@ def main() -> int:
                     out_dict[col].append(r[col])
         writer.write_table(pa.Table.from_pydict(out_dict, schema=schema))
     writer.close()
-    print(f"[main] done. Sample 5 prompts:")
+    print("[main] done; sample prompts:")
     for r in completed[:5]:
         print(f"  {r['app_prompt']}")
     return 0

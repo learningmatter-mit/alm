@@ -31,7 +31,7 @@ def generate_batch(model, batch, max_new_tokens=512, atomistic=True,
     labels    = [t.squeeze(0).to(device) for t in batch["labels"]]
     attn_mask = [t.squeeze(0).to(device) for t in batch["attention_mask"]]
 
-    # Prompt = labels==-100 positions; fall back to first 50 tokens for raw-LM samples.
+    # The prompt is the positions labeled -100; samples with no masked prefix use their first 50 tokens.
     prompt_ids_list = []
     for ids, labs in zip(input_ids, labels):
         mask = labs == -100

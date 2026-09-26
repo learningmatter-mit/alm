@@ -1,13 +1,13 @@
-# Atomistic Language Models (ALM) — packaging + tooling config.
+# Atomistic Language Models (ALM): packaging and tooling config.
 #
-# IMPORTANT — install order (the stack is CUDA-12 only; see README "Installation"):
+# Install order (the stack is CUDA-12 only; see README "Installation"):
 #   1. Create the env:        conda env create -f environment.yml   (or: python3.10 -m venv .venv)
 #   2. Install CUDA-12 torch: pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
-#   3. Install this package:  pip install -e .          # picks up the deps below WITHOUT replacing torch
+#   3. Install this package:  pip install -e .          # picks up the deps below without replacing torch
 #   4. Fetch + build the MatterGen fork: bash external/setup_mattergen.sh   (not on PyPI)
 #
-# Do NOT let pip pull a CUDA-13 torch / nvidia-* wheel — they collide with the
-# cu128 .so paths. Always install torch first, then `pip install -e .`.
+# Keep pip from pulling a CUDA-13 torch or nvidia-* wheel; those collide with the
+# cu128 .so paths. Install torch first, then `pip install -e .`.
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -23,9 +23,8 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "LearningMatter @ MIT" }]
 keywords = ["materials", "crystal-structure-prediction", "diffusion", "llm", "multimodal"]
 
-# Versions track the `llm` conda env (see environment.yml). torch and the
-# MatterGen fork are installed out-of-band (see the header) and are intentionally
-# NOT listed here so `pip install -e .` never reinstalls/clobbers the cu128 torch.
+# torch and the MatterGen fork are installed separately (see above) and are left
+# out here so `pip install -e .` does not replace the cu128 torch.
 dependencies = [
     "transformers>=4.57,<5",
     "peft>=0.19",

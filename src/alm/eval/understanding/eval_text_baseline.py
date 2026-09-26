@@ -3,13 +3,10 @@
 import argparse
 import json
 import os
-import sys
 from pathlib import Path
 
 import polars as pl
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils import _DATASET_PROPERTIES, _NARRATIVE_PROPERTIES
 from parsers import detect_leak, extract_number
 from metrics import mae, mad_mae_ratio
@@ -146,7 +143,7 @@ def _run_llm4mat(args, llm, sampling_params, out_dir, pred_fh):
                 m["mae"] = mae(preds, targets)
                 m["mad_mae_ratio"] = mad_mae_ratio(preds, targets)
             all_metrics["by_config"][config][prop] = m
-            print(f"  → {m}")
+            print(f"  {m}")
             _flush(out_dir, all_metrics, pred_fh)
 
     return all_metrics
@@ -230,7 +227,7 @@ def _run_mat2props(args, llm, sampling_params, out_dir, pred_fh):
             m["mae"] = mae(preds, targets)
             m["mad_mae_ratio"] = mad_mae_ratio(preds, targets)
         all_metrics[prop] = m
-        print(f"  → {m}")
+        print(f"  {m}")
         _flush(out_dir, all_metrics, pred_fh)
 
     return all_metrics
@@ -252,7 +249,7 @@ def _merge_shards(args):
     for sd in shard_dirs:
         p_path = sd / "predictions.jsonl"
         if not p_path.exists():
-            print(f"[merge] WARN: {p_path} missing; skipping")
+            print(f"[merge] {p_path} missing; skipping")
             continue
         with open(p_path) as f:
             for line in f:
@@ -265,7 +262,7 @@ def _merge_shards(args):
         for r in all_rows:
             f.write(json.dumps(r) + "\n")
     print(f"[merge] concatenated {len(all_rows)} predictions from {len(shard_dirs)} shards "
-          f"→ {out_pred}")
+          f"into {out_pred}")
 
     if args.bench == "llm4mat":
         merged = {"split": args.split, "max_samples": args.max_samples,
@@ -325,11 +322,11 @@ def main():
     p.add_argument("--bench", choices=["llm4mat", "mat2props"], required=True)
     p.add_argument("--base_name", default="Qwen/Qwen3-8B")
     p.add_argument("--include_description", action=argparse.BooleanOptionalAction, default=True,
-                   help="Pass formula + description (LLM4Mat-paper-parity); off = formula only.")
+                   help="Prompt with formula plus description, as in the LLM4Mat-Bench paper; --no-include_description uses the formula only.")
 
     # llm4mat
     p.add_argument("--configs", default="all",
-                   help="comma list (e.g. 'mp,jarvis_dft') or 'all' for the 9 staged configs.")
+                   help="Comma-separated LLM4Mat-Bench configs, or 'all' for all nine.")
     p.add_argument("--split", default="validation", choices=["validation", "test"])
     p.add_argument("--data_root", default=os.path.join(DATA_ROOT, "LLM4Mat-Bench"))
 
@@ -339,33 +336,28 @@ def main():
     p.add_argument("--narrative_parquet_dir",
                    default=os.path.join(DATA_ROOT, "GPT-Narratives-for-Materials"))
     p.add_argument("--properties", default=None,
-                   help="comma list; default = full _NARRATIVE_PROPERTIES[name].")
+                   help="Comma-separated properties; default is all of _NARRATIVE_PROPERTIES[name].")
     p.add_argument("--max_desc_chars", type=int, default=2000,
-                   help="Pre-trim descriptions (LLM4Mat or gpt_text) to this many chars. "
-                        "hMOF / qMOF can hit 10k+ chars; default 2000 ≈ 600-800 tokens.")
+                   help="Trim descriptions (LLM4Mat or gpt_text) to this many characters (2000 is about 600-800 tokens).")
 
     p.add_argument("--max_samples", type=int, default=1000)
     p.add_argument("--max_new_tokens", type=int, default=32)
 
     p.add_argument("--max_model_len", type=int, default=8192,
-                   help="Max input+output tokens. 8192 + max_desc_chars=2000 trim covers all "
-                        "LLM4Mat & Mat2Props rows. Bump if you raise --max_desc_chars.")
+                   help="Max input plus output tokens; 8192 fits every row at the default --max_desc_chars.")
     p.add_argument("--tensor_parallel_size", type=int, default=1,
-                   help="Multi-GPU tensor parallelism. For an 8B model on >1 GPU prefer DP "
-                        "(--shard_id/--num_shards) over TP — TP all-reduce kills throughput.")
+                   help="vLLM tensor-parallel size. For an 8B model, sharding with --num_shards is faster.")
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85,
                    help="Fraction of each GPU vLLM may use for KV cache.")
     p.add_argument("--seed", type=int, default=42)
 
     # Data-parallel sharding
     p.add_argument("--shard_id", type=int, default=0,
-                   help="This shard's index, 0..num_shards-1. Rows are striped: shard S "
-                        "takes row i where i %% num_shards == S.")
+                   help="This shard's index in 0..num_shards-1; shard S takes rows i with i %% num_shards == S.")
     p.add_argument("--num_shards", type=int, default=1,
-                   help="Total shard count for data-parallel runs. 1 = no sharding.")
+                   help="Total number of shards (1 = no sharding).")
     p.add_argument("--merge_shards_from", default=None,
-                   help="Comma-separated list of shard run dirs to merge. Skips engine "
-                        "load entirely; concatenates predictions.jsonl, recomputes metrics.")
+                   help="Comma-separated shard run dirs to merge (concatenates predictions.jsonl and recomputes metrics without loading vLLM).")
     args = p.parse_args()
 
     if args.merge_shards_from:
@@ -399,7 +391,7 @@ def main():
     if args.num_shards > 1:
         rid += f"__shard{args.shard_id}of{args.num_shards}"
     out_dir = run_dir(bench_dir, args.base_name.replace("/", "_"), run_id=rid)
-    print(f"[out] streaming predictions → {out_dir}/predictions.jsonl "
+    print(f"[out] streaming predictions to {out_dir}/predictions.jsonl "
           f"(metrics.json rewritten per property)")
 
     # Truncate so reruns don't accumulate stale rows from a crashed sweep.

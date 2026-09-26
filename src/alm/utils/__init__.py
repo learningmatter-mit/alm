@@ -273,7 +273,7 @@ class AtomisticLanguageDataset(Dataset):
                     dataset_id = row.data['smiles']
                     self.dataset_id_to_db_idx[str(dataset_id)] = row.id
 
-        # Back-compat alias: generate.py reads _descriptions directly.
+        # Read by inference/generate_stage1.py.
         self._descriptions = self._column_data.get("description")
 
     def __len__(self):
@@ -354,12 +354,10 @@ class AtomisticLanguageDataset(Dataset):
         input_ids = torch.tensor([full_ids], dtype=torch.long)
         labels = torch.tensor([[-100] * len(prompt_ids) + assistant_full_ids], dtype=torch.long)
 
-        max_num_tokens = text_budget  # redundant with tokenizer truncation; kept for safety
-
         sample = {
-            "input_ids": input_ids[:, :max_num_tokens],
-            "labels": labels[:, :max_num_tokens],
-            "attention_mask": torch.ones_like(input_ids[:, :max_num_tokens]),
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": torch.ones_like(input_ids),
             "id": sample_id,
         }
         if atom_embed is not None:
@@ -483,7 +481,7 @@ class GPTNarrativeDataset(Dataset):
             self._atoms = atoms_list
             self._ids = [str(i) for i in range(n_rows)]
 
-        # Back-compat alias matching AtomisticLanguageDataset._descriptions.
+        # Same attribute as AtomisticLanguageDataset._descriptions.
         self._descriptions = self._column_data.get("gpt_text")
 
     def __len__(self):
@@ -693,7 +691,7 @@ class CamelAIDataset(Dataset):
 
 
 class ArxivAbstractDataset(Dataset):
-    """JARVIS arXiv abstracts as ChatML instruction tuning (supervise only the abstract); raw continued-pretraining undid Qwen3's IT and leaked base-LM web priors at eval."""
+    """JARVIS arXiv abstracts as ChatML instruction pairs (title + categories -> abstract); only the abstract is supervised."""
     _SYSTEM = ("You are a scientific writing assistant. Given a paper title "
                "and arXiv categories, write a plausible abstract.")
 

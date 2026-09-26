@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import sys
 import os
 import warnings
 from pathlib import Path
@@ -16,22 +15,18 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# alm/ and external/mattergen on the path so structure_metrics + eval imports resolve.
-_ALM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_ALM_ROOT, "alm"))
-sys.path.insert(0, _ALM_ROOT)
-sys.path.insert(0, os.path.join(_ALM_ROOT, "external", "mattergen"))
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 
 from pymatgen.core import Structure  # noqa: E402
 from pymatgen.io.ase import AseAtomsAdaptor  # noqa: E402
 from paths import DATA_ROOT  # noqa: E402
 
-from eval.structure_metrics import (  # noqa: E402
+from structure_metrics import (  # noqa: E402
     relax_structures_mattersim,
     e_above_hull_per_atom,
     load_hull_reference,
 )
-from eval.eval_dng import _atoms_struct_to_pymatgen  # noqa: E402
+from eval_dng import _atoms_struct_to_pymatgen  # noqa: E402
 
 
 # Narrative buckets state DFT properties in prose only; permissive regexes pull them as a reference column.
@@ -126,11 +121,8 @@ def run_shard(args):
             if key in seen_keys:
                 continue
             seen_keys.add(key)
-        a = r["atoms_struct"]
-        if hasattr(a, "as_py"):
-            a = a.as_py()
         try:
-            s = _atoms_struct_to_pymatgen(a)
+            s = _atoms_struct_to_pymatgen(r["atoms_struct"])
         except Exception:
             s = None
         meta = {
@@ -341,18 +333,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--parquet", type=Path, required=True)
     ap.add_argument("--out_dir", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/energies")))
+                    default=Path(os.path.join(DATA_ROOT, "structure_energies")))
     ap.add_argument("--shard_idx", type=int, default=0)
     ap.add_argument("--num_shards", type=int, default=1)
     ap.add_argument("--dedup_key", choices=list(DEDUP_ADAPTERS), default="narrative",
-                    help="narrative=dedup on (parent,source_idx); row_id=keep all (editing buckets)")
+                    help="narrative: dedup on (parent, source_idx); row_id: keep every row (editing buckets).")
     ap.add_argument("--stable_threshold", type=float, default=0.1,
-                    help="e_above_hull (eV/atom) cutoff for the stable-row-index file")
+                    help="E_hull cutoff (eV/atom) for the stable-row index file.")
     ap.add_argument("--hull_dir", type=Path, default=None,
-                    help="MP-2020 hull dir; default = MatterGen-bundled via load_hull_reference()")
+                    help="MP-2020 hull dir; defaults to load_hull_reference()'s default.")
     ap.add_argument("--mattersim_device", default="cuda")
     ap.add_argument("--merge", action="store_true",
-                    help="merge mode: concatenate this parquet's shards + write stable-row index")
+                    help="Concatenate this parquet's shards and write the stable-row index.")
     args = ap.parse_args()
 
     if args.merge:

@@ -1,10 +1,9 @@
-"""Text-conditional eval: composition-match / density / energy MAE for text -> structure on a held-out pairs.parquet slice."""
+"""Text-to-structure eval: composition match, density MAE and optional energy MAE on a random sample of pairs parquet rows."""
 from __future__ import annotations
 
 
 import argparse
 import os
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -12,11 +11,9 @@ import torch
 from pymatgen.core.structure import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # alm/
-
-from paths import DATA_ROOT  # noqa: E402
-from runs import run_dir, write_run  # noqa: E402
-from structure_metrics import (  # noqa: E402
+from paths import ALM_BENCH
+from runs import run_dir, write_run
+from structure_metrics import (
     composition_match_ratio,
     composition_set,
     density_g_per_cm3,
@@ -37,7 +34,7 @@ def _atoms_struct_to_pymatgen(struct_dict: dict) -> Structure:
 
 def sample_eval_rows(parquet_path: Path, n_rows: int, seed: int = 1337,
                      parent_filter: str | None = None):
-    """Deterministic random sample of pairs.parquet rows; pairs are not held out from training, so this is in-distribution eval."""
+    """Deterministic random sample of pairs parquet rows; pairs are not held out from training, so this is in-distribution eval."""
     import pyarrow.parquet as pq
     pf = pq.ParquetFile(str(parquet_path))
     total = pf.metadata.num_rows
@@ -56,8 +53,6 @@ def sample_eval_rows(parquet_path: Path, n_rows: int, seed: int = 1337,
                     cursor += 1
                     continue
                 struct = b["atoms_struct"][i]
-                if hasattr(struct, "as_py"):
-                    struct = struct.as_py()
                 try:
                     py_struct = _atoms_struct_to_pymatgen(struct)
                 except Exception:
@@ -84,7 +79,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--alm_checkpoint", required=True)
     ap.add_argument("--atoms_mapper", required=True)
-    ap.add_argument("--pairs_parquet", default=os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs.parquet"))
+    ap.add_argument("--pairs_parquet", default=os.path.join(ALM_BENCH, "pretraining/describe.parquet"))
     ap.add_argument("--n_test_rows", type=int, default=200)
     ap.add_argument("--samples_per_prompt", type=int, default=8)
     ap.add_argument("--guidance_factor", type=float, default=1.0)
@@ -92,20 +87,17 @@ def main():
     ap.add_argument("--num_atoms_distribution", default="ALEX_MP_20")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--parent_filter", default=None,
-                    help="Restrict to one pairs.parquet parent (e.g., 'dft_3d').")
+                    help="Restrict to one pairs parquet parent (e.g., 'dft_3d').")
     ap.add_argument("--score_energy", action="store_true",
-                    help="Relax both target + generations with MatterSim and report "
-                         "per-atom-energy MAE. Adds ~30s/structure.")
+                    help="Relax targets and generations with MatterSim and report per-atom energy MAE (about 30 s per structure).")
     ap.add_argument("--mattersim_potential_path", default=None)
     ap.add_argument("--out_root", type=Path, default=None)
     ap.add_argument("--run_id", type=str, default=None)
     ap.add_argument("--bench_tag", type=str, default="text_cond",
-                    help="Bench-dir tag so different buckets sharing this eval don't collide: "
-                         "describe -> 'text_cond' (default), ood -> 'ood'. Output goes to "
-                         "stage3b_{bench_tag}_g{NN}/{run_id}.")
+                    help="Output directory tag. Results go to {bench_tag}_g{NN}/{run_id}.")
     args = ap.parse_args()
 
-    from generate_stage3 import generate_for_prompts, load_alm_and_pl_module  # noqa: E402
+    from generate_stage3 import generate_for_prompts, load_alm_and_pl_module
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     alm, tokenizer, pl_module, K = load_alm_and_pl_module(
@@ -114,14 +106,14 @@ def main():
         mattergen_pretrained=args.mattergen_pretrained,
         device=device,
     )
-    # load_alm_and_pl_module's .to() can miss buffers/property_embeddings (CPU/cuda mismatch); force all here.
+    # Move the diffusion module and its model explicitly so every buffer lands on `device`.
     pl_module = pl_module.to(device)
     pl_module.diffusion_module = pl_module.diffusion_module.to(device)
     pl_module.diffusion_module.model = pl_module.diffusion_module.model.to(device)
 
     if args.out_root is not None:
         os.environ["ALM_EVAL_RESULTS_ROOT"] = str(args.out_root)
-    bench_name = f"stage3b_{args.bench_tag}_g{int(args.guidance_factor*10):02d}"
+    bench_name = f"{args.bench_tag}_g{int(args.guidance_factor*10):02d}"
     rd = run_dir(bench_name, args.alm_checkpoint, run_id=args.run_id)
     print(f"[text-cond] writing results to {rd}", flush=True)
 
@@ -133,7 +125,7 @@ def main():
     )
     print(f"[text-cond] sampled {len(rows)} test rows", flush=True)
     if not rows:
-        print("[text-cond] no rows — nothing to do", flush=True)
+        print("[text-cond] no rows to score", flush=True)
         return 0
 
     prompts = [r["user_prompt"] for r in rows]
@@ -162,6 +154,7 @@ def main():
     composition_match_pct_at_least_one = []
     density_errs = []
     energy_errs = []  # only populated when --score_energy
+    n_gen_failed_total = 0
 
     target_e_per_atom: dict[str, float] = {}
     if args.score_energy:
@@ -231,14 +224,14 @@ def main():
                 "valid_charge": bool(v["charge"]),
             })
 
-        if per_sample_cmr:
-            mean_cmr = float(np.mean(per_sample_cmr))
-            any_match = any(c >= 1.0 for c in per_sample_cmr)
-            at_least_one = any(c > 0.0 for c in per_sample_cmr)
-        else:
-            mean_cmr = 0.0
-            any_match = False
-            at_least_one = False
+        # Missing generations (gen failures) count as zero composition match: the per-prompt
+        # denominator is the requested samples_per_prompt, not the number that came back.
+        n_expected = max(args.samples_per_prompt, len(per_sample_cmr))
+        n_gen_failed = n_expected - len(per_sample_cmr)
+        n_gen_failed_total += n_gen_failed
+        mean_cmr = float(sum(per_sample_cmr) / n_expected) if n_expected else 0.0
+        any_match = any(c >= 1.0 for c in per_sample_cmr)
+        at_least_one = any(c > 0.0 for c in per_sample_cmr)
 
         composition_match_ratios.append(mean_cmr)
         composition_match_pct_at_least_one.append(at_least_one)
@@ -255,6 +248,7 @@ def main():
             "target_elements": sorted(target_elems),
             "target_density": target_density,
             "n_samples": len(gen_structs),
+            "n_gen_failed": n_gen_failed,
             "mean_composition_match_ratio": mean_cmr,
             "any_full_match": any_match,
             "any_partial_match": at_least_one,
@@ -267,6 +261,8 @@ def main():
         "guidance_factor": args.guidance_factor,
         "mean_composition_match_ratio": float(np.mean(composition_match_ratios)) if composition_match_ratios else 0.0,
         "pct_with_any_partial_match": float(np.mean(composition_match_pct_at_least_one)) if composition_match_pct_at_least_one else 0.0,
+        "gen_failed_rate": (n_gen_failed_total / (len(rows) * args.samples_per_prompt)
+                            if rows and args.samples_per_prompt else 0.0),
         "density_mae": float(np.mean(density_errs)) if density_errs else None,
         "density_mae_n": len(density_errs),
         "energy_per_atom_mae": float(np.mean(energy_errs)) if energy_errs else None,
@@ -278,7 +274,7 @@ def main():
     write_run(rd, metrics, predictions)
 
     print()
-    print(f"[text-cond] DONE — {len(rows)} prompts × {args.samples_per_prompt} samples")
+    print(f"[text-cond] {len(rows)} prompts x {args.samples_per_prompt} samples")
     print(f"  mean_composition_match_ratio = {metrics['mean_composition_match_ratio']:.3f}")
     print(f"  pct_with_any_partial_match   = {metrics['pct_with_any_partial_match']:.3f}")
     print(f"  density_mae (g/cm³)          = {metrics['density_mae']}")

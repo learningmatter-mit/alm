@@ -2,16 +2,13 @@
 
 import argparse
 import os
-import sys
 from pathlib import Path
 
 from torch.utils.data import DataLoader, Subset
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils import AtomisticLanguageDataset, custom_collate_fn
 
-from loader import load_alm
+from loader import load_alm, resolve_encoder
 from text_generation import generate_batch
 from parsers import detect_leak, extract_number, extract_choice
 from metrics import mae, rmse, mad_mae_ratio, accuracy, weighted_f1
@@ -34,10 +31,6 @@ def _build_task_dict(target_column, prompt, target_format):
         "target_format": target_format,
         "bucket": "matterchat",
     }
-
-
-def _bool_to_yn(v):
-    return "Yes" if bool(v) else "No"
 
 
 _YN = {True: "A", False: "B", "True": "A", "False": "B", "true": "A", "false": "B"}
@@ -123,6 +116,8 @@ def _eval_task(model, tokenizer, key, defn, args):
 
     id_to_idx = {sid: i for i, sid in enumerate(ds._ids)}
     preds_num, tgts_num, preds_cls, tgts_cls, predictions = [], [], [], [], []
+    # Every row with a known target label; failed predictions are scored as "invalid" (always wrong).
+    scored_cls_pred, scored_cls_tgt = [], []
     n_leaked = 0
     for batch in loader:
         gens = generate_batch(model, batch, max_new_tokens=args.max_new_tokens, atomistic=True,
@@ -147,6 +142,9 @@ def _eval_task(model, tokenizer, key, defn, args):
                 row["parsed"], row["ok"], row["target_letter"] = pred, ok, tgt_letter
                 if ok:
                     preds_cls.append(pred); tgts_cls.append(tgt_letter)
+                if tgt_letter is not None:
+                    scored_cls_pred.append(pred if ok else "invalid")
+                    scored_cls_tgt.append(tgt_letter)
             predictions.append(row)
 
     n_total = len(predictions)
@@ -159,9 +157,14 @@ def _eval_task(model, tokenizer, key, defn, args):
         metrics["mae"] = mae(preds_num, tgts_num)
         metrics["rmse"] = rmse(preds_num, tgts_num)
         metrics["mad_mae_ratio"] = mad_mae_ratio(preds_num, tgts_num)
-    elif defn["type"] == "cls" and preds_cls:
-        metrics["accuracy"] = accuracy(preds_cls, tgts_cls)
-        metrics["weighted_f1"] = weighted_f1(preds_cls, tgts_cls)
+    elif defn["type"] == "cls" and scored_cls_tgt:
+        # Unparseable and leaked answers count as wrong and stay in the denominator.
+        metrics["n_scored"] = len(scored_cls_tgt)
+        metrics["accuracy"] = accuracy(scored_cls_pred, scored_cls_tgt)
+        metrics["weighted_f1"] = weighted_f1(scored_cls_pred, scored_cls_tgt)
+        if preds_cls:
+            metrics["accuracy_valid_only"] = accuracy(preds_cls, tgts_cls)
+            metrics["weighted_f1_valid_only"] = weighted_f1(preds_cls, tgts_cls)
     return metrics, predictions
 
 
@@ -173,7 +176,7 @@ def main():
     p.add_argument("--data_root", default=os.path.join(DATA_ROOT, "LLM4Mat-Bench"))
     p.add_argument("--cached_embs_root", default=os.path.join(DATA_ROOT, "cached_embs"))
     p.add_argument("--data_csv", default=None,
-                   help="override CSV path (use this when pointing at MatterChat's Zenodo CSV)")
+                   help="Override the CSV path (e.g. MatterChat's Zenodo CSV).")
     p.add_argument("--tasks", default=",".join(TASK_DEFS.keys()))
     p.add_argument("--max_samples", type=int, default=1000)
     p.add_argument("--batch_size", type=int, default=8)
@@ -190,18 +193,8 @@ def main():
     args = p.parse_args()
 
     model, tokenizer = load_alm(checkpoint=args.checkpoint, merge_lora=not args.no_merge_lora)
-    # Auto-detect encoder from the projector in_dim (same map as eval_llm4mat).
-    _ATOMISTIC_NAME_BY_DIM = {256: "orb_v3_direct_20_omat", 128: "uma-s-1p1",
-                              640: "pet-mad-xs", 1280: "pet-mad-s"}
-    detected_dim = int(model.projector[0].in_features)
-    if args.atomistic_feature_dim is None:
-        args.atomistic_feature_dim = detected_dim
-    if args.atomistic_model_name is None:
-        args.atomistic_model_name = _ATOMISTIC_NAME_BY_DIM.get(
-            args.atomistic_feature_dim, "orb_v3_direct_20_omat"
-        )
-    print(f"[eval_matterchat] atomistic_feature_dim={args.atomistic_feature_dim} "
-          f"→ atomistic_model_name={args.atomistic_model_name}")
+    args.atomistic_model_name, args.atomistic_feature_dim = resolve_encoder(
+        model, args.atomistic_model_name, args.atomistic_feature_dim)
 
     all_metrics, all_predictions = {}, []
     for key in [t.strip() for t in args.tasks.split(",")]:
@@ -213,7 +206,7 @@ def main():
         if m is not None:
             all_metrics[key] = m
             all_predictions.extend(preds)
-            print(f"  → {m}")
+            print(f"  {m}")
 
     write_run(run_dir("matterchat", args.checkpoint), all_metrics, all_predictions)
 

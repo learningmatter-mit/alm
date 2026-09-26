@@ -1,4 +1,8 @@
-"""Doping/substitution eval for the stage3a doping_strain bucket: generate K candidates per X->Y prompt and score substitution success."""
+"""Substitution eval: generate K candidates per 'replace X with Y' prompt and score whether the substitution happened.
+
+Every prompt contributes K candidates to the denominator. Candidates that failed to generate or
+convert, and all K candidates of a prompt whose input failed to encode, count as wrong.
+"""
 from __future__ import annotations
 
 
@@ -10,7 +14,7 @@ import re
 import sys
 import time
 import warnings
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 warnings.filterwarnings("ignore", message=".*Pauling electronegativity.*")
@@ -23,7 +27,7 @@ from ase import Atoms
 from pymatgen.core import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
-from paths import DATA_ROOT  # noqa: E402
+from paths import ALM_BENCH  # noqa: E402
 
 _PATTERNS = [
     r"replacing all ([A-Z][a-z]?) atoms with ([A-Z][a-z]?)",
@@ -47,7 +51,7 @@ def _parse_substitution(prompt: str) -> tuple[str, str] | None:
     return None
 
 
-def _ase_to_struct(atoms_struct: dict) -> Structure | None:
+def _struct_from_dict(atoms_struct: dict) -> Structure | None:
     try:
         elements = [str(e).strip() for e in atoms_struct["elements"]]
         coords = np.asarray(atoms_struct["coords"], dtype=np.float64)
@@ -80,36 +84,8 @@ def _select_rows(parquet_path: Path, max_rows: int, seed: int) -> list[dict]:
     return candidates[:max_rows]
 
 
-def _load_orbv3_cache(cached_embs_root: Path, parents: set[str]) -> dict:
-    out = {"memmap": {}, "idx": {}}
-    for parent in parents:
-        bin_p = cached_embs_root / parent / "embeddings" / "orb_v3_direct_20_omat_atom.flat.bin"
-        idx_p = cached_embs_root / parent / "embeddings" / "orb_v3_direct_20_omat_atom.flat.idx.json"
-        if not bin_p.exists() or not idx_p.exists():
-            print(f"[eval_doping] WARN no cache for {parent} at {bin_p}", flush=True)
-            continue
-        with open(idx_p) as f:
-            out["idx"][parent] = json.load(f)
-        out["memmap"][parent] = np.memmap(bin_p, dtype=np.float32, mode="r").reshape(-1, 256)
-    return out
-
-
-def _input_atom_embed(cache, parent: str, input_idx, device) -> torch.Tensor | None:
-    idx_map = cache["idx"].get(parent)
-    mm = cache["memmap"].get(parent)
-    if idx_map is None or mm is None:
-        return None
-    ent = idx_map.get(str(input_idx))
-    if ent is None:
-        return None
-    off, length = int(ent[0]), int(ent[1])
-    arr = np.asarray(mm[off:off + length], dtype=np.float32).copy()
-    return torch.from_numpy(arr).to(device)
-
-
 def _ase_atoms_from_struct(atoms_struct: dict):
-    """Build ASE Atoms from inline input_atoms_struct for live OrbV3 (the disk cache keys by row-index but input_source_idx is a material_id, so it always missed)."""
-    from ase import Atoms
+    """Build ASE Atoms from an input_atoms_struct row."""
     elements = [str(e) for e in atoms_struct["elements"]]
     coords = np.asarray(atoms_struct["coords"], dtype=np.float64)
     lattice = np.asarray(atoms_struct["lattice_mat"], dtype=np.float64)
@@ -201,9 +177,7 @@ def main() -> int:
     ap.add_argument("--alm_checkpoint", required=True)
     ap.add_argument("--atoms_mapper", required=True)
     ap.add_argument("--doping_parquet", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_doping_strain_sub1M.parquet")))
-    ap.add_argument("--cached_embs_root", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "cached_embs_narratives")))
+                    default=Path(os.path.join(ALM_BENCH, "alm_bench/eval/doping.parquet")))
     ap.add_argument("--mattergen_pretrained", default="mattergen_base")
     ap.add_argument("--out_dir", type=Path, required=True)
     ap.add_argument("--max_rows", type=int, default=100)
@@ -216,18 +190,14 @@ def main() -> int:
 
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[eval_doping] writing → {args.out_dir}", flush=True)
+    print(f"[eval_doping] writing to {args.out_dir}", flush=True)
     t0 = time.time()
 
     rows = _select_rows(args.doping_parquet, args.max_rows, args.seed)
     print(f"[eval_doping] {len(rows)} rows (seed={args.seed})", flush=True)
     by_pair = Counter((r["_donor"], r["_dopant"]) for r in rows)
     print(f"[eval_doping] top substitutions: {by_pair.most_common(8)}", flush=True)
-    parents = {r["parent"] for r in rows}
-    print(f"[eval_doping] loading OrbV3 caches for parents: {parents}", flush=True)
-    cache = _load_orbv3_cache(args.cached_embs_root, parents)
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from generate_stage3 import (
         load_alm_and_pl_module, get_alm_embedding,
         build_sampler_and_loader, draw_samples_from_sampler,
@@ -255,7 +225,8 @@ def main() -> int:
             input_atoms = _ase_atoms_from_struct(r["input_atoms_struct"])
             atom_embed = _live_orbv3_features(alm, input_atoms, device)
         except Exception as e:
-            print(f"[eval_doping] {r['row_id']}: live-encode failed ({type(e).__name__}: {e}) → skip", flush=True)
+            print(f"[eval_doping] {r['row_id']}: live-encode failed ({type(e).__name__}: {e}); "
+                  f"counted as {args.K} failed candidates", flush=True)
             structures_per_prompt.append([])
             continue
         json_counts = _target_counts_after_substitution(
@@ -284,49 +255,60 @@ def main() -> int:
             print(f"[eval_doping] generated {i+1}/{len(rows)} prompts in {time.time()-t0:.0f}s", flush=True)
 
     examples = []
-    per_prompt_rates: dict[str, list[float]] = defaultdict(list)
     overall = Counter()
     n_scored = 0
+    n_gen_failed = 0
+    n_prompts_failed = 0
+    score_keys = ("dopant_present", "donor_removed", "ratio_match",
+                  "structurally_valid", "full_substitution", "correct_substitution")
+    failed_score = {"parsed": False, **{k: False for k in score_keys}}
     for i, gens in enumerate(structures_per_prompt):
         r = rows[i]
         donor, dopant = r["_donor"], r["_dopant"]
-        input_struct = _ase_to_struct(r["input_atoms_struct"])
-        if input_struct is None or not gens:
-            continue
+        input_struct = _struct_from_dict(r["input_atoms_struct"])
         per_candidate = []
-        for g in gens:
-            if isinstance(g, Atoms):
-                try:
-                    g = AseAtomsAdaptor.get_structure(g)
-                except Exception:
-                    continue
-            sc = _score_generation(g, donor, dopant, input_struct)
-            per_candidate.append(sc)
-            n_scored += 1
-            for k in ("dopant_present", "donor_removed", "ratio_match",
-                      "structurally_valid", "full_substitution", "correct_substitution"):
-                if sc[k]:
-                    overall[k] += 1
+        if input_struct is not None:
+            for g in gens[:args.K]:
+                # _score_generation marks unconvertible candidates as parsed=False (all wrong).
+                sc = _score_generation(g, donor, dopant, input_struct)
+                per_candidate.append(sc)
+                if sc["parsed"]:
+                    n_scored += 1
+                else:
+                    n_gen_failed += 1
+                for k in score_keys:
+                    if sc[k]:
+                        overall[k] += 1
+        if not per_candidate:
+            n_prompts_failed += 1
+        n_missing = args.K - len(per_candidate)
+        n_gen_failed += n_missing
+        per_candidate.extend([dict(failed_score)] * n_missing)
         examples.append({
             "row_id": r["row_id"],
             "parent": r["parent"],
             "user_prompt": r["user_prompt"],
             "donor": donor,
             "dopant": dopant,
-            "input_formula": str(input_struct.composition.reduced_formula),
+            "input_formula": (str(input_struct.composition.reduced_formula)
+                              if input_struct is not None else None),
             "per_candidate_scores": per_candidate,
             "n_candidates": len(per_candidate),
             "full_substitution_rate": np.mean([sc["full_substitution"] for sc in per_candidate]) if per_candidate else 0.0,
             "correct_substitution_rate": np.mean([sc["correct_substitution"] for sc in per_candidate]) if per_candidate else 0.0,
         })
 
+    n_expected = len(rows) * args.K
     headline = {}
-    if n_scored > 0:
-        for k in ("dopant_present", "donor_removed", "ratio_match",
-                  "structurally_valid", "full_substitution", "correct_substitution"):
-            headline[k] = overall[k] / n_scored
+    if n_expected > 0:
+        for k in score_keys:
+            headline[k] = overall[k] / n_expected
     headline["n_scored"] = n_scored
+    headline["n_expected"] = n_expected
+    headline["n_gen_failed"] = n_gen_failed
+    headline["gen_failed_rate"] = n_gen_failed / n_expected if n_expected else 0.0
     headline["n_prompts"] = len(examples)
+    headline["n_prompts_failed"] = n_prompts_failed
     headline["guidance_factor"] = args.guidance_factor
     headline["K"] = args.K
 
@@ -338,7 +320,8 @@ def main() -> int:
         for e in examples:
             f.write(json.dumps(e) + "\n")
 
-    print(f"\n[eval_doping] HEADLINE ({n_scored} candidates across {len(examples)} prompts):", flush=True)
+    print(f"\n[eval_doping] {n_scored}/{n_expected} candidates scored across {len(examples)} prompts "
+          f"(gen_failed_rate={headline['gen_failed_rate']:.3f}):", flush=True)
     print(f"  dopant_present                = {headline.get('dopant_present', 0):.3f}", flush=True)
     print(f"  donor_removed                 = {headline.get('donor_removed', 0):.3f}", flush=True)
     print(f"  ratio_match                   = {headline.get('ratio_match', 0):.3f}", flush=True)
@@ -347,7 +330,7 @@ def main() -> int:
     print(f"  correct_substitution_rate     = {headline.get('correct_substitution', 0):.3f}", flush=True)
     print(f"  per_prompt_mean_full_sub      = {headline['per_prompt_mean_full_sub']:.3f}", flush=True)
     print(f"  per_prompt_mean_correct_sub   = {headline['per_prompt_mean_correct_sub']:.3f}", flush=True)
-    print(f"[eval_doping] DONE in {time.time()-t0:.0f}s", flush=True)
+    print(f"[eval_doping] done in {time.time()-t0:.0f}s", flush=True)
     return 0
 
 

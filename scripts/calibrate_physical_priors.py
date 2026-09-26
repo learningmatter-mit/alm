@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "alm" / "eval"))
+import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
 from csp_recovery import read_test_rows  # noqa: E402
 
 

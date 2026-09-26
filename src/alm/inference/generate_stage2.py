@@ -1,20 +1,19 @@
 """Generate from a Stage 2 LoRA checkpoint and print prompt + ground-truth + model output."""
 
 import argparse
-import sys
+import os
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "alm"))
 from utils import (
     ArxivAbstractDataset, CamelAIDataset, MaScQADataset,
     FullAtomisticLanguageDataset, GPTNarrativeDataset,
     describe_tasks_for_dataset, property_tasks_for_dataset,
     describe_tasks_for_narrative, applications_tasks_for_narrative,
 )
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "alm" / "eval"))
 from loader import load_alm
+from paths import DATA_ROOT
 
 
 def build_dataset(args, tok):
@@ -66,7 +65,7 @@ def generate_one(model, sample, device, max_new_tokens, temperature, top_p, repe
     labs = sample["labels"].squeeze(0).tolist()
     prompt_ids = [i for i, l in zip(ids, labs) if l == -100]
     target_ids = [i for i, l in zip(ids, labs) if l != -100]
-    # Arxiv (raw LM) has no masked prompt; seed from the first ~50 tokens.
+    # Samples with no masked prompt: seed generation from the first 50 tokens.
     if not prompt_ids:
         prompt_ids = ids[:min(50, len(ids))]
         target_ids = ids[len(prompt_ids):]
@@ -139,13 +138,13 @@ if __name__ == "__main__":
     p.add_argument("--repetition_penalty", type=float, default=1.1)
     p.add_argument("--lora_rank", type=int, default=64)
     p.add_argument("--lora_alpha", type=int, default=128)
-    p.add_argument("--arxiv_parquet", default="/tmp/jarvis_arxiv.parquet")
-    p.add_argument("--camel_jsonl",   default="/tmp/camel_ai.jsonl")
-    p.add_argument("--mascqa_json",   default="/tmp/MaScQA/mascqa-eval.json")
-    p.add_argument("--mascqa_xlsx",   default="/tmp/MaScQA/scoresheets/all_questions.xlsx")
-    p.add_argument("--data_parent_path",        default="/tmp/LLM4Mat-Bench")
-    p.add_argument("--cached_embs_parent_path", default="/tmp/cached_embs")
-    p.add_argument("--narrative_parquet_dir",   default="/tmp/GPT-Narratives-for-Materials")
-    p.add_argument("--narrative_cache_dir",     default="/tmp/cached_embs_narratives")
+    p.add_argument("--arxiv_parquet", default=os.path.join(DATA_ROOT, "jarvis_arxiv.parquet"))
+    p.add_argument("--camel_jsonl",   default=os.path.join(DATA_ROOT, "camel_ai.jsonl"))
+    p.add_argument("--mascqa_json",   default=os.path.join(DATA_ROOT, "MaScQA/mascqa-eval.json"))
+    p.add_argument("--mascqa_xlsx",   default=os.path.join(DATA_ROOT, "MaScQA/scoresheets/all_questions.xlsx"))
+    p.add_argument("--data_parent_path",        default=os.path.join(DATA_ROOT, "LLM4Mat-Bench"))
+    p.add_argument("--cached_embs_parent_path", default=os.path.join(DATA_ROOT, "cached_embs"))
+    p.add_argument("--narrative_parquet_dir",   default=os.path.join(DATA_ROOT, "GPT-Narratives-for-Materials"))
+    p.add_argument("--narrative_cache_dir",     default=os.path.join(DATA_ROOT, "cached_embs_narratives"))
     args = p.parse_args()
     main(args)

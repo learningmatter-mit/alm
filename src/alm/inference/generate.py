@@ -29,6 +29,7 @@ def _build_understand_batch(tokenizer, prompt, atoms=None):
 
 def cmd_understand(args):
     model, tokenizer = load_alm(checkpoint=args.alm_checkpoint, merge_lora=True,
+                                use_cached_embeddings=args.structure is None,  # a structure needs the live OrbV3 encoder
                                 attn_implementation=args.attn_implementation)
     model.eval()
 
@@ -58,17 +59,61 @@ def cmd_generate(args):
         mattergen_pretrained=args.mattergen_pretrained,
         model_path=args.mattergen_model_path,
     )
-    n_batches = max(1, (args.num_samples + args.batch_size - 1) // args.batch_size)
-    generate_for_prompts(
-        prompts=prompts,
-        alm=alm, tokenizer=tokenizer, pl_module=pl_module,
-        out_root=args.out_dir,
-        batch_size=args.batch_size,
-        num_batches=n_batches,
-        diffusion_guidance_factor=args.guidance_factor,
-        diffusion_seed=args.seed,
-    )
-    print(f"[generate] {len(prompts)} prompt(s) x {args.num_samples} sample(s) -> {args.out_dir}")
+    if args.mattergen_model_path is not None:
+        n_ok = _generate_csp(args, prompts, alm, tokenizer, pl_module)
+    else:
+        n_batches = max(1, (args.num_samples + args.batch_size - 1) // args.batch_size)
+        structures = generate_for_prompts(
+            prompts=prompts,
+            alm=alm, tokenizer=tokenizer, pl_module=pl_module,
+            out_root=args.out_dir,
+            batch_size=args.batch_size,
+            num_batches=n_batches,
+            diffusion_guidance_factor=args.guidance_factor,
+            diffusion_seed=args.seed,
+        )
+        n_ok = sum(1 for s in structures if s)
+    print(f"[generate] {n_ok}/{len(prompts)} prompt(s) produced structures -> {args.out_dir}")
+    if n_ok == 0:
+        raise SystemExit(1)
+
+
+def _generate_csp(args, prompts, alm, tokenizer, pl_module):
+    """CSP-mode decoder: the LLM plans a composition, then the decoder samples structures with those atoms fixed."""
+    from pathlib import Path
+    from omegaconf import OmegaConf
+    from mattergen.generator import draw_samples_from_sampler
+    import eval_planner_csp as epc
+    from eval_bridge_csp import build_csp_condition_loader, build_csp_sampler
+    from generate_stage3 import get_alm_embedding
+
+    torch.manual_seed(args.seed)
+    device = next(alm.llm.parameters()).device
+    alm.eval(); pl_module.eval()
+    has_alm = "alm_embedding" in pl_module.diffusion_module.model.cond_fields_model_was_trained_on
+    sampler = build_csp_sampler(pl_module, args.guidance_factor)
+    n_ok = 0
+    for i, prompt in enumerate(prompts):
+        plan_text, parsed = epc.llm_plan(prompt, alm, tokenizer, prompt_version=args.planner_prompt_version)
+        comp, _ = epc.comp_from_plan(parsed, args.planner_prompt_version)
+        if comp is None:
+            print(f"[generate] prompt {i}: could not parse a composition from the planner output: "
+                  f"{(plan_text or '')[:200]!r}")
+            continue
+        print(f"[generate] prompt {i}: planned composition {comp}")
+        alm_emb = get_alm_embedding(alm, tokenizer, prompt, device, json_counts=comp) if has_alm else None
+        out = Path(args.out_dir) / f"prompt_{i:04d}"
+        out.mkdir(parents=True, exist_ok=True)
+        draw_samples_from_sampler(
+            sampler=sampler,
+            condition_loader=build_csp_condition_loader(comp, args.num_samples, alm_emb),
+            properties_to_condition_on=None,
+            output_path=out,
+            cfg=OmegaConf.create({}),
+            record_trajectories=False,
+        )
+        n_ok += 1
+    return n_ok
 
 
 def main():
@@ -83,7 +128,7 @@ def main():
     u.add_argument("--max_new_tokens", type=int, default=512)
     u.add_argument("--attn_implementation", default="flash_attention_2",
                    choices=["flash_attention_2", "sdpa", "eager"],
-                   help="sdpa/eager need no flash-attn build (correctness-equivalent, slightly slower)")
+                   help="Use sdpa or eager if flash-attn is not installed (slower).")
     u.set_defaults(func=cmd_understand)
 
     g = sub.add_parser("generate", help="text description -> crystal structure (CIF)")
@@ -100,6 +145,8 @@ def main():
     g.add_argument("--guidance_factor", type=float, default=1.0)
     g.add_argument("--seed", type=int, default=0)
     g.add_argument("--out_dir", default="./gen_out")
+    g.add_argument("--planner_prompt_version", default="v2",
+                   help="Composition-planner prompt used with a CSP-mode decoder (--mattergen_model_path).")
     g.set_defaults(func=cmd_generate)
 
     args = ap.parse_args()
