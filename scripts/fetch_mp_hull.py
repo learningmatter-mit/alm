@@ -90,10 +90,9 @@ def fetch_via_mp_api(out_path: Path) -> Path:
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--variant", choices=["MP2020", "TRI2024"], default="MP2020",
-                   help="Which MatterGen-bundled hull to use. MP2020 matches the "
-                        "Materials Project default and is what most papers use.")
+                   help="MatterGen-bundled hull (MP2020 = Materials Project 2020 compatibility).")
     p.add_argument("--force", action="store_true",
-                   help="Re-link/re-fetch even if destination already exists.")
+                   help="Re-link or re-fetch even if the destination exists.")
     p.add_argument("--out_dir", type=Path, default=DEST_ROOT,
                    help="Where to place the resolved reference.")
     args = p.parse_args()
@@ -108,7 +107,7 @@ def main():
         print(f"[fetch] preferred marker written: {marker}")
         return 0
 
-    print(f"[fetch] no bundled reference at {MATTERGEN_BUNDLED} — trying mp-api...")
+    print(f"[fetch] no bundled reference at {MATTERGEN_BUNDLED}; trying mp-api")
     out_pkl = args.out_dir / "reference_mp_api.pkl"
     if out_pkl.exists() and not args.force:
         print(f"[fetch] already present: {out_pkl}")

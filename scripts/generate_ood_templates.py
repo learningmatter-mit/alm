@@ -267,17 +267,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--vllm_url", default="http://localhost:8000/v1",
-                    help="vLLM OpenAI-compatible base URL. May be comma-separated to "
-                         "round-robin across multiple servers (one per L40S, etc.).")
+                    help="vLLM OpenAI-compatible base URL(s), comma-separated for round-robin.")
     ap.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507",
                     help="Model name as registered in vLLM.")
     ap.add_argument("--n_calls", type=int, default=2000,
-                    help="Total LLM calls. ~100K raw templates at 50 per call.")
+                    help="Total LLM calls (the default gives about 100K raw templates at 50 per call).")
     ap.add_argument("--templates_per_call", type=int, default=50)
     ap.add_argument("--max_tokens", type=int, default=1500,
-                    help="Output token budget per call. Must satisfy "
-                         "prompt_tokens + max_tokens <= context_length (4096 for Qwen3-4B). "
-                         "1500 is plenty for 50 templates × ~25 tokens each.")
+                    help="Output token budget per call; prompt plus output must fit the context (4096 for Qwen3-4B).")
     ap.add_argument("--concurrency", type=int, default=32,
                     help="Max in-flight requests; vLLM batches across these.")
     ap.add_argument("--seed", type=int, default=42)

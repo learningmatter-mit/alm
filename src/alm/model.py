@@ -25,17 +25,15 @@ class AtomisticLanguageModel(nn.Module):
         self.atom_bidirectional_attention = bool(atom_bidirectional_attention)
         if self.atom_bidirectional_attention and attn_implementation == "flash_attention_2":
             if is_main_process():
-                print(f"[ALM] atom_bidirectional_attention=True forces "
-                      f"attn_implementation='sdpa' (flash_attn_2 requires strict causal)")
+                print("[ALM] atom_bidirectional_attention requires SDPA; switching from flash_attention_2")
             attn_implementation = "sdpa"
-        # Pin all ranks to mem-efficient SDPA: shape-based kernel dispatch otherwise diverges across multi-node DDP ranks and times out NCCL.
+        # Pin SDPA to one kernel so DDP ranks don't dispatch differently and hang NCCL.
         if self.atom_bidirectional_attention:
             torch.backends.cuda.enable_flash_sdp(False)
             torch.backends.cuda.enable_math_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
             if is_main_process():
-                print(f"[ALM] pinned SDPA backend → mem_efficient only "
-                      f"(disables per-call dispatch divergence under multi-node DDP)")
+                print("[ALM] SDPA backend pinned to mem_efficient")
         self.use_last_prompt_token = bool(use_last_prompt_token)
         if bridge_source not in ('atoms_tokens', 'last_k_prompt', 'context_plus_atoms'):
             raise ValueError(
@@ -96,14 +94,11 @@ class AtomisticLanguageModel(nn.Module):
         self.llm.resize_token_embeddings(len(self.tokenizer))
         torch.set_rng_state(rng_state)
 
-        # Seed the K [atoms_i] rows from the <|im_end|> embedding (id 151645) so they start with end-of-turn semantics rather than random.
+        # Optionally copy the <|im_end|> embedding into the [atoms_i] rows so they start from end-of-turn semantics.
         self.init_atoms_tokens_from_eos = bool(init_atoms_tokens_from_eos)
         if self.init_atoms_tokens_from_eos:
-            try:
-                eos_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-                if eos_id is None or eos_id == self.tokenizer.unk_token_id:
-                    eos_id = self.tokenizer.eos_token_id
-            except Exception:
+            eos_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+            if eos_id is None or eos_id == self.tokenizer.unk_token_id:
                 eos_id = self.tokenizer.eos_token_id
             if eos_id is None:
                 raise ValueError("init_atoms_tokens_from_eos=True but tokenizer has no EOS / <|im_end|> token")
@@ -187,7 +182,7 @@ class AtomisticLanguageModel(nn.Module):
                     f"found {len(sample_positions)} in input_ids of len {len(ids)}."
                 )
                 positions_per_sample.append(sample_positions)
-            # Also make the K output [atoms_i] block bidirectional: causal would build [atoms_0] without [atoms_1..7], breaking the set the bridge consumes. Verify contiguity first.
+            # Make the contiguous [atoms_i] block bidirectional too, so each output token sees the whole set.
             if self.atom_bidirectional_attention:
                 for b, sp in enumerate(positions_per_sample):
                     if len(sp) == K and sp[-1] - sp[0] == K - 1:
@@ -392,12 +387,7 @@ class AtomisticLanguageModel(nn.Module):
         for b in range(B):
             for (start, end) in atom_ranges_per_sample[b]:
                 mask_4d[b, start:end, start:end] = 0.0
-        pad_block = (1.0 - padding_mask.to(dtype)).unsqueeze(1) * float("-inf")
-        # torch.where, not multiply: 0 * -inf = NaN.
-        pad_block = torch.where(
-            padding_mask.to(torch.bool).unsqueeze(1),
-            torch.zeros_like(pad_block),
-            torch.full_like(pad_block, float("-inf")),
-        )
+        keep = padding_mask.to(torch.bool).unsqueeze(1)  # (B, 1, L)
+        pad_block = torch.zeros(keep.shape, dtype=dtype, device=device).masked_fill(~keep, float("-inf"))
         mask_4d = mask_4d + pad_block
         return mask_4d.unsqueeze(1)  # (B, 1, L, L)

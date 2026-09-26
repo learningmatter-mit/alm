@@ -4,7 +4,6 @@
 import argparse
 import asyncio
 import json
-import sys
 import os
 import time
 from collections import Counter
@@ -86,8 +85,7 @@ def load_model(mode, bridge_dir, k, device, hf_model_path=None, stage2_checkpoin
     _is_full_ft = mode == "part" and bridge_dir is not None and \
         (Path(bridge_dir) / "llm_full_ft" / "qwen3_state_dict.pt").exists()
     if _is_full_ft:
-        print(f"[knowledge-judge] full-FT checkpoint detected → loading full Qwen3 from "
-              f"{bridge_dir}/llm_full_ft (bridge-LoRA overlay skipped)", flush=True)
+        print(f"[knowledge] loading full-FT weights from {bridge_dir}/llm_full_ft", flush=True)
         alm, tok = load_alm(checkpoint=bridge_dir, merge_lora=True, use_cached_embeddings=True,
                             device=device, num_output_atom_tokens=k)
     else:
@@ -115,12 +113,14 @@ def generate(llm, tok, question, device, max_new=96):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["base", "stage2", "part", "hf"], required=True)
-    ap.add_argument("--bridge_dir", default=None, help="step=N dir (mode=part)")
+    ap.add_argument("--mode", choices=["base", "stage2", "part", "hf"], required=True,
+                    help="base: raw Qwen3; stage2: Stage 2 checkpoint; part: Stage 2 plus the bridge LoRA "
+                         "from --bridge_dir; hf: any HF causal LM.")
+    ap.add_argument("--bridge_dir", default=None, help="Bridge checkpoint step=N dir (mode=part).")
     ap.add_argument("--stage2_checkpoint", default=None,
-                    help="Stage 2 step=N dir (required for mode=stage2, and for mode=part with a LoRA bridge)")
+                    help="Stage 2 step=N dir (required for mode=stage2, and for mode=part with a LoRA bridge).")
     ap.add_argument("--hf_model_path", default=None,
-                    help="external HF causal-LM dir (mode=hf, e.g. CrystalReasoner)")
+                    help="HF causal-LM dir for mode=hf (e.g. CrystalReasoner).")
     ap.add_argument("--tag", required=True)
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--judge_model", default="gpt-4o-mini")
@@ -129,7 +129,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[kret:{args.tag}] loading model (mode={args.mode}) ...", flush=True)
+    print(f"[knowledge] {args.tag}: loading model (mode={args.mode}) ...", flush=True)
     llm, tok, _ = load_model(args.mode, args.bridge_dir, args.k, device, hf_model_path=args.hf_model_path,
                              stage2_checkpoint=args.stage2_checkpoint)
 
@@ -143,7 +143,7 @@ def main():
         r = generate(llm, tok, q, device, max_new=128)
         items.append({"question": q, "keywords": None, "response": r,
                       "kw_pass": None, "loop": detect_loop(r)})
-    print(f"[kret:{args.tag}] generated {len(items)} responses in {time.time()-t0:.0f}s; judging ...", flush=True)
+    print(f"[knowledge] {args.tag}: generated {len(items)} responses in {time.time()-t0:.0f}s; judging ...", flush=True)
 
     from llm_judge import batch_judge, parse_score
     verdicts = asyncio.run(batch_judge(items, build_msgs, model=args.judge_model, concurrency=16))
@@ -157,13 +157,15 @@ def main():
     kw_items = [it for it in items if it["kw_pass"] is not None]
     kw_rate = sum(it["kw_pass"] for it in kw_items) / max(1, len(kw_items))
     loop_rate = sum(it["loop"] for it in items) / max(1, n)
+    # Failed judge calls score 0 and stay in the denominator; judge_n_failed reports how many.
     summary = {"tag": args.tag, "mode": args.mode, "n": n,
+               "judge_n_failed": sum(v is None for v in verdicts),
                "judge_mean_0to2": round(mean_score, 3),
                "judge_frac_score2": round(sum(s == 2 for s in scores) / max(1, n), 3),
                "keyword_pass_rate": round(kw_rate, 3),
                "loop_rate": round(loop_rate, 3)}
     (out_dir / f"{args.tag}.json").write_text(json.dumps({"summary": summary, "items": items}, indent=2))
-    print(f"\n===== KNOWLEDGE RETENTION — {args.tag} =====")
+    print(f"[knowledge] summary ({args.tag}):")
     print(json.dumps(summary, indent=2))
     print(f"wrote {out_dir/f'{args.tag}.json'}", flush=True)
 

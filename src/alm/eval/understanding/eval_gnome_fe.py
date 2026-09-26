@@ -2,16 +2,13 @@
 
 import argparse
 import os
-import sys
 from pathlib import Path
 
 from torch.utils.data import DataLoader, Subset
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils import AtomisticLanguageDataset, _property_task, custom_collate_fn
 
-from loader import load_alm
+from loader import load_alm, resolve_encoder
 from text_generation import generate_batch
 from parsers import detect_leak, extract_number
 from metrics import mae, rmse, mad_mae_ratio
@@ -40,15 +37,8 @@ def main():
     args = p.parse_args()
 
     model, tokenizer = load_alm(checkpoint=args.checkpoint, merge_lora=not args.no_merge_lora)
-    _ATOMISTIC_NAME_BY_DIM = {256: "orb_v3_direct_20_omat", 128: "uma-s-1p1",
-                              640: "pet-mad-xs", 1280: "pet-mad-s"}
-    if args.atomistic_feature_dim is None:
-        args.atomistic_feature_dim = int(model.projector[0].in_features)
-    if args.atomistic_model_name is None:
-        args.atomistic_model_name = _ATOMISTIC_NAME_BY_DIM.get(
-            args.atomistic_feature_dim, "orb_v3_direct_20_omat")
-    print(f"[eval_gnome_fe] atomistic_feature_dim={args.atomistic_feature_dim} "
-          f"→ atomistic_model_name={args.atomistic_model_name}")
+    args.atomistic_model_name, args.atomistic_feature_dim = resolve_encoder(
+        model, args.atomistic_model_name, args.atomistic_feature_dim)
 
     embs = Path(args.cached_embs_root) / "gnome" / "embeddings" / f"{args.atomistic_model_name}_{args.split}_atom.flat.bin"
     csv  = Path(args.data_root) / "gnome" / f"{args.split}.csv"

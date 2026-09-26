@@ -1,4 +1,4 @@
-"""Shared hand-set direction-code helper used by both training and inference."""
+"""Write a fixed +/- direction code into the last conditioning token."""
 
 import torch
 

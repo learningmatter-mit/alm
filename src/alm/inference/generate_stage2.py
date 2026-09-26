@@ -2,19 +2,16 @@
 
 import argparse
 import os
-import sys
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "alm"))
 from utils import (
     ArxivAbstractDataset, CamelAIDataset, MaScQADataset,
     FullAtomisticLanguageDataset, GPTNarrativeDataset,
     describe_tasks_for_dataset, property_tasks_for_dataset,
     describe_tasks_for_narrative, applications_tasks_for_narrative,
 )
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "alm" / "eval"))
 from loader import load_alm
 from paths import DATA_ROOT
 
@@ -68,7 +65,7 @@ def generate_one(model, sample, device, max_new_tokens, temperature, top_p, repe
     labs = sample["labels"].squeeze(0).tolist()
     prompt_ids = [i for i, l in zip(ids, labs) if l == -100]
     target_ids = [i for i, l in zip(ids, labs) if l != -100]
-    # Arxiv (raw LM) has no masked prompt; seed from the first ~50 tokens.
+    # Samples with no masked prompt: seed generation from the first 50 tokens.
     if not prompt_ids:
         prompt_ids = ids[:min(50, len(ids))]
         target_ids = ids[len(prompt_ids):]

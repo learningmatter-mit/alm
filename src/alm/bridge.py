@@ -3,6 +3,18 @@
 import torch
 import torch.nn as nn
 
+# Older checkpoints store these bridge_kind names; map them to the current ones.
+BRIDGE_KIND_ALIASES = {
+    "qformer": "producer-consumer",
+    "qformer_pool": "producer-consumer-pool",
+    "ipadapter": "consumer-only",
+}
+
+
+def canonical_bridge_kind(name: str) -> str:
+    return BRIDGE_KIND_ALIASES.get(name, name)
+
+
 class AtomsMapper(nn.Module):
     def __init__(self, hidden_dim: int = 4096, mid_dim: int = 2048, out_dim: int = 512, K: int = 8):
         super().__init__()

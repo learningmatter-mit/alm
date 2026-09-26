@@ -1,18 +1,16 @@
 """Language retention battery: MMLU, GSM8K, GPQA (Diamond chemistry filter). Run twice (--model alm, --model base); aggregator joins them."""
 
 import argparse
+import os
 import random
-import sys
 from pathlib import Path
 
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from loader import load_alm
-from parsers import detect_leak, extract_choice, extract_number, extract_gsm8k_answer
+from parsers import detect_leak, extract_choice, extract_gsm8k_answer
 from text_generation import _leak_bad_words_ids
 from metrics import accuracy
 from runs import run_dir, write_run
@@ -102,7 +100,7 @@ def main():
     p.add_argument("--base_name", default="Qwen/Qwen3-8B")
     p.add_argument("--task", choices=["mmlu", "gpqa", "gsm8k", "all"], default="all")
     p.add_argument("--mmlu_subjects", default=None,
-                   help="comma list, e.g. high_school_chemistry,college_chemistry; default = full MMLU")
+                   help="Comma-separated MMLU subjects (e.g. high_school_chemistry,college_chemistry); default is all of MMLU.")
     p.add_argument("--mmlu_few_shot", type=int, default=0)
     p.add_argument("--max_samples", type=int, default=200)
     p.add_argument("--max_new_tokens_mcq", type=int, default=8)
@@ -110,8 +108,7 @@ def main():
     p.add_argument("--block_leak_tokens", action="store_true",
                    help="Suppress markdown-image / URL token openers at decode time (off by default).")
     p.add_argument("--atom_bidirectional_attention", action="store_true",
-                   help="Load under bidirectional atom attention. REQUIRED for bidir-trained "
-                        "Stage 2 ckpts (runtime mask flag, not weight-detectable).")
+                   help="Use bidirectional attention over atom tokens; set this for checkpoints trained with it.")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -152,27 +149,31 @@ def main():
             if ok:
                 preds.append(pred)
                 golds.append(gold)
+        # Unparseable and leaked outputs count as wrong: accuracy is over all n_total questions.
+        n_correct = sum(pr == g for pr, g in zip(preds, golds))
         return {f"{name}_n_valid": len(preds),
                 f"{name}_n_total": n_total,
                 f"{name}_n_leaked": n_leaked,
+                f"{name}_n_correct": n_correct,
                 f"{name}_leak_rate": n_leaked / max(1, n_total),
                 f"{name}_validity_rate": len(preds) / max(1, n_total),
-                f"{name}_accuracy": accuracy(preds, golds) if preds else None}
+                f"{name}_accuracy": (n_correct / n_total) if n_total else None,
+                f"{name}_accuracy_valid_only": accuracy(preds, golds) if preds else None}
 
     def _run_gsm():
         n_total = n_leaked = n_valid = n_correct = 0
         for i, (prompt, gold, _) in enumerate(_build_gsm8k_prompts()):
             if args.max_samples and i >= args.max_samples:
                 break
+            try:
+                gold_num = float(gold)
+            except ValueError:
+                continue  # unusable gold label: dataset issue, not a model failure
             n_total += 1
             out = _greedy(llm, tokenizer, prompt, args.max_new_tokens_gsm, device,
                           block_leak_tokens=args.block_leak_tokens)
             leaked = detect_leak(out)
             parsed = extract_gsm8k_answer(out)
-            try:
-                gold_num = float(gold)
-            except ValueError:
-                continue
             valid = parsed is not None and not leaked
             ok = valid and abs(parsed - gold_num) < 1e-3
             row = {"task": "gsm8k", "prompt": prompt[-300:], "generated": out,
@@ -184,12 +185,15 @@ def main():
                 n_valid += 1
             if ok:
                 n_correct += 1
+        # Unparseable and leaked outputs count as wrong: accuracy is over all n_total questions.
         return {"gsm8k_n": n_total,
                 "gsm8k_n_valid": n_valid,
                 "gsm8k_n_leaked": n_leaked,
+                "gsm8k_n_correct": n_correct,
                 "gsm8k_leak_rate": n_leaked / max(1, n_total),
                 "gsm8k_validity_rate": n_valid / max(1, n_total),
-                "gsm8k_accuracy": (n_correct / n_valid) if n_valid else None}
+                "gsm8k_accuracy": (n_correct / n_total) if n_total else None,
+                "gsm8k_accuracy_valid_only": (n_correct / n_valid) if n_valid else None}
 
     if args.task in ("mmlu", "all"):
         metrics.update(_run_mcq("mmlu", _build_mmlu_prompts(args, tokenizer)))
@@ -199,14 +203,13 @@ def main():
         metrics.update(_run_gsm())
 
     # ALM_EVAL_RUN_ID disambiguates run dirs that share `step=N`.
-    import os as _os
-    env_rid = _os.environ.get("ALM_EVAL_RUN_ID")
+    env_rid = os.environ.get("ALM_EVAL_RUN_ID")
     if env_rid:
         rid = f"{args.model}_{env_rid}"
     else:
-        legacy = (Path(args.checkpoint).name if args.checkpoint
-                  else args.base_name.replace('/', '_'))
-        rid = f"{args.model}_{legacy}"
+        ckpt_name = (Path(args.checkpoint).name if args.checkpoint
+                     else args.base_name.replace('/', '_'))
+        rid = f"{args.model}_{ckpt_name}"
     out_dir = run_dir("language_retention",
                       args.checkpoint or args.base_name.replace("/", "_"),
                       run_id=rid)

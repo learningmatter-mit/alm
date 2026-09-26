@@ -103,7 +103,6 @@ async def _one_judge_call(
                             _VERBOSE_REMAINING -= 1
                             print(f"[llm_judge][retry http {status}] sleeping {wait_s:.1f}s "
                                   f"(attempt {attempt+1}/{max_retries})", flush=True)
-                        pass
                     else:
                         body = (await resp.text())[:500]
                         _FAILURE_COUNTS[f"http_{status}"] += 1
@@ -124,9 +123,8 @@ async def _one_judge_call(
             except Exception as exc:
                 _FAILURE_COUNTS[f"other:{type(exc).__name__}"] += 1
                 return None
-        # Sleep outside the semaphore so other workers can proceed.
-        if last_status == 429 or (last_status is not None and 500 <= last_status < 600) or last_status is None:
-            await asyncio.sleep(wait_s)
+        # Every path that reaches here is a retry. Sleep outside the semaphore so other workers can proceed.
+        await asyncio.sleep(wait_s)
     _FAILURE_COUNTS[f"retry_exhausted_http_{last_status}"] += 1
     if _VERBOSE_REMAINING > 0:
         _VERBOSE_REMAINING -= 1

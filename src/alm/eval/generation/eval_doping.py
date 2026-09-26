@@ -14,7 +14,7 @@ import re
 import sys
 import time
 import warnings
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 warnings.filterwarnings("ignore", message=".*Pauling electronegativity.*")
@@ -27,7 +27,7 @@ from ase import Atoms
 from pymatgen.core import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
-from paths import DATA_ROOT  # noqa: E402
+from paths import ALM_BENCH  # noqa: E402
 
 _PATTERNS = [
     r"replacing all ([A-Z][a-z]?) atoms with ([A-Z][a-z]?)",
@@ -51,7 +51,7 @@ def _parse_substitution(prompt: str) -> tuple[str, str] | None:
     return None
 
 
-def _ase_to_struct(atoms_struct: dict) -> Structure | None:
+def _struct_from_dict(atoms_struct: dict) -> Structure | None:
     try:
         elements = [str(e).strip() for e in atoms_struct["elements"]]
         coords = np.asarray(atoms_struct["coords"], dtype=np.float64)
@@ -86,7 +86,6 @@ def _select_rows(parquet_path: Path, max_rows: int, seed: int) -> list[dict]:
 
 def _ase_atoms_from_struct(atoms_struct: dict):
     """Build ASE Atoms from an input_atoms_struct row."""
-    from ase import Atoms
     elements = [str(e) for e in atoms_struct["elements"]]
     coords = np.asarray(atoms_struct["coords"], dtype=np.float64)
     lattice = np.asarray(atoms_struct["lattice_mat"], dtype=np.float64)
@@ -178,7 +177,7 @@ def main() -> int:
     ap.add_argument("--alm_checkpoint", required=True)
     ap.add_argument("--atoms_mapper", required=True)
     ap.add_argument("--doping_parquet", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_doping_strain_sub1M.parquet")))
+                    default=Path(os.path.join(ALM_BENCH, "alm_bench/eval/doping.parquet")))
     ap.add_argument("--mattergen_pretrained", default="mattergen_base")
     ap.add_argument("--out_dir", type=Path, required=True)
     ap.add_argument("--max_rows", type=int, default=100)
@@ -191,7 +190,7 @@ def main() -> int:
 
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[eval_doping] writing → {args.out_dir}", flush=True)
+    print(f"[eval_doping] writing to {args.out_dir}", flush=True)
     t0 = time.time()
 
     rows = _select_rows(args.doping_parquet, args.max_rows, args.seed)
@@ -199,7 +198,6 @@ def main() -> int:
     by_pair = Counter((r["_donor"], r["_dopant"]) for r in rows)
     print(f"[eval_doping] top substitutions: {by_pair.most_common(8)}", flush=True)
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from generate_stage3 import (
         load_alm_and_pl_module, get_alm_embedding,
         build_sampler_and_loader, draw_samples_from_sampler,
@@ -227,7 +225,8 @@ def main() -> int:
             input_atoms = _ase_atoms_from_struct(r["input_atoms_struct"])
             atom_embed = _live_orbv3_features(alm, input_atoms, device)
         except Exception as e:
-            print(f"[eval_doping] {r['row_id']}: live-encode failed ({type(e).__name__}: {e}) → skip", flush=True)
+            print(f"[eval_doping] {r['row_id']}: live-encode failed ({type(e).__name__}: {e}); "
+                  f"counted as {args.K} failed candidates", flush=True)
             structures_per_prompt.append([])
             continue
         json_counts = _target_counts_after_substitution(
@@ -256,7 +255,6 @@ def main() -> int:
             print(f"[eval_doping] generated {i+1}/{len(rows)} prompts in {time.time()-t0:.0f}s", flush=True)
 
     examples = []
-    per_prompt_rates: dict[str, list[float]] = defaultdict(list)
     overall = Counter()
     n_scored = 0
     n_gen_failed = 0
@@ -267,7 +265,7 @@ def main() -> int:
     for i, gens in enumerate(structures_per_prompt):
         r = rows[i]
         donor, dopant = r["_donor"], r["_dopant"]
-        input_struct = _ase_to_struct(r["input_atoms_struct"])
+        input_struct = _struct_from_dict(r["input_atoms_struct"])
         per_candidate = []
         if input_struct is not None:
             for g in gens[:args.K]:
@@ -332,7 +330,7 @@ def main() -> int:
     print(f"  correct_substitution_rate     = {headline.get('correct_substitution', 0):.3f}", flush=True)
     print(f"  per_prompt_mean_full_sub      = {headline['per_prompt_mean_full_sub']:.3f}", flush=True)
     print(f"  per_prompt_mean_correct_sub   = {headline['per_prompt_mean_correct_sub']:.3f}", flush=True)
-    print(f"[eval_doping] DONE in {time.time()-t0:.0f}s", flush=True)
+    print(f"[eval_doping] done in {time.time()-t0:.0f}s", flush=True)
     return 0
 
 

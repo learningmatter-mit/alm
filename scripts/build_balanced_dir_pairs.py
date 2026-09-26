@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build balanced directional polymorph pairs (phases: scan, energy, pair)."""
+"""Build balanced directional polymorph pairs (phases: scan, energy, pair).
+
+Row ids have the form atomtxtbal-{parent}-{src}-to-{tgt}-formation_energy-{direction} (balanced atomtxt pairs).
+"""
 from __future__ import annotations
 
 import argparse
@@ -97,7 +100,6 @@ def _fingerprint(numbers, frac, cell) -> str:
 def phase_scan(args):
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     rng = random.Random(args.seed)
-    pool_rows = {c: [] for c in OUT_SCHEMA.names}  # placeholder; build small dict below
     pool = {"parent": [], "source_idx": [], "reduced_formula": [],
             "n_atoms": [], "atoms_struct": []}
     clusters_out = {}  # parent -> {formula: [source_idx, ...]}
@@ -269,7 +271,7 @@ def phase_pair(args):
                     sk = (parent, src_idx); tk = (parent, tgt_idx)
                     src_a = atoms_by_key[sk]; tgt_a = atoms_by_key[tk]
                     tmpls = TEMPLATES[direction]
-                    h = hash((parent, src_idx, tgt_idx, direction))
+                    h = int(hashlib.md5(f"{parent}-{src_idx}-{tgt_idx}-{direction}".encode()).hexdigest(), 16)
                     out["row_id"].append(
                         f"atomtxtbal-{parent}-{src_idx}-to-{tgt_idx}-formation_energy-{direction}")
                     out["parent"].append(parent)

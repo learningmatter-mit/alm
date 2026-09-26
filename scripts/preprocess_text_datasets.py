@@ -99,7 +99,7 @@ def preprocess_camel(root, dst):
         for p in tqdm(files, desc="camel", unit="file"):
             with open(p) as f:
                 rec = json.load(f)
-            # Raw files have a typo key "topic;" — normalize on the way in.
+            # Raw files have a typo key "topic;"; normalize it on the way in.
             row = {
                 "topic": rec.get("topic;") or rec.get("topic"),
                 "sub_topic": rec.get("sub_topic"),

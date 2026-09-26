@@ -1,4 +1,4 @@
-"""CSP eval with an instruction-tuned LLM planner as front-end to a from-scratch MG-CSP decoder."""
+"""CSP eval with an instruction-tuned LLM planner in front of a CSP-mode MatterGen decoder."""
 from __future__ import annotations
 
 
@@ -20,10 +20,6 @@ from pymatgen.analysis.structure_matcher import StructureMatcher
 from pymatgen.core import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
-# alm/ is not a package; loader.py lives under alm/eval/.
-_ALM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _ALM_ROOT)
-
 from loader import load_alm  # noqa: E402
 from paths import CHECKPOINTS, DATA_ROOT, RUNS  # noqa: E402
 
@@ -41,7 +37,7 @@ PLANNER_SYSTEMS = {
         "\"formula_units\": int, \"target_num_atoms\": int}. The composition must "
         "sum × formula_units to target_num_atoms exactly."
     ),
-    # v2: per-cell counts direct; drops the v1 formula_units indirection that tripped binaries.
+    # v2: total per-cell counts, no formula_units field.
     "v2": (
         "You are a planner for a crystal-structure generator. Given a query, "
         "respond with ONLY a JSON object (no prose, no markdown fences). "
@@ -51,7 +47,7 @@ PLANNER_SYSTEMS = {
         "SrTiO3 with 10 atoms per cell → {\"counts\": {\"Sr\": 2, \"Ti\": 2, \"O\": 6}}. "
         "GaTe with 8 atoms per cell → {\"counts\": {\"Ga\": 4, \"Te\": 4}}."
     ),
-    # v3: v2 + step-by-step + nested-parens + element guard.
+    # v3: v2 plus a step-by-step procedure, parenthesised-group expansion and an element-symbol rule.
     "v3": (
         "You are a planner for a crystal-structure generator. Given a query, "
         "respond with ONLY a JSON object (no prose, no markdown fences).\n"
@@ -78,7 +74,7 @@ PLANNER_SYSTEMS = {
         "  Mg(CoGe)6 with 13 atoms → 13 atoms per fu, Z=1 → {\"counts\": {\"Mg\": 1, \"Co\": 6, \"Ge\": 6}}\n"
         "  La(SiPt)2 with 10 atoms → 5 atoms per fu, Z=2 → {\"counts\": {\"La\": 2, \"Si\": 4, \"Pt\": 4}}"
     ),
-    # v4: LLM emits per-formula-unit only; parser computes Z = target / sum(per_fu).
+    # v4: per-formula-unit counts only; the parser computes Z = target / sum(per_fu).
     "v4": (
         "You are a planner for a crystal-structure generator. Given a formula, "
         "respond with ONLY a JSON object (no prose, no markdown fences).\n"
@@ -103,7 +99,7 @@ PLANNER_SYSTEMS = {
         "  Fe(HO)2   → {\"per_formula_unit\": {\"Fe\": 1, \"H\": 2, \"O\": 2}}\n"
         "  V3(O2F)2  → {\"per_formula_unit\": {\"V\": 3, \"O\": 4, \"F\": 2}}"
     ),
-    # v5: v4 + nested-group emphasis + anti-hallucination + ClO-mode prevention.
+    # v5: v4 plus explicit nested-group expansion and a rule against merged keys such as "ClO".
     "v5": (
         "You are a planner for a crystal-structure generator. Given a formula, "
         "respond with ONLY a JSON object (no prose, no markdown fences).\n"
@@ -257,6 +253,34 @@ def _valid_elements(per_cell: dict) -> bool:
     return True
 
 
+def summarize_csp_rows(results: list[dict]) -> dict:
+    """M@1 / M@K over every targeted row.
+
+    Planner parse failures, generation errors and timeouts count as misses and stay in the
+    denominator; n_gen_failed and gen_failed_rate report them separately.
+    """
+    n = len(results)
+    n_parse_fail = sum(bool(r.get("planner_parse_fail")) for r in results)
+    n_gen_failed = sum(1 for r in results
+                       if not r.get("planner_parse_fail") and not r.get("n_gen"))
+    n_match_n1 = sum(bool(r.get("matched_n1")) for r in results)
+    n_match_nK = sum(bool(r.get("matched_nK")) for r in results)
+    n_planner_correct = sum(bool(r.get("planner_correct")) for r in results)
+    return {
+        "n_rows": n,
+        "n_scored": n - n_parse_fail - n_gen_failed,
+        "n_match_n1": n_match_n1,
+        "n_match_nK": n_match_nK,
+        "match_rate_n1": n_match_n1 / n if n else 0.0,
+        "match_rate_nK": n_match_nK / n if n else 0.0,
+        "planner_parse_fail": n_parse_fail,
+        "n_planner_correct": n_planner_correct,
+        "planner_correct_rate": n_planner_correct / n if n else 0.0,
+        "n_gen_failed": n_gen_failed,
+        "gen_failed_rate": n_gen_failed / n if n else 0.0,
+    }
+
+
 def load_targets(benchmark: str = "mp_20"):
     csv_path = BENCHMARK_CSV[benchmark]
     targets = []
@@ -273,7 +297,7 @@ def load_targets(benchmark: str = "mp_20"):
 
 def load_targets_parquet(parquet_path: Path, max_rows: int = 1000,
                          max_n_atoms: int = 30):
-    """Load (row_id, Structure) from a parquet's `atoms_struct` column: last `max_rows` rows with n_atoms <= max_n_atoms (held-out)."""
+    """Return up to `max_rows` (row_id, Structure) pairs from the end of a pairs parquet, keeping rows with at most `max_n_atoms` atoms."""
     import pyarrow.parquet as pq
     import numpy as np
     table = pq.read_table(parquet_path)
@@ -319,7 +343,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--alm_checkpoint", type=Path,
                     default=Path(os.path.join(CHECKPOINTS, "alm-core")))
-    ap.add_argument("--mg_ckpt_dir", type=Path,
+    ap.add_argument("--mattergen_model_path", "--mg_ckpt_dir", dest="mg_ckpt_dir", metavar="DIR", type=Path,
                     default=Path(os.path.join(RUNS, "csp_backbone")),
                     help="MatterGen CSP checkpoint dir (contains checkpoints/ + config.yaml).")
     ap.add_argument("--max_rows", type=int, default=1000)
@@ -327,32 +351,23 @@ def main():
     ap.add_argument("--guidance_factor", type=float, default=1.0)
     ap.add_argument("--out_dir", type=Path, required=True)
     ap.add_argument("--num_shards", type=int, default=1,
-                    help="Stride sharding factor for parallel GPU launches.")
+                    help="Number of stride shards for parallel GPU launches.")
     ap.add_argument("--shard_idx", type=int, default=0,
-                    help="This worker's shard idx in [0, num_shards). Keeps rows "
-                         "where row_idx %% num_shards == shard_idx.")
+                    help="This worker's shard index; keeps rows where row_idx %% num_shards == shard_idx.")
     ap.add_argument("--use_oracle_comp", action="store_true",
-                    help="Bypass planner; use ground-truth composition. Useful as the "
-                         "no-LLM control inside the same eval harness.")
+                    help="Skip the planner and use the ground-truth composition (no-LLM control).")
     ap.add_argument("--benchmark", default="mp_20",
                     choices=list(BENCHMARK_CSV.keys()),
                     help="MP-20 or MPTS-52 test set (CSV-based).")
     ap.add_argument("--test_parquet", type=Path, default=None,
-                    help="Alternative to --benchmark: a parquet path (stage3a-style "
-                         "with atoms_struct column). When set, loads N=1000 held-out "
-                         "rows from the END of the parquet.")
+                    help="Use a pairs parquet with an atoms_struct column instead of --benchmark (rows taken from its end).")
     ap.add_argument("--prompt_version", default="v1",
                     choices=["v1", "v2", "v3", "v4", "v5"],
-                    help="v1: composition + formula_units indirection. "
-                         "v2: per-cell counts direct. "
-                         "v3: per-cell counts + step-by-step. "
-                         "v4: per-formula-unit only, parser computes Z. "
-                         "v5: v4 + explicit nested-group expansion rule + anti-hallucination "
-                         "+ ClO-mode prevention.")
+                    help="Planner system prompt version (see PLANNER_SYSTEMS); v4 and v5 ask for per-formula-unit counts and the parser scales them to the target cell.")
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[planner-csp] writing → {args.out_dir}", flush=True)
+    print(f"[planner-csp] writing to {args.out_dir}", flush=True)
     t0 = time.time()
 
     if args.test_parquet is not None:
@@ -370,13 +385,11 @@ def main():
         targets = all_targets
         print(f"  {len(targets)} rows from {src}", flush=True)
 
-    # Lazy-import MatterGen (heavy).
+    # MatterGen is imported late because it is slow to import.
     from mattergen.common.utils.data_classes import MatterGenCheckpointInfo
     from mattergen.generator import CrystalGenerator
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Load the LLM planner (skip if using oracle comp, saves ~30 GB GPU RAM).
+    # The planner is not needed with --use_oracle_comp (saves ~30 GB of GPU memory).
     alm = tok = None
     if not args.use_oracle_comp:
         print(f"  loading planner from {args.alm_checkpoint} ...", flush=True)
@@ -389,15 +402,11 @@ def main():
         alm.eval()
         print(f"  planner loaded (t={time.time()-t0:.0f}s)", flush=True)
 
-    print(f"  loading MG-CSP ckpt from {args.mg_ckpt_dir} ...", flush=True)
+    print(f"  loading MatterGen CSP checkpoint from {args.mg_ckpt_dir} ...", flush=True)
     ckpt_info = MatterGenCheckpointInfo(model_path=str(args.mg_ckpt_dir), load_epoch="last")
 
     matcher = StructureMatcher(**TOL)
     results = []
-    n_match_n1 = 0
-    n_match_nK = 0
-    n_planner_correct = 0
-    n_planner_parse_fail = 0
 
     for i, (mp_id, target) in enumerate(targets):
         formula = str(target.composition.reduced_formula)
@@ -418,7 +427,6 @@ def main():
                 parsed, args.prompt_version, target_atoms=n_atoms_target,
             )
             if target_comp is None:
-                n_planner_parse_fail += 1
                 results.append({
                     "row_id": mp_id, "formula": formula,
                     "matched_n1": False, "matched_nK": False, "first_match_idx": -1,
@@ -427,11 +435,9 @@ def main():
                 })
                 continue
             planner_correct = (target_comp == gt_counts)
-            if planner_correct:
-                n_planner_correct += 1
 
         if (i % 5) == 0:
-            extra = "" if args.use_oracle_comp else f"  planner→{target_comp}{'✓' if planner_correct else '✗'}"
+            extra = "" if args.use_oracle_comp else f"  planner={target_comp} correct={planner_correct}"
             print(f"  [{i:3d}/{len(targets)}] {mp_id} {formula} (gt={gt_counts}){extra} "
                   f"t={time.time()-t0:.0f}s", flush=True)
 
@@ -475,10 +481,6 @@ def main():
                         first_match_idx = j
             except Exception:
                 pass
-        if matched_n1:
-            n_match_n1 += 1
-        if matched_nK:
-            n_match_nK += 1
         results.append({
             "row_id": mp_id, "formula": formula,
             "matched_n1": matched_n1, "matched_nK": matched_nK,
@@ -490,13 +492,18 @@ def main():
             "planner_counts": target_comp,
         })
 
-    n = len(results)
+    summary = summarize_csp_rows(results)
+    n = summary["n_rows"]
     headline = {
         "n_rows": n, "K": args.K, "guidance_factor": args.guidance_factor,
-        "match_rate_n1": n_match_n1 / max(1, n),
-        "match_rate_nK": n_match_nK / max(1, n),
-        "planner_correct_rate": n_planner_correct / max(1, n - n_planner_parse_fail) if not args.use_oracle_comp else 1.0,
-        "planner_parse_fail": n_planner_parse_fail,
+        "match_rate_n1": summary["match_rate_n1"],
+        "match_rate_nK": summary["match_rate_nK"],
+        # Unparseable plans count as incorrect.
+        "planner_correct_rate": summary["planner_correct_rate"] if not args.use_oracle_comp else 1.0,
+        "planner_parse_fail": summary["planner_parse_fail"],
+        "n_scored": summary["n_scored"],
+        "n_gen_failed": summary["n_gen_failed"],
+        "gen_failed_rate": summary["gen_failed_rate"],
         "mg_ckpt_dir": str(args.mg_ckpt_dir),
         "alm_checkpoint": str(args.alm_checkpoint),
         "use_oracle_comp": args.use_oracle_comp,
@@ -509,12 +516,13 @@ def main():
             f.write(json.dumps(r) + "\n")
 
     print(f"\n[planner-csp] {src} ({n} rows, K={args.K}):")
-    print(f"  M@1               = {headline['match_rate_n1']:.4f}  ({n_match_n1}/{n})")
-    print(f"  M@K               = {headline['match_rate_nK']:.4f}  ({n_match_nK}/{n})")
+    print(f"  M@1               = {headline['match_rate_n1']:.4f}  ({summary['n_match_n1']}/{n})")
+    print(f"  M@K               = {headline['match_rate_nK']:.4f}  ({summary['n_match_nK']}/{n})")
+    print(f"  gen_failed        = {summary['n_gen_failed']}")
     if not args.use_oracle_comp:
         print(f"  planner_correct   = {headline['planner_correct_rate']:.4f}  "
-              f"({n_planner_correct}/{n - n_planner_parse_fail})")
-        print(f"  planner_parse_fail= {n_planner_parse_fail}")
+              f"({summary['n_planner_correct']}/{n})")
+        print(f"  planner_parse_fail= {summary['planner_parse_fail']}")
     print(f"  total time        = {time.time()-t0:.0f}s")
 
 

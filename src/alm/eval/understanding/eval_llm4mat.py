@@ -2,17 +2,14 @@
 
 import argparse
 import os
-import sys
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))           # alm/eval
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))       # alm/
 from utils import AtomisticLanguageDataset, _DATASET_PROPERTIES, _property_task, custom_collate_fn
 
-from loader import load_alm
+from loader import load_alm, resolve_encoder
 from text_generation import generate_batch
 from parsers import detect_leak, extract_number
 from metrics import mae, mad_mae_ratio
@@ -90,12 +87,12 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True, help="Stage 2 step=N/ dir")
     p.add_argument("--configs", default="mp",
-                   help="comma list (e.g. 'mp,jarvis_dft,oqmd' or 'all' for the 9 staged configs)")
+                   help="Comma-separated LLM4Mat-Bench configs (e.g. 'mp,jarvis_dft,oqmd'), or 'all' for all nine.")
     p.add_argument("--split", default="validation", choices=["validation", "test"])
     p.add_argument("--data_root", default=os.path.join(DATA_ROOT, "LLM4Mat-Bench"))
     p.add_argument("--cached_embs_root", default=os.path.join(DATA_ROOT, "cached_embs"))
     p.add_argument("--max_samples", type=int, default=1000,
-                   help="cap per (config, property); 0 or negative for full split")
+                   help="Max samples per (config, property); 0 or negative for the full split.")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--max_num_tokens", type=int, default=2048)
@@ -106,15 +103,12 @@ def main():
     p.add_argument("--block_leak_tokens", action="store_true",
                    help="Suppress markdown-image / URL token openers at decode time (off by default).")
     p.add_argument("--atomistic_model_name", type=str, default=None,
-                   help="Cache filename prefix (orb_v3_direct_20_omat / uma-s-1p1 / "
-                        "pet-mad-xs / pet-mad-s). Auto-detected from the checkpoint "
-                        "projector's input dim when omitted.")
+                   help="Cache filename prefix (orb_v3_direct_20_omat, uma-s-1p1, pet-mad-xs, pet-mad-s); "
+                        "auto-detected from the checkpoint when omitted.")
     p.add_argument("--atomistic_feature_dim", type=int, default=None,
-                   help="Per-atom feature dim (256 / 128 / 640 / 1280). Auto-"
-                        "detected from the checkpoint projector when omitted.")
+                   help="Per-atom feature dim (256, 128, 640, 1280); auto-detected from the checkpoint when omitted.")
     p.add_argument("--atom_bidirectional_attention", action="store_true",
-                   help="Load under bidirectional atom attention. Required for bidir-trained "
-                        "Stage 2 ckpts (runtime mask flag, not weight-detectable).")
+                   help="Use bidirectional attention over atom tokens; set this for checkpoints trained with it.")
     args = p.parse_args()
 
     if args.configs == "all":
@@ -127,18 +121,9 @@ def main():
                                 base_model=args.llm_name,
                                 merge_lora=not args.no_merge_lora,
                                 atom_bidirectional_attention=args.atom_bidirectional_attention)
-    # Detect encoder from projector input dim so the cache file matches Stage 2.
-    _ATOMISTIC_NAME_BY_DIM = {256: "orb_v3_direct_20_omat", 128: "uma-s-1p1",
-                              640: "pet-mad-xs", 1280: "pet-mad-s"}
-    detected_dim = int(model.projector[0].in_features)
-    if args.atomistic_feature_dim is None:
-        args.atomistic_feature_dim = detected_dim
-    if args.atomistic_model_name is None:
-        args.atomistic_model_name = _ATOMISTIC_NAME_BY_DIM.get(
-            args.atomistic_feature_dim, "orb_v3_direct_20_omat"
-        )
-    print(f"[eval_llm4mat] atomistic_feature_dim={args.atomistic_feature_dim} "
-          f"→ atomistic_model_name={args.atomistic_model_name}")
+    # The cache file must come from the same encoder the checkpoint was trained on.
+    args.atomistic_model_name, args.atomistic_feature_dim = resolve_encoder(
+        model, args.atomistic_model_name, args.atomistic_feature_dim)
 
     out = run_dir("llm4mat", args.checkpoint)
     all_metrics = {"split": args.split, "max_samples": args.max_samples, "by_config": {}}
@@ -156,7 +141,7 @@ def main():
             m, preds = _eval_one(model, ds, prop, args)
             all_metrics["by_config"][config][prop] = m
             all_predictions.extend(preds)
-            print(f"  → {m}")
+            print(f"  {m}")
 
     write_run(out, all_metrics, all_predictions)
 

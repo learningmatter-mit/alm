@@ -9,11 +9,12 @@
 #      `alm_embedding` cond_field (alm_embedding.yaml, backed by bridge.AtomsMapper)
 #      and appends it to PROPERTY_SOURCE_IDS, adds the from-scratch CSP data-module
 #      config (csp_backbone.yaml) and the task_direction embedding config, adds the
-#      GemNetTCtrl IP-Adapter / tenc-fuse bridge, and writes install_for_h200.sh.
-#   3. Marks install_for_h200.sh executable (git diff doesn't preserve +x).
+#      GemNetTCtrl IP-Adapter / tenc-fuse bridge, and writes install_cu128.sh.
+#   3. Marks install_cu128.sh executable (git diff doesn't preserve +x).
 #
-# The ALM bridge modules (src/alm/bridge.py) must be importable at runtime; the
-# patched alm_embedding.yaml references them by bare module name.
+# The patched alm_embedding.yaml references the bridge modules (src/alm/bridge.py)
+# by bare module name. `import alm` puts them on sys.path; MatterGen's own CLIs
+# (mattergen-finetune, mattergen-generate) need PYTHONPATH=<repo>/src/alm.
 #
 # Usage (from repo root):
 #   bash external/setup_mattergen.sh
@@ -59,9 +60,9 @@ else
   echo "  working tree already has edits; skipping (reset --hard to start fresh)."
 fi
 
-echo "[3/3] chmod +x install_for_h200.sh ..."
-chmod +x "$SUBMODULE/install_for_h200.sh" 2>/dev/null || true
+echo "[3/3] chmod +x install_cu128.sh ..."
+chmod +x "$SUBMODULE/install_cu128.sh" 2>/dev/null || true
 
 echo
-echo "MatterGen fork ready. Install it into the alm env (CUDA-12 / torch 2.9):"
-echo "  cd $SUBMODULE && bash install_for_h200.sh && bash build_pyg_for_torch29.sh"
+echo "MatterGen fork ready. Install it into the alm env (CUDA 12, torch 2.9):"
+echo "  cd $SUBMODULE && bash install_cu128.sh && bash build_pyg_for_torch29.sh"

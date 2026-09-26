@@ -1,4 +1,8 @@
-"""App-prompt consistency eval: generate K structures per prompt, relax, then LM-judge property consistency. Shard via --row_start/--row_end; needs OPENAI_API_KEY."""
+"""App-prompt consistency eval: generate K structures per prompt, relax them, then LLM-judge property consistency. Shard via --row_start/--row_end; needs OPENAI_API_KEY.
+
+Every requested generation stays in the per-prompt denominator: structures that fail conversion,
+have Z outside 1-94, get a NaN energy after relaxation or fail characterization score 0.
+"""
 from __future__ import annotations
 
 
@@ -7,7 +11,6 @@ import asyncio
 import hashlib
 import json
 import os
-import sys
 import time
 import warnings
 from collections import defaultdict
@@ -25,12 +28,11 @@ from pymatgen.core import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
 from llm_judge import (  # noqa: E402
     DEFAULT_MODEL, batch_judge, build_app_consistency_messages,
     get_failure_counts, parse_score, reset_failure_counts,
 )
-from paths import DATA_ROOT  # noqa: E402
+from paths import ALM_BENCH  # noqa: E402
 
 
 # Stratified mode samples max_rows/N_categories rows per category.
@@ -111,14 +113,55 @@ def _app_messages(item: dict) -> list[dict]:
 
 
 def _formation_energy_per_atom_from_relaxed(atoms: Atoms) -> float:
-    """Total energy/atom (eV) from MatterSim; elemental reference not subtracted, fine for relative-rank judging."""
+    """Total energy/atom (eV) from MatterSim; no elemental reference is subtracted (fine for relative judging)."""
     e = atoms.info.get("total_energy")
     if e is None:
         return float("nan")
-    try:
-        return float(e) / max(1, len(atoms))
-    except Exception:
-        return float("nan")
+    return float(e) / max(1, len(atoms))
+
+
+def aggregate_scores(row_ids: list[str], scored: list[tuple[str, int]]) -> dict:
+    """Per-prompt mean judge score over every prompt in row_ids (a prompt with no scores gets 0), plus the fraction of 2s over all scores."""
+    per_prompt: dict[str, list[int]] = {rid: [] for rid in row_ids}
+    for rid, sc in scored:
+        per_prompt.setdefault(rid, []).append(sc)
+    per_prompt_mean = {rid: float(np.mean(v)) if v else 0.0 for rid, v in per_prompt.items()}
+    all_scores = [sc for v in per_prompt.values() for sc in v]
+    return {
+        "per_prompt_mean": per_prompt_mean,
+        "overall_consistency_mean_per_prompt": (
+            float(np.mean(list(per_prompt_mean.values()))) if per_prompt_mean else 0.0),
+        "fraction_score_2": float(np.mean([sc == 2 for sc in all_scores])) if all_scores else 0.0,
+    }
+
+
+def _failed_item(row: dict, failure: str, summary: dict | None = None) -> dict:
+    return {"row_id": row["row_id"], "prompt": row["user_prompt"], "failed": True,
+            "failure": failure, **(summary or {})}
+
+
+def flatten_for_relax(structures_per_prompt: list[list], rows: list[dict], K: int):
+    """Collect relaxable structures (first K per prompt); unconvertible, out-of-range-Z and missing generations become failed items."""
+    flat: list = []
+    flat_back_idx: list[tuple[int, int]] = []  # (prompt_i, gen_j)
+    failed_items: list[dict] = []
+    for i, gens in enumerate(structures_per_prompt):
+        for j, g in enumerate(gens[:K]):
+            try:
+                s = g if isinstance(g, Structure) else AseAtomsAdaptor.get_structure(g)
+                zs = [int(site.specie.Z) for site in s]
+            except Exception:
+                failed_items.append(_failed_item(rows[i], "conversion_error"))
+                continue
+            # Z outside [1, 94] makes MatterSim device-assert, which corrupts the CUDA context for the batch.
+            if not zs or any(z < 1 or z > 94 for z in zs):
+                failed_items.append(_failed_item(rows[i], "z_out_of_range"))
+                continue
+            flat.append(s)
+            flat_back_idx.append((i, j))
+        for _ in range(K - min(len(gens), K)):
+            failed_items.append(_failed_item(rows[i], "missing_generation"))
+    return flat, flat_back_idx, failed_items
 
 
 def main() -> int:
@@ -127,51 +170,37 @@ def main() -> int:
     ap.add_argument("--alm_checkpoint", required=True)
     ap.add_argument("--atoms_mapper", required=True)
     ap.add_argument("--app_parquet", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_app.parquet")))
+                    default=Path(os.path.join(ALM_BENCH, "alm_bench/eval/app.parquet")))
     ap.add_argument("--mattergen_pretrained", default="mattergen_base")
     ap.add_argument("--out_dir", type=Path, required=True)
     ap.add_argument("--max_rows", type=int, default=50,
-                    help="Held-out app prompts to evaluate. Hash-deterministic via --seed.")
+                    help="Number of held-out app prompts (hash-selected with --seed).")
     ap.add_argument("--K", type=int, default=20,
                     help="Generations per prompt.")
     ap.add_argument("--guidance_factor", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--stratify_per_category", action="store_true",
-                    help="Sample max_rows/N rows per app category (top-10 categories) "
-                         "instead of hash-random over the full parquet. Lifts perov + "
-                         "tail categories to comparable n with bulk semicond/bandgap.")
+                    help="Sample an equal number of prompts from each application category.")
     ap.add_argument("--judge_model", default=DEFAULT_MODEL)
     ap.add_argument("--judge_concurrency", type=int, default=16)
     ap.add_argument("--judge_only", action="store_true",
-                    help="Skip generation + relax + judge_items construction; "
-                         "read existing predictions.jsonl from --out_dir and re-run "
-                         "ONLY the LLM judge phase. Useful when a prior run hit "
-                         "rate-limit 429s and you don't want to redo relax.")
+                    help="Re-run only the LLM judge on an existing predictions.jsonl in --out_dir.")
     ap.add_argument("--judge_max_per_prompt", type=int, default=0,
-                    help="Cap number of judge calls per prompt (default 0 = no cap). "
-                         "Set to e.g. 3 to dramatically reduce OpenAI API volume when "
-                         "rate-limited. Per-prompt-mean is computed over the sampled "
-                         "subset, so headlines remain comparable.")
+                    help="Cap on judge calls per prompt in --judge_only mode (0 = no cap).")
     ap.add_argument("--mattersim_potential_path", type=str, default=None)
     ap.add_argument("--skip_relax", action="store_true",
-                    help="Skip MatterSim relaxation (judge sees raw generation properties; "
-                         "only useful for fast iteration on the judge prompt).")
+                    help="Skip MatterSim relaxation; the judge sees unrelaxed properties.")
     ap.add_argument("--row_start", type=int, default=0)
     ap.add_argument("--row_end", type=int, default=-1)
     ap.add_argument("--diffusion_seed", type=int, default=1337,
-                    help="Seed for diffusion noise. Per-prompt offset added so "
-                         "reordering doesn't change individual outputs.")
+                    help="Diffusion noise seed; a per-prompt offset keeps outputs independent of prompt order.")
     ap.add_argument("--skip_generation_use_existing", action="store_true",
-                    help="Skip generation; read existing structures from "
-                         "out_dir/generations/<row_id>/generated_crystals_cif.zip. "
-                         "Useful when a prior run crashed during relax/judge but "
-                         "the on-disk CIFs are already there. Avoids reloading ALM + "
-                         "MatterGen and re-running the diffusion sampler.")
+                    help="Skip generation and read out_dir/generations/<row_id>/generated_crystals_cif.zip from a previous run.")
     args = ap.parse_args()
 
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[eval_app] writing → {args.out_dir}", flush=True)
+    print(f"[eval_app] writing to {args.out_dir}", flush=True)
     t0 = time.time()
 
     # --judge_only: replay only the LLM judge phase against existing predictions.jsonl.
@@ -200,6 +229,7 @@ def main() -> int:
             req = ("prompt", "formula", "density", "volume_per_atom",
                    "formation_energy_per_atom", "elements", "space_group", "n_atoms")
             if not all(k in ex for k in req):
+                failed_row_ids.append(ex["row_id"])  # incomplete record scores 0
                 continue
             rid = ex["row_id"]
             if args.judge_max_per_prompt > 0 and per_prompt_count[rid] >= args.judge_max_per_prompt:
@@ -229,9 +259,7 @@ def main() -> int:
         if fc:
             print(f"[eval_app] judge failures: {fc}", flush=True)
 
-        per_prompt: dict[str, list[int]] = defaultdict(list)
-        for rid in failed_row_ids:
-            per_prompt[rid].append(0)
+        scored: list[tuple[str, int]] = [(rid, 0) for rid in failed_row_ids]
         for back_i, verdict in zip(keep_idx, verdicts):
             score = parse_score(verdict, default=0)
             existing[back_i]["judge_score"] = score
@@ -240,16 +268,17 @@ def main() -> int:
             existing[back_i]["extracted_application"] = (
                 verdict.get("extracted_application") if verdict else None
             )
-            per_prompt[existing[back_i]["row_id"]].append(score)
+            scored.append((existing[back_i]["row_id"], score))
 
-        per_prompt_mean = {rid: float(np.mean(scores)) for rid, scores in per_prompt.items() if scores}
-        overall_mean = float(np.mean(list(per_prompt_mean.values()))) if per_prompt_mean else 0.0
-        all_scores = [sc for scores in per_prompt.values() for sc in scores]
-        score_2_rate = float(np.mean([sc == 2 for sc in all_scores])) if all_scores else 0.0
+        agg = aggregate_scores(list(dict.fromkeys(ex["row_id"] for ex in existing)), scored)
+        overall_mean = agg["overall_consistency_mean_per_prompt"]
+        score_2_rate = agg["fraction_score_2"]
+        per_prompt_mean = agg["per_prompt_mean"]
 
         metrics = {
             "n_judge_calls": len(judge_items),
             "n_judge_failures": int(sum(fc.values())) if fc else 0,
+            "n_failed_structures": len(failed_row_ids),
             "judge_model": args.judge_model,
             "judge_only_replay": True,
             "overall_consistency_mean_per_prompt": overall_mean,
@@ -265,10 +294,10 @@ def main() -> int:
                 f.write(json.dumps(ex) + "\n")
         print(f"[eval_app] overall_consistency_mean_per_prompt = {overall_mean:.3f} / 2.0", flush=True)
         print(f"[eval_app] fraction_score_2 = {score_2_rate:.3f}", flush=True)
-        print(f"[eval_app] DONE (judge-only replay) in {time.time()-t0:.0f}s", flush=True)
+        print(f"[eval_app] done (judge-only replay) in {time.time()-t0:.0f}s", flush=True)
         return 0
 
-    # ── 1. Pick rows ──
+    # 1. Pick rows.
     rows = _selected_app_rows(args.app_parquet, args.max_rows, args.seed,
                               stratify_per_category=args.stratify_per_category)
     if args.row_end < 0:
@@ -276,9 +305,7 @@ def main() -> int:
     rows = rows[args.row_start:args.row_end]
     print(f"[eval_app] {len(rows)} prompts (seed={args.seed}, range={args.row_start}-{args.row_end})", flush=True)
 
-    # ── 2. Load model + generate (or skip generation, read existing CIFs) ──
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # alm/
-
+    # 2. Load the model and generate, or read CIFs from a previous run.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     prompts = [r["user_prompt"] for r in rows]
     prompt_ids = [r["row_id"] for r in rows]
@@ -289,43 +316,27 @@ def main() -> int:
         from zipfile import ZipFile
         from pymatgen.io.cif import CifParser
         n_have = 0
-        n_missing = 0
-        kept_rows: list[dict] = []
         structures_per_prompt: list[list] = []
         for r in rows:
             zip_path = gen_root / r["row_id"] / "generated_crystals_cif.zip"
-            if not zip_path.exists():
-                n_missing += 1
-                continue
             gens = []
-            try:
+            if zip_path.exists():
                 with ZipFile(zip_path) as zf:
                     for name in zf.namelist():
                         if not name.endswith(".cif"):
                             continue
                         cif = zf.read(name).decode("utf-8", errors="ignore")
                         try:
-                            s = CifParser.from_str(cif).parse_structures(primitive=False)[0]
-                            gens.append(s)
+                            gens.append(CifParser.from_str(cif).parse_structures(primitive=False)[0])
                         except Exception:
-                            pass
-            except Exception as exc:
-                print(f"[eval_app] error reading {zip_path}: {exc}", flush=True)
-                continue
-            if not gens:
-                n_missing += 1
-                continue
-            kept_rows.append(r)
+                            pass  # the missing slot is scored 0 below
+            n_have += bool(gens)
             structures_per_prompt.append(gens)
-            n_have += 1
-        rows = kept_rows
-        prompts = [r["user_prompt"] for r in rows]
-        prompt_ids = [r["row_id"] for r in rows]
-        print(f"[eval_app] reused on-disk generations: {n_have} prompts found, "
-              f"{n_missing} missing/empty (skipped). "
-              f"Total structures: {sum(len(g) for g in structures_per_prompt)}", flush=True)
+        # Prompts with a missing or empty zip stay in the denominator and score 0.
+        print(f"[eval_app] reused on-disk generations for {n_have}/{len(rows)} prompts "
+              f"({sum(len(g) for g in structures_per_prompt)} structures)", flush=True)
         if n_have == 0:
-            raise SystemExit("No on-disk generations found to reuse — disable --skip_generation_use_existing or check the out_dir path")
+            raise SystemExit(f"no generations found under {gen_root}")
     else:
         from generate_stage3 import generate_for_prompts, load_alm_and_pl_module
         print(f"[eval_app] loading ALM + MatterGen on {device} ...", flush=True)
@@ -345,36 +356,15 @@ def main() -> int:
         )
         print(f"[eval_app] generation done in {time.time()-t0:.0f}s", flush=True)
 
-    # ── 3. Relax + characterize ──
+    # 3. Relax and characterize. Dropped structures become failed items that score 0.
     from structure_metrics import relax_structures_mattersim
-    flat: list = []
-    flat_back_idx: list[tuple[int, int]] = []  # (prompt_i, gen_j)
-    n_filtered_z = 0
-    for i, gens in enumerate(structures_per_prompt):
-        for j, g in enumerate(gens):
-            if isinstance(g, Structure):
-                s = g
-            else:
-                try:
-                    s = AseAtomsAdaptor.get_structure(g)
-                except Exception:
-                    continue
-            # Drop Z outside [1,94] before batched relax: one bad Z device-asserts and corrupts the CUDA context.
-            try:
-                zs = [int(site.specie.Z) for site in s]
-            except Exception:
-                continue
-            if not zs or any(z < 1 or z > 94 for z in zs):
-                n_filtered_z += 1
-                continue
-            flat.append(s)
-            flat_back_idx.append((i, j))
-    if n_filtered_z:
-        print(f"[eval_app] pre-filtered {n_filtered_z} structures with out-of-range Z (kept Z∈[1,94])", flush=True)
+    flat, flat_back_idx, failed_items = flatten_for_relax(structures_per_prompt, rows, args.K)
+    if failed_items:
+        print(f"[eval_app] {len(failed_items)} generations missing or not relaxable "
+              f"(conversion error, Z outside 1-94); they score 0", flush=True)
 
     if args.skip_relax:
         relaxed_atoms = [AseAtomsAdaptor.get_atoms(s) for s in flat]
-        relaxed_atoms = [a for a in relaxed_atoms if a is not None]
     else:
         print(f"[eval_app] MatterSim relaxing {len(flat)} structures ...", flush=True)
         relaxed_atoms, _ = relax_structures_mattersim(
@@ -388,8 +378,6 @@ def main() -> int:
     judge_back_idx: list[tuple[int, int]] = []  # (prompt_i, gen_j)
     # Structures with a NaN energy after relaxation or that fail to characterize are not
     # sent to the judge; they score 0 and stay in the per-prompt denominator.
-    failed_items: list[dict] = []
-    skipped = 0
     for (pi, gj), atoms in zip(flat_back_idx, relaxed_atoms):
         try:
             struct = AseAtomsAdaptor.get_structure(atoms)
@@ -398,8 +386,7 @@ def main() -> int:
             if not (fe == fe) and args.skip_relax:
                 fe = None  # no relaxation was run, so the energy is unknown
             elif not (fe == fe):  # NaN after relaxation
-                failed_items.append({"row_id": rows[pi]["row_id"], "prompt": rows[pi]["user_prompt"],
-                                     "failed": True, "failure": "nan_energy", **summary})
+                failed_items.append(_failed_item(rows[pi], "nan_energy", summary))
                 continue
             judge_items.append({
                 "row_id": rows[pi]["row_id"],
@@ -409,13 +396,11 @@ def main() -> int:
             })
             judge_back_idx.append((pi, gj))
         except Exception:
-            skipped += 1
-            failed_items.append({"row_id": rows[pi]["row_id"], "prompt": rows[pi]["user_prompt"],
-                                 "failed": True, "failure": "characterization_error"})
+            failed_items.append(_failed_item(rows[pi], "characterization_error"))
     print(f"[eval_app] characterized {len(judge_items)} structures; {len(failed_items)} failed "
-          f"(NaN energy or parse error) and score 0", flush=True)
+          f"and score 0", flush=True)
 
-    # ── 4. Batch LLM judge ──
+    # 4. Batch LLM judge.
     reset_failure_counts()
     print(f"[eval_app] dispatching {len(judge_items)} judge calls "
           f"(model={args.judge_model}, concurrency={args.judge_concurrency}) ...", flush=True)
@@ -429,16 +414,16 @@ def main() -> int:
     if fc:
         print(f"[eval_app] judge failures: {fc}", flush=True)
 
-    # ── 5. Aggregate ──
-    per_prompt: dict[str, list[int]] = defaultdict(list)
+    # 5. Aggregate over every selected prompt and every requested generation.
+    scored: list[tuple[str, int]] = []
     examples: list[dict] = []
     for item in failed_items:
-        per_prompt[item["row_id"]].append(0)
+        scored.append((item["row_id"], 0))
         examples.append({**item, "judge_verdict": None, "judge_score": 0,
                          "judge_reason": None, "extracted_application": None})
     for item, verdict in zip(judge_items, verdicts):
         score = parse_score(verdict, default=0)
-        per_prompt[item["row_id"]].append(score)
+        scored.append((item["row_id"], score))
         examples.append({
             **item,
             "judge_verdict": verdict.get("verdict") if verdict else None,
@@ -447,15 +432,18 @@ def main() -> int:
             "extracted_application": verdict.get("extracted_application") if verdict else None,
         })
 
-    per_prompt_mean = {rid: float(np.mean(scores)) for rid, scores in per_prompt.items() if scores}
-    overall_mean = float(np.mean(list(per_prompt_mean.values()))) if per_prompt_mean else 0.0
-    overall_max_score_rate = float(np.mean([s == 2 for scores in per_prompt.values() for s in scores]))
+    agg = aggregate_scores([r["row_id"] for r in rows], scored)
+    per_prompt_mean = agg["per_prompt_mean"]
+    overall_mean = agg["overall_consistency_mean_per_prompt"]
+    overall_max_score_rate = agg["fraction_score_2"]
 
     metrics = {
         "n_prompts": len(rows),
         "n_judge_calls": len(judge_items),
         "n_judge_failures": int(sum(fc.values())) if fc else 0,
         "n_failed_structures": len(failed_items),
+        "n_expected_structures": len(rows) * args.K,
+        "failed_structure_rate": len(failed_items) / max(1, len(rows) * args.K),
         "judge_model": args.judge_model,
         "K": args.K,
         "guidance_factor": args.guidance_factor,
@@ -472,10 +460,10 @@ def main() -> int:
         for ex in examples:
             f.write(json.dumps(ex) + "\n")
 
-    print(f"[eval_app] wrote {args.out_dir}/metrics.json + predictions.jsonl", flush=True)
+    print(f"[eval_app] wrote {args.out_dir}/metrics.json and predictions.jsonl", flush=True)
     print(f"[eval_app] overall_consistency_mean_per_prompt = {overall_mean:.3f} / 2.0", flush=True)
     print(f"[eval_app] fraction_score_2 = {overall_max_score_rate:.3f}", flush=True)
-    print(f"[eval_app] DONE in {time.time()-t0:.0f}s", flush=True)
+    print(f"[eval_app] done in {time.time()-t0:.0f}s", flush=True)
     return 0
 
 

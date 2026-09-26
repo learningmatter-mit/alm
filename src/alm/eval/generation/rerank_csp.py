@@ -1,8 +1,11 @@
-"""Post-hoc re-rank CSP candidates by SMACT charge validity then ORB-v3 energy, rewriting metrics.json with new M@1/M@K'."""
+"""Rerank CSP candidates by SMACT charge validity, then ORB-v3 energy, and recompute M@1 and M@K on the top K_new; writes metrics.json and predictions.jsonl to --out_dir.
+
+Every per-row generation dir counts in the denominator: rows whose extxyz is missing or unreadable
+(failed generation) and rows without a ground-truth structure count as misses.
+"""
 
 import argparse
 import json
-import sys
 import os
 import time
 import warnings
@@ -17,8 +20,6 @@ from pymatgen.io.ase import AseAtomsAdaptor
 
 warnings.filterwarnings("ignore")
 
-# Requires PYTHONPATH to include alm/.
-_ALM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from structure_metrics import (  # noqa: E402
     cdvae_matcher, match_one, validity_charge,
 )
@@ -28,24 +29,21 @@ from paths import DATA_ROOT  # noqa: E402
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--src", required=True, type=Path,
-                   help="directory containing the per-shard subdirs")
+                   help="Directory containing the per-shard subdirs.")
     p.add_argument("--src_prefix", default="", type=str,
-                   help="prefix of shard subdirs. Default empty = match anything; "
-                        "use 'shard_' for MG-CSP-fs layout, or the run's shard-dir prefix "
-                        "for the ALM-CSP layout.")
+                   help="Only use shard subdirs whose name starts with this prefix (default: all).")
     p.add_argument("--gen_dirname", default=None, type=str,
-                   help="name of the per-shard subdir holding per-prompt outputs. "
-                        "Default: auto-detect ('generations' for ALM-CSP, 'gens' for MG-CSP-fs).")
+                   help="Per-shard subdir holding per-row outputs (default: 'generations', falling back to 'gens').")
     p.add_argument("--bench", type=Path,
                    default=Path(os.path.join(DATA_ROOT, "eval_data/csp/mp_20/test.csv")))
     p.add_argument("--K_new", type=int, default=20,
-                   help="top-K' to retain after re-ranking (also evaluated for K=1)")
-    p.add_argument("--K_orig", type=int, default=256, help="original K")
+                   help="Candidates kept after reranking (M@1 is also reported).")
+    p.add_argument("--K_orig", type=int, default=256, help="Original K (recorded in metrics.json).")
     p.add_argument("--out_dir", type=Path, required=True)
     p.add_argument("--orb_model", type=str, default="orb_v3_direct_20_omat")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--limit_rows", type=int, default=None,
-                   help="for smoke-testing")
+                   help="Stop after this many rows.")
     return p.parse_args()
 
 
@@ -87,13 +85,11 @@ class OrbEnergyScorer:
             batch = batch_graphs(graphs)
             out = self.model.predict(batch)
             energies = out["energy"].detach().cpu().tolist()
-        except Exception:
+        except Exception as e:
+            print(f"  [warn] ORB energy prediction failed ({e}); energies set to inf", flush=True)
             return result
         for i, e, n in zip(valid_indices, energies, n_atoms):
-            try:
-                result[i] = float(e) / max(1, n)
-            except Exception:
-                pass
+            result[i] = float(e) / max(1, n)
         return result
 
 
@@ -101,14 +97,30 @@ def load_gt(bench_csv: Path) -> dict[str, Structure]:
     df = pd.read_csv(bench_csv)
     gt = {}
     id_col = "material_id" if "material_id" in df.columns else df.columns[0]
-    cif_col = "cif" if "cif" in df.columns else None
     for _, row in df.iterrows():
         try:
-            s = Structure.from_str(row[cif_col], fmt="cif")
+            s = Structure.from_str(row["cif"], fmt="cif")
             gt[row[id_col]] = s
         except Exception:
             pass
     return gt
+
+
+def summarize_rerank(preds: list[dict], n_rows: int) -> dict:
+    """Match rates over all n_rows (rows without predictions count as misses); RMSE averages over matched rows only (CDVAE convention)."""
+    n_m1 = sum(1 for p in preds if p.get("matched_n1"))
+    n_mK = sum(1 for p in preds if p.get("matched_nK_new"))
+    rmses_n1 = [p["rmse_n1"] for p in preds if p["rmse_n1"] is not None]
+    rmses_nK = [p["rmse_nK_new"] for p in preds if p["rmse_nK_new"] is not None]
+    return {
+        "n_rows": n_rows,
+        "n_match_n1": n_m1,
+        "n_match_nK_new": n_mK,
+        "match_rate@1": n_m1 / n_rows if n_rows else 0.0,
+        "match_rate@K_new": n_mK / n_rows if n_rows else 0.0,
+        "rmse@1_mean": float(np.mean(rmses_n1)) if rmses_n1 else None,
+        "rmse@K_new_mean": float(np.mean(rmses_nK)) if rmses_nK else None,
+    }
 
 
 def main():
@@ -140,8 +152,9 @@ def main():
     new_preds = []
     rerank_stats = {
         "n_rows": 0,
-        "n_with_extxyz": 0,
         "n_skipped": 0,
+        "n_gen_failed": 0,
+        "n_gt_missing": 0,
         "rerank_time_s": 0.0,
     }
 
@@ -161,16 +174,18 @@ def main():
                 break
             row_id = row_dir.name
             extxyz = row_dir / "generated_crystals.extxyz"
+            rerank_stats["n_rows"] += 1
             if not extxyz.exists():
+                # Failed generation: counted as a miss.
+                rerank_stats["n_gen_failed"] += 1
                 rerank_stats["n_skipped"] += 1
                 continue
-            rerank_stats["n_rows"] += 1
-            rerank_stats["n_with_extxyz"] += 1
 
             try:
                 atoms_list = ase.io.read(str(extxyz), ":", format="extxyz")
             except Exception as e:
-                print(f"  [warn] {row_id}: extxyz read failed: {e}")
+                print(f"  [warn] {row_id}: extxyz read failed ({e}); counted as a miss")
+                rerank_stats["n_gen_failed"] += 1
                 rerank_stats["n_skipped"] += 1
                 continue
             if not isinstance(atoms_list, list):
@@ -197,6 +212,7 @@ def main():
 
             ref = gt.get(row_id)
             if ref is None:
+                rerank_stats["n_gt_missing"] += 1
                 rerank_stats["n_skipped"] += 1
                 continue
 
@@ -232,23 +248,16 @@ def main():
         if args.limit_rows and rerank_stats["n_rows"] >= args.limit_rows:
             break
 
-    n_scored = len([p for p in new_preds if p.get("matched_n1") is not None])
-    n_m1 = sum(1 for p in new_preds if p.get("matched_n1"))
-    n_mK = sum(1 for p in new_preds if p.get("matched_nK_new"))
-    rmses_n1 = [p["rmse_n1"] for p in new_preds if p["rmse_n1"] is not None]
-    rmses_nK = [p["rmse_nK_new"] for p in new_preds if p["rmse_nK_new"] is not None]
     metrics = {
-        "n_rows": rerank_stats["n_rows"],
-        "n_with_extxyz": rerank_stats["n_with_extxyz"],
+        **summarize_rerank(new_preds, rerank_stats["n_rows"]),
         "n_skipped": rerank_stats["n_skipped"],
+        "n_gen_failed": rerank_stats["n_gen_failed"],
+        "n_gt_missing": rerank_stats["n_gt_missing"],
         "K_orig": args.K_orig,
         "K_new": args.K_new,
-        "match_rate@1": n_m1 / max(1, rerank_stats["n_rows"]),
-        "match_rate@K_new": n_mK / max(1, rerank_stats["n_rows"]),
-        "rmse@1_mean": float(np.mean(rmses_n1)) if rmses_n1 else None,
-        "rmse@K_new_mean": float(np.mean(rmses_nK)) if rmses_nK else None,
         "rerank_time_s": rerank_stats["rerank_time_s"],
     }
+    n_m1, n_mK = metrics["n_match_n1"], metrics["n_match_nK_new"]
     out_metrics = args.out_dir / "metrics.json"
     out_preds = args.out_dir / "predictions.jsonl"
     json.dump(metrics, open(out_metrics, "w"), indent=2)
@@ -257,15 +266,15 @@ def main():
             f.write(json.dumps(p) + "\n")
 
     print()
-    print(f"[rerank] DONE — {rerank_stats['n_rows']} rows, "
+    print(f"[rerank] done: {rerank_stats['n_rows']} rows ({rerank_stats['n_gen_failed']} failed generations), "
           f"rerank wallclock {rerank_stats['rerank_time_s']:.1f}s")
     print(f"  M@1     (new) = {metrics['match_rate@1']:.3f}  ({n_m1}/{rerank_stats['n_rows']})")
     print(f"  M@{args.K_new:<3d}  (new) = {metrics['match_rate@K_new']:.3f}  ({n_mK}/{rerank_stats['n_rows']})")
     rmK = metrics.get("rmse@K_new_mean")
     if rmK is not None:
         print(f"  RMSE@K_new   = {rmK:.4f}")
-    print(f"  → metrics:    {out_metrics}")
-    print(f"  → predictions:{out_preds}")
+    print(f"  metrics:     {out_metrics}")
+    print(f"  predictions: {out_preds}")
 
 
 if __name__ == "__main__":

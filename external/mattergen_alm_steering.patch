@@ -120,11 +120,11 @@ index e85a43c..0000000
 @@ -1,2 +1,0 @@
 -alex_mp_20.zip filter=lfs diff=lfs merge=lfs -text
 -mp_20.zip filter=lfs diff=lfs merge=lfs -text
-diff --git a/install_for_h200.sh b/install_for_h200.sh
+diff --git a/install_cu128.sh b/install_cu128.sh
 new file mode 100644
 index 0000000..bd4489b
 --- /dev/null
-+++ b/install_for_h200.sh
++++ b/install_cu128.sh
 @@ -0,0 +1,109 @@
 +#!/usr/bin/env bash
 +# Install mattergen (this fork) into the active conda env or venv.
@@ -141,11 +141,11 @@ index 0000000..bd4489b
 +#
 +# Usage (a), fresh env:
 +#   conda create -n mattergen python=3.10 -y && conda activate mattergen
-+#   cd external/mattergen && bash install_for_h200.sh
++#   cd external/mattergen && bash install_cu128.sh
 +#
 +# Usage (b), existing ALM env:
 +#   conda activate alm
-+#   cd external/mattergen && bash install_for_h200.sh
++#   cd external/mattergen && bash install_cu128.sh
 +
 +set -euo pipefail
 +
@@ -977,11 +977,11 @@ index 0000000..24f00b7
 +#
 +# ChemGraph["alm_embedding"] is a (K * llm_hidden_dim,) = (32768,) float32 vector
 +# per structure: the K=8 Qwen3-8B hidden states at the [atoms_i] output token
-+# positions for the text prompt, concatenated. AtomsMapper reshapes it to
-+# (B, K, hidden_dim), projects each position to (B, K, out_dim), then mean-pools
-+# over K to (B, 512). That vector flows through the adapter's cond_adapt path
-+# into GemNetTCtrl, and the gradient of L_diff flows back through AtomsMapper
-+# into the LLM. AtomsMapper has about 9M params.
++# positions for the text prompt, concatenated. This default pool bridge
++# (bridge.AtomsMapper, about 9M params) reshapes it to (B, K, hidden_dim),
++# projects each position, and mean-pools over K to (B, 512). The other
++# bridge_kind values in the Stage 3 trainer swap in a sequence-capable bridge.
++# The gradient of L_diff flows back through the bridge into the LLM.
 +#
 +# GemNetTAdapter.__init__ rewrites unconditional_embedding_module to
 +# ZerosEmbedding, so the choice here does not matter; EmbeddingVector matches
@@ -1449,8 +1449,8 @@ index 2ce2504..6e516a0 100644
 -"torchvision==0.19.1; sys_platform == 'darwin'",
 -"torchaudio==2.4.1; sys_platform == 'darwin'",
 +# Loosened from upstream's torch 2.2.1+cu118 (recent GPUs need CUDA 12.x). The range
-+# covers both a fresh env (torch 2.5.1+cu124 from install_for_h200.sh) and an
-+# existing ALM env (torch 2.9.0+cu128). install_for_h200.sh installs torch only if
++# covers both a fresh env (torch 2.5.1+cu124 from install_cu128.sh) and an
++# existing ALM env (torch 2.9.0+cu128). install_cu128.sh installs torch only if
 +# it is missing.
 +"torch>=2.5,<2.10; sys_platform == 'linux'",
 +"torchvision>=0.20,<0.25; sys_platform == 'linux'",
@@ -1467,7 +1467,7 @@ index 2ce2504..6e516a0 100644
  
 +# uv overrides retargeted from cu118 to cu128 to match torch 2.9.x. pip does not
 +# read [tool.uv.sources] / [tool.uv.index]; for pip installs run
-+# `bash install_for_h200.sh`, which detects the installed torch (2.5 to 2.9) and
++# `bash install_cu128.sh`, which detects the installed torch (2.5 to 2.9) and
 +# pulls matching PyG wheels.
  [tool.uv.sources]
  torch = { index = "pytorch_linux",  marker = "sys_platform == 'linux'" }

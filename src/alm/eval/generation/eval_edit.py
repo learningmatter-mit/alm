@@ -1,5 +1,9 @@
 #!/usr/bin/env python
-"""Per-task instruction-following editing eval for the planner-stage bridge checkpoint (polymorph/doping/app/atomtxt/strain/describe/ood). App task needs OPENAI_API_KEY."""
+"""Evaluate structure editing and text-to-structure tasks (polymorph, doping, strain, atomtxt, app, describe, ood) on a bridged checkpoint. The app task needs OPENAI_API_KEY.
+
+Each prompt contributes K candidate slots; bad inputs, generation failures and unconvertible
+candidates count as wrong and stay in the denominator (see gen_failed_rate).
+"""
 from __future__ import annotations
 
 
@@ -8,7 +12,6 @@ import hashlib
 import json
 import os
 import re
-import sys
 import time
 import warnings
 from collections import Counter
@@ -20,9 +23,6 @@ warnings.filterwarnings("ignore", message=".*fractional coordinates.*")
 import numpy as np
 import pyarrow.parquet as pq
 import torch
-
-_ALM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 from ase import Atoms
 from pymatgen.core import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
@@ -57,19 +57,20 @@ def _sega_prompts(prop: str, direction: int) -> tuple[str, str]:
     return base.format(p=asked_phrase), base.format(p=opp_phrase)
 
 from structure_metrics import validity_geom, validity_charge
-from paths import DATA_ROOT, CHECKPOINTS, RUNS
+from paths import CHECKPOINTS, RUNS, ALM_BENCH
 
 
 DEFAULT_PARQUET = {
-    "polymorph": os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_polymorph_under_hull.parquet"),
-    "doping": os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_doping_strain_sub1M.parquet"),
-    # strain shares the doping parquet; the dV_±X.XXpct target is in the row_id.
-    "strain": os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_doping_strain_sub1M.parquet"),
-    "app": os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_app.parquet"),
-    "atomtxt": os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_atomtxt.parquet"),
-    # describe/ood: text->structure recovery (no input); describe verbose, ood terse, same materials.
-    "describe": os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs.parquet"),
-    "ood": os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_ood.parquet"),
+    "polymorph": os.path.join(ALM_BENCH, "alm_bench/eval/polymorph.parquet"),
+    "doping": os.path.join(ALM_BENCH, "alm_bench/eval/doping.parquet"),
+    # strain shares the doping rows; the dV_+X.XXpct target volume change is in the row_id.
+    "strain": os.path.join(ALM_BENCH, "alm_bench/eval/doping.parquet"),
+    "app": os.path.join(ALM_BENCH, "alm_bench/eval/app.parquet"),
+    "atomtxt": os.path.join(ALM_BENCH, "alm_bench/eval/atomtxt.parquet"),
+    "ood": os.path.join(ALM_BENCH, "alm_bench/eval/ood.parquet"),
+    # describe: text->structure recovery from the verbose narrative prompts. ALM-Bench has no
+    # held-out describe split, so this samples the pretraining describe bucket.
+    "describe": os.path.join(ALM_BENCH, "pretraining/describe.parquet"),
 }
 
 # dV_±X.XXpct target volume-change (strain task), encoded in the row_id.
@@ -93,7 +94,7 @@ _DOPING_PLANNER_TMPL = (
 )
 
 
-# ── X→Y substitution parsing ─────────────────────────────────────────────────
+# X-to-Y substitution parsing.
 _PATTERNS = [
     r"replacing all ([A-Z][a-z]?) atoms with ([A-Z][a-z]?)",
     r"substitute ([A-Z][a-z]?) sites with ([A-Z][a-z]?)",
@@ -115,7 +116,7 @@ def _parse_substitution(prompt: str):
     return None
 
 
-# ── inline atoms_struct → ASE / pymatgen ─────────────────────────────────────
+# Inline atoms_struct to ASE / pymatgen.
 def _ase_atoms_from_struct(atoms_struct: dict) -> Atoms:
     elements = [str(e) for e in atoms_struct["elements"]]
     coords = np.asarray(atoms_struct["coords"], dtype=np.float64)
@@ -126,7 +127,7 @@ def _ase_atoms_from_struct(atoms_struct: dict) -> Atoms:
     return Atoms(symbols=elements, scaled_positions=coords, cell=lattice, pbc=True)
 
 
-def _ase_to_struct(atoms_struct: dict):
+def _struct_from_dict(atoms_struct: dict):
     try:
         elements = [str(e).strip() for e in atoms_struct["elements"]]
         coords = np.asarray(atoms_struct["coords"], dtype=np.float64)
@@ -172,7 +173,7 @@ def _per_cell_counts(struct: Structure) -> dict:
     return dict(Counter(_elem(s) for s in struct))
 
 
-# ── row selection (hash-deterministic, sharded) ─────────────────────────────
+# Row selection (hash-deterministic, sharded).
 def _select_rows(parquet_path: Path, task: str, max_rows: int, seed: int,
                  num_shards: int, shard_idx: int, row_start: int = 0,
                  atomtxt_property: str | None = None) -> list[dict]:
@@ -228,81 +229,52 @@ def main() -> int:
                     choices=["polymorph", "doping", "app", "atomtxt", "strain",
                              "describe", "ood"])
     ap.add_argument("--strain_tol_pct", type=float, default=5.0,
-                    help="strain only: tolerance (in percentage points) on the relaxed "
-                         "volume-change match. strain_correct = doping_correct AND "
-                         "|relaxed dV%% - target dV%%| < strain_tol_pct.")
+                    help="strain: tolerance in percentage points on |relaxed dV%% - target dV%%| for strain_correct.")
     ap.add_argument("--atomtxt_property", default="all",
                     choices=["all", "formation_energy", "density", "volume"],
-                    help="atomtxt only: restrict the eval set to one property so each "
-                         "property gets a clean fixed-N slice (band_gap is never scored "
-                         "— no predictor). 'all' keeps the natural mixed distribution.")
+                    help="atomtxt: restrict the eval set to one property ('all' keeps the natural mix; band_gap is never scored).")
     ap.add_argument("--doping_via_planner", action="store_true",
-                    help="Doping: have the LLM planner emit the substituted composition "
-                         "from text (input formula + edit), then CSP that composition "
-                         "with the bridge off (planner-to-CSP path). "
-                         "correct_substitution then = planner emitted right comp AND CSP "
-                         "produced a valid structure.")
+                    help="doping: have the LLM planner predict the substituted composition, then run CSP on it with the bridge off.")
     ap.add_argument("--alm_checkpoint", type=Path,
                     default=Path(os.path.join(CHECKPOINTS, "alm-core")),
-                    help="Stage-2 base ckpt (merged r=64 LoRA + projector). The fresh "
-                         "r=8 bridge LoRA is applied on top from the ckpt's lora_adapter/.")
+                    help="Stage-2 base checkpoint; the bridge LoRA from the Stage-3 checkpoint is applied on top.")
     ap.add_argument("--atoms_mapper", type=Path, required=True,
-                    help="The bridge ckpt's step=N/atoms_mapper.pt. bridge_lora_dir "
-                         "auto-derives to its sibling lora_adapter/.")
+                    help="atoms_mapper.pt from a Stage-3 step=N dir (its sibling lora_adapter/ is the default bridge LoRA).")
     ap.add_argument("--bridge_lora_dir", type=Path, default=None,
-                    help="Override the fresh r=8 bridge LoRA dir "
-                         "(default: <atoms_mapper parent>/lora_adapter). "
-                         "Pass 'none' to skip (debug: Stage-2 LoRA only).")
+                    help="Bridge LoRA dir (default: <atoms_mapper parent>/lora_adapter; 'none' skips it).")
     ap.add_argument("--mattergen_model_path", type=str,
                     default=os.path.join(RUNS, "csp_backbone"),
-                    help="LOCAL csp_backbone CSP-mode backbone dir (config.yaml + checkpoints/).")
+                    help="CSP-mode MatterGen backbone directory (config.yaml + checkpoints/).")
     ap.add_argument("--parquet", type=Path, default=None,
-                    help="Task parquet (default: per-task under stage3_outputs/stage3a/).")
+                    help="Task parquet (default: $ALM_DATA_ROOT/ALM-Bench/alm_bench/eval/<task>.parquet; strain reads eval/doping.parquet, describe reads pretraining/describe.parquet).")
     ap.add_argument("--max_rows", type=int, default=100)
     ap.add_argument("--row_start", type=int, default=0,
-                    help="Offset into the hash-sorted candidate pool; lets parallel jobs cover "
-                         "disjoint row windows (e.g. multi-node FK gen) without duplication.")
+                    help="Offset into the hash-sorted row pool, so parallel jobs can cover disjoint windows.")
     ap.add_argument("--K", type=int, default=8, help="Candidates per prompt.")
     ap.add_argument("--guidance_factor", type=float, default=0.0,
-                    help="CFG guidance scale on the alm_embedding bridge "
-                         "(0 = pure conditional; the bridge should matter for editing).")
+                    help="CFG guidance scale on the alm_embedding bridge (0 = pure conditional).")
     ap.add_argument("--diffusion_steps", type=int, default=None)
     ap.add_argument("--diffusion_seed", type=int, default=1337)
     ap.add_argument("--gen_retries", type=int, default=2,
-                    help="Retries per row, each with a new seed, when generation fails "
-                         "with a GemNet empty-graph device error. 0 disables retries.")
+                    help="Retries per row, with a new diffusion seed, after a GemNet empty-graph error (0 = no retry).")
     ap.add_argument("--strict_n_scored", action="store_true",
-                    help="Hard-exit(2) when this shard scored 0 rows. Default OFF "
-                         "for sharded runs: a shard that scored 0 writes "
-                         "metrics.json (n_scored=0) and exits 0 so surviving shards "
-                         "still aggregate; the run-level aggregator FATALs only when "
-                         "EVERY shard scored 0. Turn ON for a single-shard/manual "
-                         "run where 0 truly is total failure.")
-    ap.add_argument("--handset_direction", action="store_true",
-                    help="Thread each row's requested direction (_direction = +1 higher / "
-                         "-1 lower) into get_alm_embedding so the 9th [atoms_i] hidden block "
-                         "is overwritten with the same hand-set code used at training. "
-                         "Without this the trained direction channel is inert at eval. "
-                         "Use ONLY for --num_output_atom_tokens 9 handset checkpoints.")
-    ap.add_argument("--scalar_direction", action="store_true",
-                    help="Stamp the row's requested ±1 as the scalar task_direction "
-                         "cond_field (SetProperty) at sampling, so CFG (guidance_factor) "
-                         "steers it. Use ONLY for checkpoints trained with "
-                         "--use_task_direction_cond.")
-    # SEGA CFG (atomtxt): s = s_null + sega_g*(s_asked - s_opp); opp branch isolates the directional residual.
+                    help="Exit with status 2 if this shard scores no rows (by default sharded runs exit 0 so other shards can still be aggregated).")
+    ap.add_argument("--handset_direction", "--handset_direction_token", dest="handset_direction", action="store_true",
+                    help="Overwrite the last [atoms_i] block with each row's hand-set direction code (for checkpoints trained with 9 output atom tokens and a hand-set direction token).")
+    ap.add_argument("--scalar_direction", "--use_task_direction_cond", dest="scalar_direction", action="store_true",
+                    help="Stamp the requested direction (+1/-1) as the task_direction cond field (for checkpoints trained with --use_task_direction_cond).")
+    # SEGA CFG (atomtxt): s = s_null + sega_g * (s_asked - s_opp); the opposite prompt isolates the directional part.
     ap.add_argument("--sega_difference", action="store_true",
                     help="atomtxt: enable prompt-difference (SEGA) CFG on the bridge.")
     ap.add_argument("--sega_g", type=float, default=3.0,
-                    help="SEGA guidance scale on (s_asked - s_opp). Extrapolative; "
-                         "3-7 typical. Replaces --guidance_factor when --sega_difference.")
+                    help="SEGA guidance scale on (s_asked - s_opp), typically 3-7; replaces --guidance_factor.")
     # Feynman-Kac directional steering (atomtxt): n_particles=K SMC ensemble, signed-property reward.
     ap.add_argument("--fk", action="store_true",
                     help="Enable FK directional steering (atomtxt only).")
     ap.add_argument("--fk_lambda", type=float, default=0.5)
     ap.add_argument("--fk_resample_every", type=int, default=10)
     ap.add_argument("--fk_t_start_frac", type=float, default=0.5,
-                    help="Fraction of the schedule after which FK resampling starts "
-                         "(0.5 = late half only — where x̂₀ energy is meaningful).")
+                    help="Fraction of the schedule after which FK resampling starts (0.5 = second half only).")
     ap.add_argument("--fk_log_w_clip", type=float, default=50.0)
     ap.add_argument("--fk_potential", type=str, default="diff",
                     choices=["diff", "sum", "max"])
@@ -311,85 +283,68 @@ def main() -> int:
     ap.add_argument("--num_shards", type=int, default=1)
     ap.add_argument("--shard_idx", type=int, default=0)
     ap.add_argument("--out_dir", type=Path, required=True)
-    # StructureMatcher tolerances (CDVAE / CrystaLLM defaults), polymorph distinctness.
+    # StructureMatcher tolerances (CDVAE / CrystaLLM defaults) for distinctness checks.
     ap.add_argument("--ltol", type=float, default=0.3)
     ap.add_argument("--stol", type=float, default=0.5)
     ap.add_argument("--angle_tol", type=float, default=10.0)
     # MatterSim relax (polymorph energy + app characterization).
     ap.add_argument("--skip_relax", action="store_true",
-                    help="Skip MatterSim relax. For polymorph this disables the PRIMARY "
-                         "lower-energy metric; for app the judge sees raw-gen properties.")
+                    help="Skip MatterSim relaxation (disables the polymorph lower-energy metric; the app judge sees unrelaxed properties).")
     ap.add_argument("--single_point_energy", action="store_true",
-                    help="atomtxt: score the formation_energy direction on the RAW generated "
-                         "geometry via MatterSim single-point (max_n_steps=0), not the relaxed "
-                         "energy. Sanity check on whether the bridge moves energy pre-relaxation.")
+                    help="atomtxt: score the formation_energy direction with a MatterSim single-point energy on the unrelaxed geometry.")
     ap.add_argument("--save_gens", type=Path, default=None,
-                    help="atomtxt: write every generated structure with its input, prompt, "
-                         "requested direction, relaxed energies and direction_correct to "
-                         "<save_gens>/gens_shard{idx}.parquet.")
+                    help="atomtxt: write every scored generation with its input and scores to <save_gens>/gens_shard{idx}.parquet.")
     ap.add_argument("--save_cifs", type=Path, default=None,
-                    help="Showcase dump (all tasks): after scoring, for the first "
-                         "--save_cifs_max rows whose per-task success flag is True, write "
-                         "the INPUT structure (if any) + the first SUCCESSFUL generated "
-                         "candidate as CIF into <save_cifs>/, plus one metadata JSON line per "
-                         "saved example to <save_cifs>/saved_meta.jsonl (row_id, prompt, "
-                         "target, why-success). Read-only on the eval itself.")
+                    help="Write the input and first successful generation as CIFs for up to --save_cifs_max successful rows, with metadata in saved_meta.jsonl.")
     ap.add_argument("--save_cifs_max", type=int, default=2,
-                    help="Max number of successful examples to dump per task (default 2).")
+                    help="Maximum number of successful examples to write per task.")
     ap.add_argument("--mattersim_potential_path", type=str, default=None)
     # App-judge controls (mirror eval_app_consistency).
     ap.add_argument("--prompt_version", default="v2",
                     choices=["v1", "v2", "v3", "v4", "v5"],
-                    help="Planner JSON format for the app composition (v2 = {'counts':{}} "
-                         "= what these ckpts were trained on).")
+                    help="Planner JSON format; v2 ({'counts': {...}}) matches the released checkpoints.")
     ap.add_argument("--judge_model", default="gpt-4o-mini")
     ap.add_argument("--judge_concurrency", type=int, default=16)
     dir_grp = ap.add_argument_group("directional editing (optional)")
     dir_grp.add_argument("--cot_tokens", type=int, default=0,
-                    help="CoT-then-atoms: sample this many free-form LLM tokens before "
-                         "the K=[atoms_i] block so the bridge reads reasoning context. "
-                         "0 = off (deterministic).")
+                    help="Sample this many free-form LLM tokens before the [atoms_i] block (0 = off).")
     dir_grp.add_argument("--llm_temperature", type=float, default=1.0,
                     help="Sampling temperature for the CoT prefix (ignored if cot_tokens=0).")
     dir_grp.add_argument("--cot_top_p", type=float, default=0.9,
                     help="Nucleus cutoff for the CoT prefix (ignored if cot_tokens=0).")
     dir_grp.add_argument("--whiten_common_mode", action="store_true",
-                    help="common-mode whitening (atomtxt): subtract the eval-set MEAN "
-                         "bridge cond from every row before the consumer, leaving only the "
-                         "directional residual. Two-pass.")
+                    help="atomtxt: subtract the eval-set mean bridge embedding from every row (two passes).")
     dir_grp.add_argument("--atoms_before_json", action="store_true",
-                    help="For checkpoints whose model emits [atoms_i] BEFORE the {counts} "
-                         "JSON: inference must build the assistant turn the same way, else "
-                         "the bridge reads OOD positions.")
+                    help="Place [atoms_i] before the counts JSON in the assistant turn (for checkpoints trained that way).")
     args = ap.parse_args()
 
     if args.parquet is None:
         args.parquet = Path(DEFAULT_PARQUET[args.task])
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[bridge-edit] task={args.task} writing → {args.out_dir}", flush=True)
+    print(f"[bridge-edit] task={args.task} writing to {args.out_dir}", flush=True)
     t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── 1. Select rows (+ shard) ──
+    # 1. Select rows and shard.
     rows = _select_rows(args.parquet, args.task, args.max_rows, args.seed,
                         args.num_shards, args.shard_idx, row_start=args.row_start,
                         atomtxt_property=args.atomtxt_property)
     print(f"[bridge-edit] {len(rows)} rows (task={args.task}, seed={args.seed}, "
           f"shard {args.shard_idx}/{args.num_shards}) from {args.parquet}", flush=True)
     if not rows:
-        raise SystemExit(f"No rows selected for task={args.task} — check parquet/shard args.")
+        raise SystemExit(f"no rows selected for task={args.task}; check the parquet and shard args")
 
-    # ── 2. Load ALM (planner + bridge) + bridged csp_backbone decoder ──
+    # 2. Load the ALM (planner and bridge) and the bridged CSP decoder.
     # use_cached_embeddings=False: OrbV3 needed for live input-structure encoding (polymorph/doping).
-    print(f"[bridge-edit] loading ALM + bridged csp_backbone decoder on {device} ...", flush=True)
-    # Full-FT ckpts store the whole Qwen3 in llm_full_ft/ with no lora_adapter/ → load it directly, skip the overlay.
+    print(f"[bridge-edit] loading ALM and bridged CSP decoder on {device} ...", flush=True)
+    # Fully fine-tuned checkpoints store Qwen3 in llm_full_ft/ with no lora_adapter/; load it directly.
     _ckdir = Path(args.atoms_mapper).parent
     _is_full_ft = (_ckdir / "llm_full_ft" / "qwen3_state_dict.pt").exists()
     _alm_ckpt = str(_ckdir) if _is_full_ft else str(args.alm_checkpoint)
     if _is_full_ft:
-        print(f"[bridge-edit] full-FT checkpoint detected → loading full Qwen3 from "
-              f"{_ckdir}/llm_full_ft (LoRA overlay skipped)", flush=True)
+        print(f"[bridge-edit] full fine-tuned checkpoint: loading Qwen3 from {_ckdir}/llm_full_ft "
+              f"(LoRA overlay skipped)", flush=True)
     alm, tok, pl_module, K_tokens = load_alm_and_pl_module(
         alm_checkpoint=_alm_ckpt,
         atoms_mapper=str(args.atoms_mapper),
@@ -397,18 +352,18 @@ def main() -> int:
         device=device,
         model_path=args.mattergen_model_path,
     )
-    # Two-stage load: fresh r=8 bridge LoRA on top of the Stage-2-merged ALM (load_alm alone uses the wrong LoRA).
+    # Two-stage load: bridge LoRA on top of the Stage-2-merged ALM (load_alm alone applies the wrong LoRA).
     _bld = args.bridge_lora_dir
     if _bld is None:
         _bld = Path(args.atoms_mapper).parent / "lora_adapter"
     if _is_full_ft:
-        print("  [bridge-lora] SKIPPED (full-FT — full Qwen3 weights loaded directly)", flush=True)
+        print("[bridge-lora] skipped: full fine-tuned Qwen3 weights loaded directly", flush=True)
     elif str(_bld).lower() != "none":
         if not Path(_bld).exists():
             raise FileNotFoundError(f"bridge_lora_dir not found: {_bld}")
         apply_bridge_lora(alm, _bld, device)
     else:
-        print("  [bridge-lora] SKIPPED (--bridge_lora_dir none): Stage-2 LoRA only", flush=True)
+        print("[bridge-lora] skipped (--bridge_lora_dir none): Stage-2 LoRA only", flush=True)
     alm.eval()
     pl_module.eval()
 
@@ -417,9 +372,8 @@ def main() -> int:
     print(f"[bridge-edit] decoder cond_fields={cond_fields} has_alm_embedding={has_alm} "
           f"(t={time.time()-t0:.0f}s)", flush=True)
     if not has_alm:
-        print("  [WARN] decoder has no alm_embedding cond_field — BRIDGE INERT. "
-              "This measures observed-atom CSP only; the per-task edit signal is gone.",
-              flush=True)
+        print("[bridge-edit] warning: decoder has no alm_embedding cond field; results reflect "
+              "composition-only CSP", flush=True)
 
     from omegaconf import OmegaConf
     from mattergen.generator import draw_samples_from_sampler
@@ -473,7 +427,7 @@ def main() -> int:
             fk_reward_cache[key] = _parse_rewards(spec, direction=rew_direction)
         return fk_reward_cache[key]
 
-    # ── 3. Generate per row (observed-atom CSP + stamped alm_embedding bridge) ──
+    # 3. Generate per row (observed-atom CSP with the alm_embedding bridge stamped on).
     import random as _random
     gens_per_row: list[list] = []
     target_comp_per_row: list[dict | None] = []
@@ -489,7 +443,7 @@ def main() -> int:
         return ("on the same device" in s) or ("wrapper_cuda" in s) or \
                ("zero graph edges" in s) or ("expected all tensors to be on" in s)
 
-    _cot_on = int(getattr(args, "cot_tokens", 0)) > 0
+    _cot_on = args.cot_tokens > 0
 
     def _cot_kw(i):
         # cot_seed = diffusion_seed + i so the whitening pre-pass and main loop draw the same CoT per row.
@@ -502,15 +456,15 @@ def main() -> int:
         print(f"[bridge-edit] CoT-then-atoms ON: cot_tokens={args.cot_tokens} "
               f"T={args.llm_temperature} top_p={args.cot_top_p}", flush=True)
 
-    # precompute eval-set MEAN bridge cond (atomtxt) so the loop can subtract it (common-mode whitening).
+    # Precompute the eval-set mean bridge embedding (atomtxt) so the loop can subtract it.
     mean_emb = None
-    if getattr(args, "whiten_common_mode", False) and args.task == "atomtxt" and has_alm:
+    if args.whiten_common_mode and args.task == "atomtxt" and has_alm:
         _embs = []
         for i, r in enumerate(rows):
             try:
                 _ia = _ase_atoms_from_struct(r["input_atoms_struct"])
                 _ae = _live_orbv3_features(alm, _ia, device)
-                _is = _ase_to_struct(r["input_atoms_struct"])
+                _is = _struct_from_dict(r["input_atoms_struct"])
                 if _is is None:
                     continue
                 _tc = _per_cell_counts(_is)
@@ -523,11 +477,11 @@ def main() -> int:
                 continue
         if _embs:
             mean_emb = torch.stack(_embs, dim=0).mean(dim=0).to(device)
-            print(f"[bridge-edit] common-mode whitening ON: subtracting mean cond over "
+            print(f"[bridge-edit] common-mode whitening: subtracting the mean embedding over "
                   f"{len(_embs)}/{len(rows)} rows (||mean||={mean_emb.norm().item():.3f})", flush=True)
         else:
-            print("[bridge-edit] common-mode whitening requested but 0 rows produced a cond "
-                  "→ disabled (mean_emb=None)", flush=True)
+            print("[bridge-edit] common-mode whitening disabled: no row produced an embedding",
+                  flush=True)
 
     for i, r in enumerate(rows):
         _s = (int(args.diffusion_seed) + i) & 0x7FFFFFFF
@@ -548,11 +502,11 @@ def main() -> int:
                 atom_embed = _live_orbv3_features(alm, input_atoms, device)
             except Exception as e:
                 print(f"[bridge-edit] {r['row_id']}: live-encode failed "
-                      f"({type(e).__name__}: {e}) → skip", flush=True)
+                      f"({type(e).__name__}: {e}); counted as failed", flush=True)
                 gens_per_row.append([]); target_comp_per_row.append(None)
                 planner_text_per_row.append(None)
                 continue
-            input_struct = _ase_to_struct(r["input_atoms_struct"])
+            input_struct = _struct_from_dict(r["input_atoms_struct"])
             if input_struct is None:
                 gens_per_row.append([]); target_comp_per_row.append(None)
                 planner_text_per_row.append(None)
@@ -569,21 +523,21 @@ def main() -> int:
                 target_comp, _fu = epc.comp_from_plan(parsed, args.prompt_version)
                 if target_comp is None:
                     n_planner_parse_fail += 1
-                    print(f"[bridge-edit] {r['row_id']}: doping planner parse fail "
-                          f"→ skip  raw={(plan_text or '')[:80]!r}", flush=True)
+                    print(f"[bridge-edit] {r['row_id']}: doping planner output did not parse; "
+                          f"counted as failed. raw={(plan_text or '')[:80]!r}", flush=True)
                     gens_per_row.append([]); target_comp_per_row.append(None)
                     planner_text_per_row.append((plan_text or "")[:300])
                     continue
-            else:  # doping (rule-based): apply X→Y to the input composition.
+            else:  # doping (rule-based): apply the X-to-Y substitution to the input composition.
                 donor, dopant = r["_donor"], r["_dopant"]
                 target_comp = {}
                 for el, n in in_counts.items():
                     key = dopant if el == donor else el
                     target_comp[key] = target_comp.get(key, 0) + n
                 if donor not in in_counts:
-                    # Donor element not present → can't apply the substitution; skip.
+                    # Donor element absent: the substitution cannot be applied; counted as failed.
                     print(f"[bridge-edit] {r['row_id']}: donor {donor} absent in input "
-                          f"{in_counts} → skip", flush=True)
+                          f"{in_counts}; counted as failed", flush=True)
                     gens_per_row.append([]); target_comp_per_row.append(None)
                     planner_text_per_row.append(None)
                     continue
@@ -624,7 +578,7 @@ def main() -> int:
 
         # SEGA (atomtxt): compute the opposite-direction bridge vector; (asked - opp) applied at sampling.
         alm_emb_opp = None
-        if (getattr(args, "sega_difference", False) and args.task == "atomtxt"
+        if (args.sega_difference and args.task == "atomtxt"
                 and has_alm and not args.doping_via_planner):
             _askp, _oppp = _sega_prompts(r.get("_property", "formation_energy"),
                                          int(r.get("_direction", 0)))
@@ -641,12 +595,12 @@ def main() -> int:
             if i == 0:
                 _cos = torch.nn.functional.cosine_similarity(
                     alm_emb.flatten().float(), alm_emb_opp.flatten().float(), dim=0).item()
-                print(f"[bridge-edit] SEGA ON: sega_g={args.sega_g}  "
+                print(f"[bridge-edit] SEGA: sega_g={args.sega_g}  "
                       f"cos(asked,opp)={_cos:.4f}  ||asked-opp||="
                       f"{(alm_emb-alm_emb_opp).norm().item():.3f}", flush=True)
 
         if (i % 5) == 0:
-            extra = f"  comp→{target_comp}" if args.task != "app" else f"  plan→{target_comp}"
+            extra = f"  comp={target_comp}" if args.task != "app" else f"  plan={target_comp}"
             print(f"  [{i:3d}/{len(rows)}] {r['row_id']} {extra}  t={time.time()-t0:.0f}s",
                   flush=True)
 
@@ -665,7 +619,7 @@ def main() -> int:
                                               int(r.get("_direction", 0)))
             _fk_reset_per_prompt(_fkst, args.K, device)
 
-        # 3c. Observed-atom CSP loader with alm_embedding stamped → sample.
+        # 3c. Observed-atom CSP loader with alm_embedding stamped on, then sample.
         _sd = float(r.get("_direction", 0)) if args.scalar_direction else None
         samples = []
         gen_err = None
@@ -701,7 +655,7 @@ def main() -> int:
                 gen_err = e
                 if _is_device_mismatch(e) and _attempt < int(args.gen_retries):
                     print(f"    [{r['row_id']}] gen device-mismatch (empty-graph?) "
-                          f"on attempt {_attempt} — re-seeding & retrying", flush=True)
+                          f"on attempt {_attempt}; retrying with a new seed", flush=True)
                     samples = []
                     continue
                 # Non-device error or retries exhausted: give up on this row.
@@ -723,7 +677,7 @@ def main() -> int:
             print(f"[bridge-edit] generated {i+1}/{len(rows)} prompts in {time.time()-t0:.0f}s",
                   flush=True)
 
-    # ── 4. Score per task ──
+    # 4. Score per task.
     if args.task == "polymorph":
         headline, examples, n_scored = _score_polymorph(
             args, rows, gens_per_row, device)
@@ -744,16 +698,16 @@ def main() -> int:
             args, rows, gens_per_row, target_comp_per_row,
             planner_text_per_row, n_planner_parse_fail, device, t0)
 
-    # ── 4b. Optional showcase CIF dump (read-only on scoring) ──
-    if getattr(args, "save_cifs", None) is not None:
+    # 4b. Optional showcase CIF dump (does not affect scoring).
+    if args.save_cifs is not None:
         try:
             _save_showcase_cifs(args, rows, gens_per_row, examples,
                                 target_comp_per_row)
         except Exception as _e:  # never let the showcase dump break the eval
-            print(f"[save_cifs] FAILED ({type(_e).__name__}: {_e}) — eval metrics unaffected",
+            print(f"[save_cifs] failed ({type(_e).__name__}: {_e}); metrics are unaffected",
                   flush=True)
 
-    # ── 5. Write metrics + graceful-degradation n_scored gating ──
+    # 5. Write metrics; a shard that scored nothing records why.
     headline["task"] = args.task
     headline["n_scored"] = n_scored
     headline.setdefault("n_prompts", len(rows))
@@ -764,10 +718,10 @@ def main() -> int:
     headline["mattergen_model_path"] = args.mattergen_model_path
     headline["cot_tokens"] = int(args.cot_tokens)
     headline["llm_temperature"] = float(args.llm_temperature)
-    headline["whiten_common_mode"] = bool(getattr(args, "whiten_common_mode", False))
-    headline["sega_difference"] = bool(getattr(args, "sega_difference", False))
-    headline["sega_g"] = float(getattr(args, "sega_g", 0.0))
-    headline["atoms_before_json"] = bool(getattr(args, "atoms_before_json", False))
+    headline["whiten_common_mode"] = args.whiten_common_mode
+    headline["sega_difference"] = args.sega_difference
+    headline["sega_g"] = args.sega_g
+    headline["atoms_before_json"] = args.atoms_before_json
     headline["wallclock_sec"] = time.time() - t0
     # Failure-class counters: distinguish "all rows hit the same fixable error" from a real empty result.
     headline["n_gen_device_errors"] = n_gen_device_errors
@@ -794,7 +748,7 @@ def main() -> int:
             print(f"  {k:32s} = {v:.4f}", flush=True)
 
     if n_scored > 0:
-        print(f"[bridge-edit] DONE in {time.time()-t0:.0f}s", flush=True)
+        print(f"[bridge-edit] done in {time.time()-t0:.0f}s", flush=True)
         return 0
 
     # n_scored == 0 below: report which failure class caused it.
@@ -820,9 +774,7 @@ def main() -> int:
     raise SystemExit(2)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-task scorers
-# ─────────────────────────────────────────────────────────────────────────────
+# Per-task scorers.
 def _to_struct(g):
     if isinstance(g, Structure):
         return g
@@ -832,8 +784,26 @@ def _to_struct(g):
         return None
 
 
+# Every row contributes K candidate slots. A bad input, a failed generation or an unconvertible
+# candidate fills its slots with failed candidates (all flags False), so headline rates divide by
+# len(rows) * K and failures count as wrong. n_scored counts only the candidates actually scored.
+def _failed_candidate(keys) -> dict:
+    return {**{k: False for k in keys}, "gen_failed": True}
+
+
+def _pad_failed(per_candidate: list[dict], K: int, keys) -> list[dict]:
+    per_candidate.extend(_failed_candidate(keys) for _ in range(K - len(per_candidate)))
+    return per_candidate
+
+
+def _failure_stats(n_scored: int, n_expected: int) -> dict:
+    n_failed = n_expected - n_scored
+    return {"n_expected": n_expected, "n_gen_failed": n_failed,
+            "gen_failed_rate": n_failed / n_expected if n_expected else 0.0}
+
+
 def _score_polymorph(args, rows, gens_per_row, device):
-    """PRIMARY: polymorph_lower_energy_rate (relaxed gen E/atom < relaxed input E/atom), plus distinctness/composition/validity."""
+    """Primary metric polymorph_lower_energy_rate (relaxed gen E/atom below relaxed input E/atom), plus distinctness, composition and validity."""
     from structure_metrics import relax_structures_mattersim, total_energy_per_atom
     matcher = StructureMatcher(ltol=args.ltol, stol=args.stol, angle_tol=args.angle_tol)
 
@@ -843,7 +813,7 @@ def _score_polymorph(args, rows, gens_per_row, device):
     input_struct_per_row: list[Structure | None] = []
     for i, gens in enumerate(gens_per_row):
         r = rows[i]
-        input_struct = _ase_to_struct(r["input_atoms_struct"])
+        input_struct = _struct_from_dict(r["input_atoms_struct"])
         input_struct_per_row.append(input_struct)
         if input_struct is None or not gens:
             continue
@@ -878,21 +848,21 @@ def _score_polymorph(args, rows, gens_per_row, device):
             except Exception:
                 pass
 
+    _poly_keys = ("composition_preserved", "structurally_distinct", "structurally_valid",
+                  "validity_geom", "validity_charge", "validity_both",
+                  "lower_energy", "real_lower_energy")
     examples = []
     overall = Counter()
     n_scored = 0
-    n_lower = 0
-    n_lower_real = 0
     for i, gens in enumerate(gens_per_row):
         r = rows[i]
         input_struct = input_struct_per_row[i]
-        if input_struct is None or not gens:
-            continue
         e_input = energy_by_key.get((i, -1), float("nan"))
         per_candidate = []
-        for j, g in enumerate(gens):
+        for j, g in enumerate(gens[:args.K] if input_struct is not None else []):
             s = _to_struct(g)
             if s is None:
+                per_candidate.append(_failed_candidate(_poly_keys))
                 continue
             comp_match = (s.composition.reduced_formula ==
                           input_struct.composition.reduced_formula)
@@ -907,7 +877,7 @@ def _score_polymorph(args, rows, gens_per_row, device):
                     distinct = True
             e_gen = energy_by_key.get((i, j), float("nan"))
             lower_energy = bool(e_gen == e_gen and e_input == e_input and e_gen < e_input)
-            # GATED real win: lower energy AND same composition AND distinct AND valid.
+            # Counted as a lower-energy polymorph only with the same composition, a distinct structure and a valid geometry.
             real_lower = bool(lower_energy and comp_match and distinct and valid)
             sc = {
                 "composition_preserved": comp_match,
@@ -923,35 +893,31 @@ def _score_polymorph(args, rows, gens_per_row, device):
             }
             per_candidate.append(sc)
             n_scored += 1
-            for k in ("composition_preserved", "structurally_distinct",
-                      "structurally_valid", "validity_geom", "validity_charge",
-                      "validity_both"):
+        _pad_failed(per_candidate, args.K, _poly_keys)
+        for sc in per_candidate:
+            for k in _poly_keys:
                 if sc[k]:
                     overall[k] += 1
-            if lower_energy:
-                n_lower += 1
-                overall["lower_energy"] += 1
-            if real_lower:
-                n_lower_real += 1
         examples.append({
             "row_id": r["row_id"], "parent": r.get("parent"),
             "user_prompt": r["user_prompt"],
-            "input_formula": str(input_struct.composition.reduced_formula),
+            "input_formula": (str(input_struct.composition.reduced_formula)
+                              if input_struct is not None else None),
             "e_input_per_atom": e_input if e_input == e_input else None,
             "n_candidates": len(per_candidate),
             "per_candidate_scores": per_candidate,
-            "lower_energy_rate": float(np.mean([c["lower_energy"] for c in per_candidate]))
-                                 if per_candidate else 0.0,
+            "lower_energy_rate": float(np.mean([c["lower_energy"] for c in per_candidate])),
         })
 
-    headline = {}
-    if n_scored > 0:
+    n_expected = len(rows) * args.K
+    headline = _failure_stats(n_scored, n_expected)
+    if n_expected > 0:
         for k in ("composition_preserved", "structurally_distinct",
                   "structurally_valid", "validity_geom", "validity_charge",
                   "validity_both"):
-            headline[k] = overall[k] / n_scored
-        headline["polymorph_lower_energy_rate"] = n_lower_real / n_scored  # GATED PRIMARY
-        headline["polymorph_lower_energy_rate_ungated"] = n_lower / n_scored  # diagnostic
+            headline[k] = overall[k] / n_expected
+        headline["polymorph_lower_energy_rate"] = overall["real_lower_energy"] / n_expected  # primary
+        headline["polymorph_lower_energy_rate_ungated"] = overall["lower_energy"] / n_expected  # diagnostic
     headline["per_prompt_mean_lower_energy"] = (
         float(np.mean([e["lower_energy_rate"] for e in examples])) if examples else 0.0)
     headline["skip_relax"] = bool(args.skip_relax)
@@ -998,10 +964,10 @@ def _score_atomtxt(args, rows, gens_per_row, device):
 
     input_struct_per_row: list[Structure | None] = []
     for i in range(len(gens_per_row)):
-        input_struct_per_row.append(_ase_to_struct(rows[i]["input_atoms_struct"]))
+        input_struct_per_row.append(_struct_from_dict(rows[i]["input_atoms_struct"]))
 
-    # density/volume are also measured after relaxation: a pure lattice rescale relaxes back to the
-    # input's equilibrium volume, so only a genuinely different material moves relaxed density.
+    # density/volume are measured after relaxation: a pure lattice rescale relaxes back to the
+    # input's equilibrium volume, so only a structurally different material changes relaxed density.
     _RELAX_PROPS = ("formation_energy", "density", "volume")
     flat: list[Structure] = []
     flat_meta: list[tuple[int, int]] = []
@@ -1029,13 +995,13 @@ def _score_atomtxt(args, rows, gens_per_row, device):
     energy_by_key: dict[tuple[int, int], float] = {}
     relaxed_atoms_by_key: dict[tuple[int, int], object] = {}
     if not args.skip_relax and flat:
-        # Force full relax whenever density/volume present (de-game needs equilibrium geometry);
-        # --single_point_energy (max_n_steps=0) is honored only for FE-only runs.
+        # Density/volume must be measured at relaxed geometry, so always fully relax when they are
+        # present; --single_point_energy (max_n_steps=0) applies only to formation-energy-only runs.
         _props_present = {rows[i].get("_property") for i in range(len(gens_per_row))}
         _full_relax_needed = bool(_props_present & {"density", "volume"})
         _atx_steps = 0 if (args.single_point_energy and not _full_relax_needed) else 500
         print(f"[bridge-edit:atomtxt] MatterSim "
-              f"{'SINGLE-POINT (max_n_steps=0, raw geometry)' if _atx_steps == 0 else 'full-relaxing'} "
+              f"{'single-point (max_n_steps=0, unrelaxed geometry)' if _atx_steps == 0 else 'relaxing'} "
               f"{len(flat)} structures (inputs + gens; props={sorted(p for p in _props_present if p)}) ...",
               flush=True)
         relaxed_atoms, _ = relax_structures_mattersim(
@@ -1046,13 +1012,15 @@ def _score_atomtxt(args, rows, gens_per_row, device):
             energy_by_key[key] = total_energy_per_atom(atoms)
             relaxed_atoms_by_key[key] = atoms
 
-    # De-game gate: a pure lattice rescale matches the input under the volume-normalized matcher.
+    # A pure lattice rescale matches the input under the volume-normalized matcher, so it is not counted.
     _distinct_matcher = StructureMatcher(ltol=args.ltol, stol=args.stol, angle_tol=args.angle_tol)
 
+    _atx_keys = ("composition_preserved", "structurally_valid", "distinct_from_input",
+                 "direction_correct")
     examples = []
     overall = Counter()
     n_scored = 0
-    _saved_gens = [] if getattr(args, "save_gens", None) else None
+    _saved_gens = [] if args.save_gens else None
     by: dict[str, dict[str, int]] = {}  # (property, direction) -> counts, for cross-shard re-aggregation
 
     def _bump(prop, want, correct):
@@ -1065,26 +1033,30 @@ def _score_atomtxt(args, rows, gens_per_row, device):
     for i, gens in enumerate(gens_per_row):
         r = rows[i]
         input_struct = input_struct_per_row[i]
-        if input_struct is None or not gens:
-            continue
         prop = r.get("_property", "formation_energy")
         want = int(r.get("_direction", 0))
-        if prop == "formation_energy":
+        _failed = {**_failed_candidate(_atx_keys), "property": prop,
+                   "requested_direction": "higher" if want > 0 else "lower",
+                   "prop_gen": None, "prop_input": None, "delta_prop": None}
+        if input_struct is None:
+            p_input = float("nan")
+        elif prop == "formation_energy":
             p_input = energy_by_key.get((i, -1), float("nan"))
         elif prop in ("density", "volume"):  # relaxed-equilibrium geometry
             _ria = relaxed_atoms_by_key.get((i, -1))
             if _ria is not None:
                 p_input = (_density_from_atoms(_ria) if prop == "density"
                            else _vol_per_atom_from_atoms(_ria))
-            else:  # --skip_relax fallback: raw geometric (gameable)
+            else:  # --skip_relax: unrelaxed geometry (a lattice rescale can move it)
                 p_input = (_density_g_cm3(input_struct) if prop == "density"
                            else _volume_per_atom(input_struct))
         else:
             p_input = float("nan")
         per_candidate = []
-        for j, g in enumerate(gens):
+        for j, g in enumerate(gens[:args.K] if input_struct is not None else []):
             s = _to_struct(g)
             if s is None:
+                per_candidate.append(dict(_failed))
                 continue
             comp_match = (s.composition.reduced_formula ==
                           input_struct.composition.reduced_formula)
@@ -1103,7 +1075,7 @@ def _score_atomtxt(args, rows, gens_per_row, device):
                 p_gen = float("nan")
             dP = (p_gen - p_input) if (p_gen == p_gen and p_input == p_input) else float("nan")
             _dir_sign = bool(dP == dP and ((want > 0 and dP > 0) or (want < 0 and dP < 0)))
-            # De-game (density/volume): reject pure lattice rescales via distinct_from_input.
+            # density/volume: a pure lattice rescale of the input does not count (distinct_from_input).
             distinct_from_input = True
             if prop in ("density", "volume"):
                 try:
@@ -1128,81 +1100,81 @@ def _score_atomtxt(args, rows, gens_per_row, device):
             per_candidate.append(sc)
             n_scored += 1
             if _saved_gens is not None:
-                try:
-                    # Structures as JSON strings (nested float lists trip pyarrow type inference).
-                    _injson = json.dumps({
-                        "elements": [str(sp) for sp in input_struct.species],
-                        "frac_coords": input_struct.frac_coords.tolist(),
-                        "lattice": input_struct.lattice.matrix.tolist()})
-                    _genjson = json.dumps({
-                        "elements": [str(sp) for sp in s.species],
-                        "frac_coords": s.frac_coords.tolist(),
-                        "lattice": s.lattice.matrix.tolist()})
-                    _saved_gens.append({
-                        "row_id": r["row_id"],
-                        "user_prompt": r["user_prompt"],
-                        "requested_direction": "higher" if want > 0 else "lower",
-                        "direction_correct": bool(dir_correct),
-                        "composition_preserved": bool(comp_match),
-                        "structurally_valid": bool(valid),
-                        "prop_gen": float(p_gen) if p_gen == p_gen else None,
-                        "prop_input": float(p_input) if p_input == p_input else None,
-                        "delta_prop": float(dP) if dP == dP else None,
-                        "input_struct_json": _injson,
-                        "gen_struct_json": _genjson,
-                    })
-                except Exception:
-                    pass
-            if comp_match:
+                # Structures as JSON strings (nested float lists trip pyarrow type inference).
+                _injson = json.dumps({
+                    "elements": [str(sp) for sp in input_struct.species],
+                    "frac_coords": input_struct.frac_coords.tolist(),
+                    "lattice": input_struct.lattice.matrix.tolist()})
+                _genjson = json.dumps({
+                    "elements": [str(sp) for sp in s.species],
+                    "frac_coords": s.frac_coords.tolist(),
+                    "lattice": s.lattice.matrix.tolist()})
+                _saved_gens.append({
+                    "row_id": r["row_id"],
+                    "user_prompt": r["user_prompt"],
+                    "requested_direction": "higher" if want > 0 else "lower",
+                    "direction_correct": bool(dir_correct),
+                    "composition_preserved": bool(comp_match),
+                    "structurally_valid": bool(valid),
+                    "prop_gen": float(p_gen) if p_gen == p_gen else None,
+                    "prop_input": float(p_input) if p_input == p_input else None,
+                    "delta_prop": float(dP) if dP == dP else None,
+                    "input_struct_json": _injson,
+                    "gen_struct_json": _genjson,
+                })
+        per_candidate.extend(dict(_failed) for _ in range(args.K - len(per_candidate)))
+        for sc in per_candidate:
+            if sc["composition_preserved"]:
                 overall["composition_preserved"] += 1
-            if valid:
+            if sc["structurally_valid"]:
                 overall["structurally_valid"] += 1
-            # Degenerate/failed gen (NaN property) is dir_correct=False, kept in the denominator
-            # as wrong (never excluded); n_gen_failed is a diagnostic, not a gate.
-            if dP != dP:
+            # Failed or degenerate candidates (no property value) are direction_correct=False and
+            # stay in the denominator; n_gen_failed is a diagnostic, not a gate.
+            if sc["delta_prop"] is None:
                 overall["n_gen_failed"] += 1
-            if dir_correct:
+            if sc["direction_correct"]:
                 overall["direction_correct"] += 1
                 overall[f"correct_{prop}"] += 1
-                if want > 0:
-                    overall["correct_higher"] += 1
-                else:
-                    overall["correct_lower"] += 1
+                overall["correct_higher" if want > 0 else "correct_lower"] += 1
             overall[f"n_{prop}"] += 1
             overall["n_higher" if want > 0 else "n_lower"] += 1
-            _bump(prop, want, dir_correct)
+            _bump(prop, want, sc["direction_correct"])
         examples.append({
             "row_id": r["row_id"], "parent": r.get("parent"), "property": prop,
             "user_prompt": r["user_prompt"],
             "requested_direction": "higher" if want > 0 else "lower",
-            "input_formula": str(input_struct.composition.reduced_formula),
+            "input_formula": (str(input_struct.composition.reduced_formula)
+                              if input_struct is not None else None),
             "prop_input": p_input if p_input == p_input else None,
             "n_candidates": len(per_candidate),
             "per_candidate_scores": per_candidate,
             "direction_correct_rate": float(np.mean(
-                [c["direction_correct"] for c in per_candidate])) if per_candidate else 0.0,
+                [c["direction_correct"] for c in per_candidate])),
         })
 
     if _saved_gens is not None:
         import pandas as _pd
         args.save_gens.mkdir(parents=True, exist_ok=True)
-        _gp = args.save_gens / f"gens_shard{getattr(args, 'shard_idx', 0)}.parquet"
+        _gp = args.save_gens / f"gens_shard{args.shard_idx}.parquet"
         _pd.DataFrame(_saved_gens).to_parquet(_gp)
         _hc = sum(1 for g in _saved_gens
                   if g["requested_direction"] == "higher" and g["direction_correct"])
-        print(f"[save_gens] wrote {len(_saved_gens)} gen records ({_hc} higher-correct) → {_gp}",
+        print(f"[save_gens] wrote {len(_saved_gens)} gen records ({_hc} higher-correct) to {_gp}",
               flush=True)
 
     def _rate(num, den):
         return (overall[num] / overall[den]) if overall[den] else None
 
-    headline = {}
-    if n_scored > 0:
-        # PRIMARY: direction-correct over ALL scored candidates (failed gens kept as wrong).
-        headline["direction_correct_rate"] = overall["direction_correct"] / n_scored
-        headline["composition_preserved"] = overall["composition_preserved"] / n_scored
-        headline["structurally_valid"] = overall["structurally_valid"] / n_scored
-        headline["gen_failed_rate"] = overall["n_gen_failed"] / n_scored  # diagnostic, not a gate
+    n_expected = len(rows) * args.K
+    headline = _failure_stats(n_scored, n_expected)
+    if n_expected > 0:
+        # Primary: direction-correct over every candidate slot (failed candidates count as wrong).
+        headline["direction_correct_rate"] = overall["direction_correct"] / n_expected
+        headline["composition_preserved"] = overall["composition_preserved"] / n_expected
+        headline["structurally_valid"] = overall["structurally_valid"] / n_expected
+        # Candidates with no property value (failed or degenerate); diagnostic, not a gate.
+        headline["n_gen_failed"] = overall["n_gen_failed"]
+        headline["gen_failed_rate"] = overall["n_gen_failed"] / n_expected
     # discriminating splits (None when a shard saw none of that bucket)
     headline["higher_direction_correct_rate"] = _rate("correct_higher", "n_higher")
     headline["lower_direction_correct_rate"] = _rate("correct_lower", "n_lower")
@@ -1223,15 +1195,24 @@ def _score_atomtxt(args, rows, gens_per_row, device):
 
 
 def _score_doping(args, rows, gens_per_row):
-    """correct_substitution_rate (Y present AND X removed AND ratio_match AND valid), plus components. No relax."""
+    """correct_substitution_rate (dopant present, donor removed, ratio match, valid, not a naive relabel), plus components. No relaxation."""
+    _dop_keys = ("dopant_present", "donor_removed", "ratio_match", "structurally_valid",
+                 "distinct_from_relabel", "full_substitution", "correct_substitution")
     examples = []
     overall = Counter()
     n_scored = 0
     for i, gens in enumerate(gens_per_row):
         r = rows[i]
         donor, dopant = r["_donor"], r["_dopant"]
-        input_struct = _ase_to_struct(r["input_atoms_struct"])
-        if input_struct is None or not gens:
+        input_struct = _struct_from_dict(r["input_atoms_struct"])
+        if input_struct is None:
+            examples.append({
+                "row_id": r["row_id"], "parent": r.get("parent"),
+                "user_prompt": r["user_prompt"], "donor": donor, "dopant": dopant,
+                "input_formula": None, "n_candidates": args.K,
+                "per_candidate_scores": _pad_failed([], args.K, _dop_keys),
+                "correct_substitution_rate": 0.0, "full_substitution_rate": 0.0,
+            })
             continue
         in_elems = [str(s.specie.symbol) for s in input_struct]
         in_count = Counter(in_elems)
@@ -1250,9 +1231,10 @@ def _score_doping(args, rows, gens_per_row):
         _relabel_matcher = StructureMatcher(ltol=args.ltol, stol=args.stol,
                                             angle_tol=args.angle_tol)
         per_candidate = []
-        for g in gens:
+        for g in gens[:args.K]:
             s = _to_struct(g)
             if s is None:
+                per_candidate.append(_failed_candidate(_dop_keys))
                 continue
             gen_elems = [str(site.specie.symbol) for site in s]
             gen_count = Counter(gen_elems)
@@ -1263,7 +1245,7 @@ def _score_doping(args, rows, gens_per_row):
             ratio_match = abs(gen_frac - target_frac) <= 0.10
             valid = _structurally_valid(s)
             full_sub = dopant_present and donor_removed
-            # Real-structure gate: distinct from the naive relabel (no relabel available -> distinct=True).
+            # A candidate that matches the naive relabel is not counted (no relabel available -> distinct=True).
             is_relabel = False
             if naive_relabel is not None:
                 try:
@@ -1284,9 +1266,9 @@ def _score_doping(args, rows, gens_per_row):
             }
             per_candidate.append(sc)
             n_scored += 1
-            for k in ("dopant_present", "donor_removed", "ratio_match",
-                      "structurally_valid", "distinct_from_relabel",
-                      "full_substitution", "correct_substitution"):
+        _pad_failed(per_candidate, args.K, _dop_keys)
+        for sc in per_candidate:
+            for k in _dop_keys:
                 if sc[k]:
                     overall[k] += 1
         examples.append({
@@ -1296,25 +1278,26 @@ def _score_doping(args, rows, gens_per_row):
             "n_candidates": len(per_candidate),
             "per_candidate_scores": per_candidate,
             "correct_substitution_rate": float(np.mean(
-                [c["correct_substitution"] for c in per_candidate])) if per_candidate else 0.0,
+                [c["correct_substitution"] for c in per_candidate])),
             "full_substitution_rate": float(np.mean(
-                [c["full_substitution"] for c in per_candidate])) if per_candidate else 0.0,
+                [c["full_substitution"] for c in per_candidate])),
         })
 
-    headline = {}
-    if n_scored > 0:
-        for k in ("dopant_present", "donor_removed", "ratio_match",
-                  "structurally_valid", "distinct_from_relabel",
-                  "full_substitution", "correct_substitution"):
-            headline[k] = overall[k] / n_scored
-        headline["correct_substitution_rate"] = overall["correct_substitution"] / n_scored
+    n_expected = len(rows) * args.K
+    headline = _failure_stats(n_scored, n_expected)
+    if n_expected > 0:
+        for k in _dop_keys:
+            headline[k] = overall[k] / n_expected
+        headline["correct_substitution_rate"] = overall["correct_substitution"] / n_expected
     headline["per_prompt_mean_correct_sub"] = (
         float(np.mean([e["correct_substitution_rate"] for e in examples])) if examples else 0.0)
     return headline, examples, n_scored
 
 
 def _score_strain(args, rows, gens_per_row, device):
-    """strain_correct_rate: doping correct AND relaxed dV hits the row_id's target dV (within strain_tol_pct)."""
+    """strain_correct_rate: doping correct and the relaxed volume change within strain_tol_pct of the row_id's target dV."""
+    _str_keys = ("doping_correct", "volume_match", "strain_correct", "dopant_present",
+                 "donor_removed", "ratio_match", "structurally_valid", "distinct_from_relabel")
     from structure_metrics import relax_structures_mattersim
 
     # Flat relax batch: per row [input] + [gens], input relaxed with the same potential/settings.
@@ -1323,7 +1306,7 @@ def _score_strain(args, rows, gens_per_row, device):
     input_struct_per_row: list[Structure | None] = []
     for i, gens in enumerate(gens_per_row):
         r = rows[i]
-        input_struct = _ase_to_struct(r["input_atoms_struct"])
+        input_struct = _struct_from_dict(r["input_atoms_struct"])
         input_struct_per_row.append(input_struct)
         if input_struct is None or not gens:
             continue
@@ -1362,13 +1345,20 @@ def _score_strain(args, rows, gens_per_row, device):
         donor, dopant = r["_donor"], r["_dopant"]
         target_dv = r["_target_dv_pct"]
         input_struct = input_struct_per_row[i]
-        if input_struct is None or not gens:
+        if input_struct is None:
+            examples.append({
+                "row_id": r["row_id"], "parent": r.get("parent"),
+                "user_prompt": r["user_prompt"], "donor": donor, "dopant": dopant,
+                "target_dv_pct": target_dv, "input_formula": None, "n_candidates": args.K,
+                "per_candidate_scores": _pad_failed([], args.K, _str_keys),
+                "strain_correct_rate": 0.0,
+            })
             continue
         in_elems = [str(s.specie.symbol) for s in input_struct]
         in_count = Counter(in_elems)
         n_in = max(1, len(in_elems))
         target_frac = in_count.get(donor, 0) / n_in
-        # naive (coords-identical) relabel, disallowed (same relabel check as doping).
+        # Naive (coords-identical) relabel is not counted, as in doping.
         naive_relabel = None
         if donor in in_count:
             try:
@@ -1381,9 +1371,10 @@ def _score_strain(args, rows, gens_per_row, device):
                                             angle_tol=args.angle_tol)
         vpa_input = vpa_by_key.get((i, -1), float("nan"))
         per_candidate = []
-        for j, g in enumerate(gens):
+        for j, g in enumerate(gens[:args.K]):
             s = _to_struct(g)
             if s is None:
+                per_candidate.append(_failed_candidate(_str_keys))
                 continue
             gen_count = Counter(str(site.specie.symbol) for site in s)
             n_gen = max(1, sum(gen_count.values()))
@@ -1422,13 +1413,13 @@ def _score_strain(args, rows, gens_per_row, device):
             }
             per_candidate.append(sc)
             n_scored += 1
-            for k in ("doping_correct", "volume_match", "strain_correct",
-                      "dopant_present", "donor_removed", "ratio_match",
-                      "structurally_valid", "distinct_from_relabel"):
-                if sc[k]:
-                    overall[k] += 1
             if realized_dv_pct == realized_dv_pct:
                 realized_dv.append((realized_dv_pct, target_dv))
+        _pad_failed(per_candidate, args.K, _str_keys)
+        for sc in per_candidate:
+            for k in _str_keys:
+                if sc[k]:
+                    overall[k] += 1
         examples.append({
             "row_id": r["row_id"], "parent": r.get("parent"),
             "user_prompt": r["user_prompt"], "donor": donor, "dopant": dopant,
@@ -1437,17 +1428,18 @@ def _score_strain(args, rows, gens_per_row, device):
             "n_candidates": len(per_candidate),
             "per_candidate_scores": per_candidate,
             "strain_correct_rate": float(np.mean(
-                [c["strain_correct"] for c in per_candidate])) if per_candidate else 0.0,
+                [c["strain_correct"] for c in per_candidate])),
         })
 
-    headline = {}
-    if n_scored > 0:
+    n_expected = len(rows) * args.K
+    headline = _failure_stats(n_scored, n_expected)
+    if n_expected > 0:
         for k in ("doping_correct", "volume_match", "dopant_present", "donor_removed",
                   "ratio_match", "structurally_valid", "distinct_from_relabel"):
-            headline[k] = overall[k] / n_scored
-        headline["doping_correct_rate"] = overall["doping_correct"] / n_scored
-        headline["volume_match_rate"] = overall["volume_match"] / n_scored
-        headline["strain_correct_rate"] = overall["strain_correct"] / n_scored  # GATED PRIMARY
+            headline[k] = overall[k] / n_expected
+        headline["doping_correct_rate"] = overall["doping_correct"] / n_expected
+        headline["volume_match_rate"] = overall["volume_match"] / n_expected
+        headline["strain_correct_rate"] = overall["strain_correct"] / n_expected  # primary
     if realized_dv:
         errs = [abs(rd - td) for rd, td in realized_dv]
         headline["mean_abs_dv_err_pct"] = float(np.mean(errs))
@@ -1458,36 +1450,26 @@ def _score_strain(args, rows, gens_per_row, device):
 
 
 def _score_text2struct(args, rows, gens_per_row):
-    """describe/ood text->structure recovery vs GT: comp_match_rate + struct_match_rate (rough disordered matcher), no relax."""
+    """describe/ood text-to-structure recovery vs the ground truth: comp_match_rate and struct_match_rate (disordered matcher), no relaxation."""
     from mattergen.evaluation.utils.structure_matcher import DisorderedStructureMatcher
     rough = DisorderedStructureMatcher(ltol=0.3, stol=0.5, angle_tol=10.0)
+    _t2s_keys = ("comp_match", "struct_match")
     examples = []
     overall = Counter()
     n_scored = 0
-    n_prompts = 0
-    n_gen_failed = 0
+    n_gt_missing = 0
     comp_any_k = 0
     struct_any_k = 0
     for i, gens in enumerate(gens_per_row):
         r = rows[i]
-        gt = _ase_to_struct(r.get("atoms_struct"))
-        if gt is None:
-            continue  # GT missing -> cannot score
-        gt_formula = gt.composition.reduced_formula
-        if not gens:
-            # No structure produced: count as one scored-WRONG candidate (kept in denominator).
-            n_scored += 1
-            n_gen_failed += 1
-            n_prompts += 1
-            examples.append({"row_id": r["row_id"], "gt_formula": gt_formula,
-                             "gen_failed": True, "n_candidates": 0})
-            continue
+        gt = _struct_from_dict(r.get("atoms_struct"))
+        gt_formula = gt.composition.reduced_formula if gt is not None else None
+        n_gt_missing += gt is None
         per_candidate = []
-        row_comp_hit = False
-        row_struct_hit = False
-        for g in gens:
+        for g in (gens[:args.K] if gt is not None else []):
             s = _to_struct(g)
             if s is None:
+                per_candidate.append(_failed_candidate(_t2s_keys))
                 continue
             comp_match = (s.composition.reduced_formula == gt_formula)
             struct_match = False
@@ -1496,17 +1478,14 @@ def _score_text2struct(args, rows, gens_per_row):
                     struct_match = bool(rough.fit(gt, s))
                 except Exception:
                     struct_match = False
-            sc = {"comp_match": comp_match, "struct_match": struct_match,
-                  "gen_formula": str(s.composition.reduced_formula)}
-            per_candidate.append(sc)
+            per_candidate.append({"comp_match": comp_match, "struct_match": struct_match,
+                                  "gen_formula": str(s.composition.reduced_formula)})
             n_scored += 1
-            if comp_match:
-                overall["comp_match"] += 1; row_comp_hit = True
-            if struct_match:
-                overall["struct_match"] += 1; row_struct_hit = True
-        if not per_candidate:
-            continue
-        n_prompts += 1
+        _pad_failed(per_candidate, args.K, _t2s_keys)
+        row_comp_hit = any(c["comp_match"] for c in per_candidate)
+        row_struct_hit = any(c["struct_match"] for c in per_candidate)
+        overall["comp_match"] += sum(c["comp_match"] for c in per_candidate)
+        overall["struct_match"] += sum(c["struct_match"] for c in per_candidate)
         comp_any_k += int(row_comp_hit)
         struct_any_k += int(row_struct_hit)
         examples.append({
@@ -1518,17 +1497,17 @@ def _score_text2struct(args, rows, gens_per_row):
             "struct_match_rate": float(np.mean([c["struct_match"] for c in per_candidate])),
         })
 
-    headline = {}
-    if n_scored > 0:
-        headline["comp_match_rate"] = overall["comp_match"] / n_scored
-        headline["struct_match_rate"] = overall["struct_match"] / n_scored
+    n_expected = len(rows) * args.K
+    n_prompts = len(rows)
+    headline = _failure_stats(n_scored, n_expected)
+    if n_expected > 0:
+        headline["comp_match_rate"] = overall["comp_match"] / n_expected
+        headline["struct_match_rate"] = overall["struct_match"] / n_expected
     if n_prompts > 0:
         headline["comp_match_at_k"] = comp_any_k / n_prompts      # any-of-K diagnostic
         headline["struct_match_at_k"] = struct_any_k / n_prompts
         headline["n_prompts_scored"] = n_prompts
-    if n_scored > 0:
-        headline["gen_failed_rate"] = n_gen_failed / n_scored      # diagnostic, not a gate
-    headline["n_gen_failed"] = n_gen_failed
+    headline["n_gt_missing"] = n_gt_missing
     headline["matcher"] = "DisorderedStructureMatcher(0.3/0.5/10)"
     return headline, examples, n_scored
 
@@ -1558,26 +1537,32 @@ def _score_app(args, rows, gens_per_row, target_comp_per_row, planner_text_per_r
                 "n_atoms": n_atoms, "elements": elements_set,
                 "density": density, "volume_per_atom": vpa}
 
-    # Flatten gens; filter out-of-range Z (device-side asserts in MatterSim).
+    # Flatten gens. Unconvertible structures and Z outside [1, 94] (MatterSim device-asserts)
+    # are not relaxed; they score 0 and stay in the per-prompt denominator.
     flat: list[Structure] = []
     flat_meta: list[int] = []
+    failed_row_ids: list[str] = []  # structures that score 0 without being judged
+    n_conversion_error = 0
     n_filtered_z = 0
     for i, gens in enumerate(gens_per_row):
-        for g in gens:
+        for g in gens[:args.K]:
             s = _to_struct(g)
-            if s is None:
-                continue
             try:
-                zs = [int(site.specie.Z) for site in s]
+                zs = [int(site.specie.Z) for site in s] if s is not None else None
             except Exception:
+                zs = None
+            if zs is None:
+                n_conversion_error += 1
+                failed_row_ids.append(rows[i]["row_id"])
                 continue
             if not zs or any(z < 1 or z > 94 for z in zs):
                 n_filtered_z += 1
+                failed_row_ids.append(rows[i]["row_id"])
                 continue
             flat.append(s); flat_meta.append(i)
-    if n_filtered_z:
-        print(f"[bridge-edit:app] pre-filtered {n_filtered_z} structures with out-of-range Z",
-              flush=True)
+    if n_filtered_z or n_conversion_error:
+        print(f"[bridge-edit:app] {n_conversion_error} unconvertible and {n_filtered_z} "
+              f"out-of-range-Z structures score 0", flush=True)
 
     if args.skip_relax:
         relaxed_atoms = [AseAtomsAdaptor.get_atoms(s) for s in flat]
@@ -1594,7 +1579,7 @@ def _score_app(args, rows, gens_per_row, target_comp_per_row, planner_text_per_r
     judge_items: list[dict] = []
     judge_back_row: list[int] = []
     n_nan_energy = 0
-    failed_row_ids: list[str] = []  # NaN energy after relaxation: scored 0, not judged
+    n_characterization_error = 0
     for row_i, raw_s, atoms in zip(flat_meta, flat, relaxed_atoms):
         try:
             struct = AseAtomsAdaptor.get_structure(atoms)
@@ -1616,7 +1601,8 @@ def _score_app(args, rows, gens_per_row, target_comp_per_row, planner_text_per_r
             })
             judge_back_row.append(row_i)
         except Exception:
-            pass
+            n_characterization_error += 1
+            failed_row_ids.append(rows[row_i]["row_id"])
 
     reset_failure_counts()
     print(f"[bridge-edit:app] dispatching {len(judge_items)} judge calls "
@@ -1636,7 +1622,7 @@ def _score_app(args, rows, gens_per_row, target_comp_per_row, planner_text_per_r
     n_gated_invalid = 0
     for item, verdict in zip(judge_items, verdicts):
         score = parse_score(verdict, default=0)
-        if not item.get("_valid", True):          # validity gate: invalid structure scores 0
+        if not item.get("_valid", True):  # invalid structures score 0
             if score:
                 n_gated_invalid += 1
             score = 0
@@ -1646,8 +1632,11 @@ def _score_app(args, rows, gens_per_row, target_comp_per_row, planner_text_per_r
                          "judge_reason": verdict.get("reason") if verdict else None,
                          "extracted_application": verdict.get("extracted_application") if verdict else None})
 
-    # Every prompt contributes to the denominator; one with no judged structure scores 0.
-    per_prompt = {r["row_id"]: judged.get(r["row_id"], [0]) for r in rows}
+    # Every prompt counts, with K slots; missing generations are padded with 0.
+    per_prompt = {}
+    for r in rows:
+        v = judged.get(r["row_id"], [])
+        per_prompt[r["row_id"]] = v + [0] * (args.K - len(v))
     per_prompt_mean = {rid: float(np.mean(s)) for rid, s in per_prompt.items()}
     overall_mean = float(np.mean(list(per_prompt_mean.values()))) if per_prompt_mean else 0.0
     score_2_rate = float(np.mean([s == 2 for ss in per_prompt.values() for s in ss])) \
@@ -1655,11 +1644,18 @@ def _score_app(args, rows, gens_per_row, target_comp_per_row, planner_text_per_r
     n_scored = len(judge_items)
 
     headline = {
-        "overall_consistency_mean_per_prompt": overall_mean,   # ∈ [0,2]  PRIMARY (validity-gated)
+        "overall_consistency_mean_per_prompt": overall_mean,   # in [0, 2]; primary (invalid structures score 0)
         "fraction_score_2": score_2_rate,
         "n_prompts_scored": len(per_prompt),
         "n_gated_invalid": n_gated_invalid,
         "n_nan_energy": n_nan_energy,
+        "n_conversion_error": n_conversion_error,
+        "n_z_out_of_range": n_filtered_z,
+        "n_characterization_error": n_characterization_error,
+        "n_expected": len(rows) * args.K,
+        "n_gen_failed": len(rows) * args.K - len(judge_items),
+        "gen_failed_rate": ((len(rows) * args.K - len(judge_items)) / (len(rows) * args.K)
+                            if rows else 0.0),
         "n_judge_calls": len(judge_items),
         "n_judge_failures": int(sum(fc.values())) if fc else 0,
         "n_planner_parse_fail": n_planner_parse_fail,
@@ -1720,14 +1716,10 @@ def _save_showcase_cifs(args, rows, gens_per_row, examples, target_comp_per_row)
                     "judge_score": sc,
                     "judge_application": v.get("extracted_application"),
                     "judge_reason": v.get("judge_reason"),
-                    "why_success": "The gpt-4o-mini app-consistency judge scored this "
-                                   "prompt's generations 2/2 (fully consistent with the "
-                                   "requested application) on the relaxed structures. The "
-                                   "saved CIF is a representative raw generated candidate "
-                                   "for the prompt (same planner-fixed composition).",
+                    "why_success": f"{args.judge_model} app-consistency score 2/2 on relaxed structures",
                 }) + "\n")
                 saved += 1
-        print(f"[save_cifs] app: wrote {saved} showcase example(s) → {out}", flush=True)
+        print(f"[save_cifs] app: wrote {saved} showcase example(s) to {out}", flush=True)
         return
 
     # structured tasks: per_candidate boolean success flag
@@ -1742,30 +1734,20 @@ def _save_showcase_cifs(args, rows, gens_per_row, examples, target_comp_per_row)
         if not gens:
             continue
         pcs = e.get("per_candidate_scores", [])
-        # re-walk gens in the same skip-None order the scorers use so the index aligns with pcs
-        cand_structs = []
-        for g in gens:
-            s = _to_struct(g)
-            if s is None:
-                continue
-            cand_structs.append(s)
+        # per_candidate_scores[j] scores gens[j]; failed and padding slots never succeed.
+        n_real = min(len(gens), len(pcs))
         win_j = None
         if task in ("describe", "ood"):  # prefer struct_match, else comp_match
-            for j, sc in enumerate(pcs):
-                if j < len(cand_structs) and sc.get("struct_match"):
-                    win_j = j; break
-            if win_j is None:
-                for j, sc in enumerate(pcs):
-                    if j < len(cand_structs) and sc.get("comp_match"):
-                        win_j = j; break
+            for flag in ("struct_match", "comp_match"):
+                win_j = next((j for j in range(n_real) if pcs[j].get(flag)), None)
+                if win_j is not None:
+                    break
         else:
-            for j, sc in enumerate(pcs):
-                if j < len(cand_structs) and sc.get(success_key):
-                    win_j = j; break
+            win_j = next((j for j in range(n_real) if pcs[j].get(success_key)), None)
         if win_j is None:
             continue
-        gen_s = cand_structs[win_j]
-        if not _structurally_valid(gen_s):
+        gen_s = _to_struct(gens[win_j])
+        if gen_s is None or not _structurally_valid(gen_s):
             continue
 
         tag = f"almedit_{task}_{saved+1:02d}_{gen_s.composition.reduced_formula}"
@@ -1773,7 +1755,7 @@ def _save_showcase_cifs(args, rows, gens_per_row, examples, target_comp_per_row)
                 "gen_formula": str(gen_s.composition.reduced_formula)}
         input_struct = None
         if "input_atoms_struct" in rows[i]:
-            input_struct = _ase_to_struct(rows[i]["input_atoms_struct"])
+            input_struct = _struct_from_dict(rows[i]["input_atoms_struct"])
         if input_struct is not None:
             ip = out / f"{tag}_input.cif"
             input_struct.to(filename=str(ip))
@@ -1787,44 +1769,37 @@ def _save_showcase_cifs(args, rows, gens_per_row, examples, target_comp_per_row)
         sc = pcs[win_j]
         if task == "polymorph":
             meta["why_success"] = (
-                "Same composition as the input (composition_preserved), a genuinely "
-                "DISTINCT structure (StructureMatcher != input), structurally valid, and "
-                "MatterSim-relaxed energy/atom BELOW the relaxed input → a real "
-                "lower-energy polymorph.")
+                "same composition, distinct from input, valid, lower relaxed energy per atom")
             meta.update({k: sc.get(k) for k in
                          ("e_gen_per_atom", "e_input_per_atom",
                           "composition_preserved", "structurally_distinct")})
         elif task == "atomtxt":
             meta["why_success"] = (
-                f"Requested to move {sc.get('property')} {sc.get('requested_direction')}; the "
-                f"relaxed generated structure moved it the requested way "
-                f"(direction_correct) at fixed composition.")
+                f"{sc.get('property')} moved {sc.get('requested_direction')} as requested "
+                f"at fixed composition")
             meta.update({k: sc.get(k) for k in
                          ("property", "requested_direction", "prop_input", "prop_gen",
                           "delta_prop", "composition_preserved")})
         elif task == "doping":
             meta["why_success"] = (
-                f"Dopant {rows[i].get('_dopant')} present, donor {rows[i].get('_donor')} "
-                f"removed, ratio matches, valid, and distinct from a naive coords-identical "
-                f"relabel → a real substitution.")
+                f"dopant {rows[i].get('_dopant')} present, donor {rows[i].get('_donor')} "
+                f"removed, ratio matches, valid, distinct from a naive relabel")
             meta.update({k: sc.get(k) for k in
                          ("dopant_present", "donor_removed", "ratio_match",
                           "distinct_from_relabel", "gen_formula")})
             meta["donor"] = rows[i].get("_donor"); meta["dopant"] = rows[i].get("_dopant")
         elif task == "strain":
             meta["why_success"] = (
-                f"Doping correct AND the relaxed-equilibrium volume change hit the target "
-                f"dV={sc.get('target_dv_pct')}% (realized {sc.get('realized_dv_pct')}%, "
-                f"within tol).")
+                f"doping correct and relaxed volume change {sc.get('realized_dv_pct')}% "
+                f"within tolerance of target {sc.get('target_dv_pct')}%")
             meta.update({k: sc.get(k) for k in
                          ("target_dv_pct", "realized_dv_pct", "doping_correct",
                           "volume_match", "gen_formula")})
             meta["donor"] = rows[i].get("_donor"); meta["dopant"] = rows[i].get("_dopant")
         else:  # describe / ood
             meta["why_success"] = (
-                "Text→structure recovery: generated reduced formula matches the GT and "
-                + ("the geometry matches under DisorderedStructureMatcher (struct_match)."
-                   if sc.get("struct_match") else "the composition matches (comp_match).") )
+                "structure matches the ground truth (DisorderedStructureMatcher)"
+                if sc.get("struct_match") else "reduced formula matches the ground truth")
             meta["gt_formula"] = e.get("gt_formula")
             meta.update({k: sc.get(k) for k in ("comp_match", "struct_match")})
 
@@ -1833,7 +1808,7 @@ def _save_showcase_cifs(args, rows, gens_per_row, examples, target_comp_per_row)
         saved += 1
         print(f"[save_cifs] {task}: saved {tag} (row {rid})", flush=True)
 
-    print(f"[save_cifs] {task}: wrote {saved} showcase example(s) → {out}", flush=True)
+    print(f"[save_cifs] {task}: wrote {saved} showcase example(s) to {out}", flush=True)
 
 
 if __name__ == "__main__":

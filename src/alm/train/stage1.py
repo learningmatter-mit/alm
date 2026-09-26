@@ -17,8 +17,6 @@ import wandb
 def train(args):
     dist.init_process_group(backend='nccl', init_method='env://')
     local_rank = int(os.environ["LOCAL_RANK"])
-    local_world_size = int(os.environ['WORLD_SIZE'])
-    local_env_rank = int(os.environ['RANK'])
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     main_process = is_main_process()
@@ -153,7 +151,7 @@ def train(args):
                     f"at epoch {start_epoch}."
                 )
         else:
-            # Backward compat: projector-only checkpoints.
+            # Raw projector state_dict (no optimizer/scheduler state).
             model.module.projector.load_state_dict(checkpoint)
             if main_process:
                 print(
@@ -270,8 +268,9 @@ def train(args):
                                             row_batch=row_batch, atom_embeds=atom_embeds)
                             val_loss += outputs.loss.item()
 
-                print(f"Epoch {epoch}, Validation Loss: {(val_loss / len(val_dataloader)):.4f}")
                 avg_val_loss = val_loss / len(val_dataloader)
+                if main_process:
+                    print(f"Epoch {epoch}, val loss {avg_val_loss:.4f}")
                 if use_wandb:
                     wandb.log(
                         {
@@ -300,11 +299,10 @@ def train(args):
                                 "optimizer_state_dict": optim.state_dict(),
                                 "scheduler_state_dict": scheduler.state_dict(),
                                 "epoch": epoch + 1,
-                                    "global_step": (epoch + 1) * len(train_dataloader),
-                                },
-                                checkpoint_path,
-                            )
-            
+                                "global_step": (epoch + 1) * len(train_dataloader),
+                            },
+                            checkpoint_path,
+                        )
 
     # Final save when --max_steps caps the run before the eval-cadence save fires.
     if args.max_steps is not None and is_main_process():
@@ -320,7 +318,7 @@ def train(args):
             },
             final_path,
         )
-        print(f"[stage1-exit] saved final projector → {final_path}")
+        print(f"Saved final projector to {final_path}")
 
     if use_wandb:
         wandb.finish()
@@ -344,8 +342,7 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_epochs", type=int, default=5)
     parser.add_argument("--max_steps", type=int, default=None,
-                        help="Optional step cap (early-exits the inner loop). "
-                             "Default None = run num_epochs to completion.")
+                        help="Stop after this many steps (default: run all epochs).")
     parser.add_argument("--thinking", action="store_true")
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--disable_wandb", action="store_true")

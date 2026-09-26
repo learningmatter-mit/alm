@@ -46,10 +46,7 @@ class _EmptyDataset(Dataset):
         return 0
 
     def __getitem__(self, idx):
-        raise IndexError(
-            f"_EmptyDataset has no items (idx={idx}); this bucket should have "
-            "weight=0 and never be sampled. If you see this, the sampler is "
-            "drawing from a zero-weight bucket — check --bucket_weights.")
+        raise IndexError(f"index {idx} sampled from an empty bucket; check --bucket_weights")
 
 
 def _narrative_subsets(tokenizer, parquet_dir, cache_dir, max_num_tokens, task_fn,
@@ -83,7 +80,7 @@ def build_stage2_datasets(args, tokenizer, weights=None):
             if float(w) == 0.0:
                 skip.add(name)
         if skip and is_main_process():
-            print(f"[stage2] zero-weight buckets — skipping eager load: {sorted(skip)}")
+            print(f"[stage2] skipping zero-weight buckets: {sorted(skip)}")
 
     if "describe" in skip:
         describe_bucket = _EmptyDataset()
@@ -223,7 +220,7 @@ def train(args):
     use_wandb = main_process and not args.disable_wandb
 
     weights = [float(x) for x in args.bucket_weights.split(",")]
-    # Backward-compat: pad a legacy 5-entry string with 0.0 for the matterchat bucket.
+    # Five weights means no matterchat entry; treat its weight as 0.
     if len(weights) == len(BUCKET_NAMES) - 1:
         weights = weights + [0.0]
     assert len(weights) == len(BUCKET_NAMES), \
@@ -233,11 +230,8 @@ def train(args):
     mc_idx = BUCKET_NAMES.index("matterchat")
     if args.matterchat_in_property_apps and weights[mc_idx] > 0:
         raise ValueError(
-            f"--matterchat_in_property_apps is True (default) but weights[{mc_idx}] "
-            f"(matterchat) = {weights[mc_idx]}. The matterchat bucket is empty in "
-            "this mode (matterchat data lives inside property_apps). Either pass "
-            "--no-matterchat_in_property_apps to extract it as a separate bucket, "
-            "or set the matterchat weight to 0.")
+            f"matterchat weight is {weights[mc_idx]}, but MatterChat is mixed into "
+            "property_apps; set its weight to 0 or pass --no-matterchat_in_property_apps.")
 
     model = AtomisticLanguageModel(
         llm_name=args.llm_name,
@@ -263,7 +257,7 @@ def train(args):
         sd = {k.replace(".lora_A.weight", ".lora_A.default.weight")
                .replace(".lora_B.weight", ".lora_B.default.weight"): v
               for k, v in sd.items()}
-        # Vocab-resize migration: copy old rows into the matching prefix when the current model grew.
+        # If the vocab grew since the adapter was saved, copy the saved rows into the leading slice.
         cur_sd = model.llm.state_dict()
         for k in list(sd.keys()):
             if k in cur_sd and sd[k].shape != cur_sd[k].shape:
@@ -273,7 +267,7 @@ def train(args):
                     new[tuple(slice(0, s) for s in old.shape)] = old.to(new.dtype)
                     sd[k] = new
                     if main_process:
-                        print(f"  resized {k}: {tuple(old.shape)} → {tuple(new.shape)}")
+                        print(f"  resized {k}: {tuple(old.shape)} -> {tuple(new.shape)}")
         _, unexpected = model.llm.load_state_dict(sd, strict=False)
         assert not unexpected, f"unexpected keys after rename: {unexpected[:5]}..."
         if main_process:
@@ -578,7 +572,7 @@ def save_checkpoint(model, optim, scheduler, global_opt_step, save_root, main_pr
         },
         ckpt_dir / "projector_and_state.pt",
     )
-    print(f"Saved Stage 2 checkpoint → {ckpt_dir}")
+    print(f"Saved Stage 2 checkpoint to {ckpt_dir}")
 
 
 if __name__ == "__main__":
@@ -592,7 +586,7 @@ if __name__ == "__main__":
                    help="MatterChat MP train CSV (128k rows). Skipped if missing.")
     p.add_argument("--matterchat_train_cache", type=str,
                    default="data/matterchat/cached_embs/orb_v3_direct_20_omat_train_atom.flat.bin",
-                   help="OrbV3 cache for matterchat MP train. Build via cache_embeddings_atomistic_orbv3.py.")
+                   help="OrbV3 cache for matterchat MP train. Build via scripts/cache_embeddings_atomistic.py --source ase_db --split train --id_key material_id.")
     p.add_argument("--matterchat_val_csv", type=str,
                    default="data/matterchat/val.csv",
                    help="MatterChat MP val CSV (~14k rows). Held-out, used only for val/loss_matterchat.")
@@ -605,8 +599,8 @@ if __name__ == "__main__":
     p.add_argument("--camel_jsonl",   type=str, default=os.path.join(DATA_ROOT, "camel_ai.jsonl"))
     p.add_argument("--max_num_tokens", type=int, default=2048)
     p.add_argument("--bucket_weights", type=str, default="0.408,0.408,0.14,0.04,0,0",
-                   help="order: describe, property_apps, arxiv, camel, mascqa, matterchat (0 = skip). "
-                        "Legacy 5-entry strings (no matterchat) are accepted and padded with 0.")
+                   help="Order: describe, property_apps, arxiv, camel, mascqa, matterchat; 0 skips a bucket. "
+                        "The matterchat weight may be omitted.")
     p.add_argument("--resume_from_stage1", type=str, default=None)
     p.add_argument("--resume_from_stage2", type=str, default=None)
     p.add_argument("--reset_optim_on_resume", action="store_true",
@@ -615,11 +609,8 @@ if __name__ == "__main__":
                         "--lora_lr / --projector_lr / --total_optim_steps. Use this for "
                         "continuation runs where the resumed cosine has already decayed to ~0.")
     p.add_argument("--matterchat_in_property_apps", action=argparse.BooleanOptionalAction, default=True,
-                   help="(default True) Include matterchat_mp data inside the property_apps bucket. "
-                        "Pass --no-matterchat_in_property_apps "
-                        "to extract matterchat into its own (6th) bucket so its sampling weight can be "
-                        "set independently via --bucket_weights. When True, the matterchat bucket weight "
-                        "must be 0; when False, set the matterchat weight to a positive value.")
+                   help="Mix MatterChat data into property_apps. With --no-matterchat_in_property_apps "
+                        "it becomes a separate bucket weighted by the 6th --bucket_weights entry.")
     p.add_argument("--atomistic_model_name", type=str, default="orb_v3_direct_20_omat",
                    help="Encoder tag baked into cached-embedding filenames "
                         "({atomistic_model_name}_{split}_atom.flat.bin). Default is OrbV3.")
@@ -627,9 +618,8 @@ if __name__ == "__main__":
                    help="Per-atom feature dim of the cached embeddings. OrbV3=256, UMA=128, "
                         "PET-MAD variable.")
     p.add_argument("--atom_bidirectional_attention", action="store_true",
-                   help="Let atom tokens attend to each other bidirectionally; text and "
-                        "[atoms_i] tokens stay causal. Switches attention to SDPA, about "
-                        "10-15%% slower than flash-attention-2.")
+                   help="Use bidirectional attention among atom tokens inside the <atoms> block "
+                        "(forces sdpa; ~10-15%% slower).")
     p.add_argument("--llm_name", type=str, default="Qwen/Qwen3-8B",
                    help="Base LLM (HuggingFace id), e.g. Qwen/Qwen3-4B.")
     p.add_argument("--lora_rank", type=int, default=64)

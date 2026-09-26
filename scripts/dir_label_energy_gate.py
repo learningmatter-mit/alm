@@ -154,10 +154,9 @@ def main():
                 disagree += 1
         tot = agree + disagree
         rate = agree / tot if tot else float("nan")
-        print(f"\n[gate] {parent}: ordering agreement")
-        print(f"  scored={tot}  unscorable(NaN relax)={nan}")
-        print(f"  DFT↔MatterSim same-sign ΔE = {agree}/{tot} = {rate:.3f}")
-        print(f"  recommendation: {'use DFT labels (high agreement)' if rate >= 0.8 else 'relabel with MatterSim (low agreement)'}\n", flush=True)
+        verdict = "DFT labels usable" if rate >= 0.8 else "relabel with MatterSim"
+        print(f"[gate] {parent}: DFT/MatterSim same-sign dE {agree}/{tot} = {rate:.3f} "
+              f"({nan} unscorable); {verdict}", flush=True)
 
 
 if __name__ == "__main__":

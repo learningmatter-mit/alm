@@ -1,16 +1,13 @@
 """Load an ALM checkpoint for evaluation."""
 
 import json
-import os
-import sys
 from pathlib import Path
 
 import torch
 from peft import LoraConfig, get_peft_model
 from safetensors.torch import load_file
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from model import AtomisticLanguageModel  # alm/alm.py module, not package
+from model import AtomisticLanguageModel
 
 
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
@@ -18,8 +15,13 @@ LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
 
 
 def _apply_lora_adapter(llm, adapter_dir: Path, lora_rank=None, lora_alpha=None,
-                        merge: bool = True):
-    """Attach a PEFT LoRA adapter onto `llm` and optionally merge it; replayable for a second adapter atop an already-merged base."""
+                        merge: bool = True, target_modules=None):
+    """Attach a LoRA adapter to `llm` and optionally merge it. Can be called again to stack a second adapter on a merged model.
+
+    The weights are loaded manually (not via PEFT from_pretrained) to skip its strict shape check, so a
+    checkpoint saved with a different vocab size (num_output_atom_tokens) still loads: the matching
+    prefix of each resized tensor is copied over.
+    """
     with open(adapter_dir / "adapter_config.json") as f:
         saved_cfg = json.load(f)
     r = lora_rank if lora_rank is not None else saved_cfg["r"]
@@ -27,10 +29,11 @@ def _apply_lora_adapter(llm, adapter_dir: Path, lora_rank=None, lora_alpha=None,
     lora_cfg = LoraConfig(
         r=r, lora_alpha=a, lora_dropout=0.0,
         bias="none", task_type="CAUSAL_LM",
-        target_modules=saved_cfg.get("target_modules", LORA_TARGET_MODULES),
+        target_modules=target_modules or saved_cfg.get("target_modules", LORA_TARGET_MODULES),
     )
     llm = get_peft_model(llm, lora_cfg)
     sd = load_file(str(adapter_dir / "adapter_model.safetensors"))
+    # PEFT strips the adapter name during save_pretrained; re-insert "default".
     sd = {k.replace(".lora_A.weight", ".lora_A.default.weight")
            .replace(".lora_B.weight", ".lora_B.default.weight"): v
           for k, v in sd.items()}
@@ -44,10 +47,10 @@ def _apply_lora_adapter(llm, adapter_dir: Path, lora_rank=None, lora_alpha=None,
                 new = cur.clone()
                 new[tuple(slice(0, s) for s in old.shape)] = old.to(new.dtype)
                 sd[k] = new
-                print(f"  resized (grow) {k}: {tuple(old.shape)} → {tuple(new.shape)}")
+                print(f"  resized (grow) {k}: {tuple(old.shape)} -> {tuple(new.shape)}")
             elif all(o >= c for o, c in zip(old.shape, cur.shape)):
                 sd[k] = old[tuple(slice(0, s) for s in cur.shape)].to(cur.dtype)
-                print(f"  resized (truncate) {k}: {tuple(old.shape)} → {tuple(cur.shape)}")
+                print(f"  resized (truncate) {k}: {tuple(old.shape)} -> {tuple(cur.shape)}")
     llm.load_state_dict(sd, strict=False)
     if merge:
         llm = llm.merge_and_unload()
@@ -96,9 +99,13 @@ def load_alm(checkpoint=None, stage1_projector=None,
              init_atoms_tokens_from_eos: bool = False,
              atom_bidirectional_attention: bool = False,
              stage2_base=None):
-    """Returns (model, tokenizer); pass exactly one of `checkpoint` (Stage 2 dir) or `stage1_projector` (.pt)."""
+    """Returns (model, tokenizer); pass exactly one of `checkpoint` (Stage 2 dir) or `stage1_projector` (.pt).
+
+    `stage2_base` (eval only): a Stage 2 checkpoint dir whose LoRA is merged first, before the
+    `checkpoint` bridge adapter is applied on top; use it for bridge checkpoints saved with a fresh LoRA.
+    """
     if (checkpoint is None) == (stage1_projector is None):
-        raise ValueError("pass exactly one of --checkpoint or --stage1_projector")
+        raise ValueError("pass exactly one of checkpoint or stage1_projector")
     if is_trainable and merge_lora:
         raise ValueError("is_trainable=True requires merge_lora=False")
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -135,15 +142,14 @@ def load_alm(checkpoint=None, stage1_projector=None,
               f"({len(missing)} missing, {len(unexpected)} unexpected)")
         state = torch.load(Path(checkpoint) / "projector_and_state.pt", map_location=device)
         model.projector.load_state_dict(state["projector_state_dict"])
-    elif (stage2_base or os.environ.get("ALM_STAGE2_BASE")) and \
-            (Path(checkpoint) / "lora_adapter").exists():
+    elif stage2_base and (Path(checkpoint) / "lora_adapter").exists():
         # The bridge adapter was trained on the merged Stage 2 model, so merge Stage 2 first.
         if is_trainable:
             raise ValueError("stage2_base two-stage load is eval-only (it merges both "
                              "adapters); drop stage2_base for training resume.")
-        s2 = Path(stage2_base or os.environ["ALM_STAGE2_BASE"])
-        print(f"[load_alm] two-stage load: Stage-2 base {s2} → "
-              f"bridge adapter {Path(checkpoint)/'lora_adapter'}", flush=True)
+        s2 = Path(stage2_base)
+        print(f"[load_alm] loading Stage 2 base {s2}, then bridge adapter "
+              f"{Path(checkpoint)/'lora_adapter'}", flush=True)
         model.llm = _apply_lora_adapter(model.llm, s2 / "lora_adapter", merge=True)
         model.llm = _apply_lora_adapter(model.llm, Path(checkpoint) / "lora_adapter",
                                         lora_rank=lora_rank, lora_alpha=lora_alpha,
@@ -151,47 +157,31 @@ def load_alm(checkpoint=None, stage1_projector=None,
         state = torch.load(Path(checkpoint) / "projector_and_state.pt", map_location=device)
         model.projector.load_state_dict(state["projector_state_dict"])
     else:
-        adapter_dir = Path(checkpoint) / "lora_adapter"
-        with open(adapter_dir / "adapter_config.json") as f:
-            saved_cfg = json.load(f)
-        r = lora_rank if lora_rank is not None else saved_cfg["r"]
-        a = lora_alpha if lora_alpha is not None else saved_cfg["lora_alpha"]
-        lora_cfg = LoraConfig(
-            r=r, lora_alpha=a, lora_dropout=0.0,
-            bias="none", task_type="CAUSAL_LM", target_modules=LORA_TARGET_MODULES,
-        )
-        # Manual load (not PEFT from_pretrained) to side-step its strict shape-check; preserves requires_grad.
-        model.llm = get_peft_model(model.llm, lora_cfg)
-        sd = load_file(str(adapter_dir / "adapter_model.safetensors"))
-        # PEFT strips the adapter name during save_pretrained; re-insert "default".
-        sd = {k.replace(".lora_A.weight", ".lora_A.default.weight")
-               .replace(".lora_B.weight", ".lora_B.default.weight"): v
-              for k, v in sd.items()}
-        # Vocab-resize migration: copy the matching prefix when num_output_atom_tokens differs.
-        cur_sd = model.llm.state_dict()
-        for k in list(sd.keys()):
-            if k in cur_sd and sd[k].shape != cur_sd[k].shape:
-                old, cur = sd[k], cur_sd[k]
-                if old.ndim != cur.ndim:
-                    continue
-                if all(o <= c for o, c in zip(old.shape, cur.shape)):
-                    new = cur.clone()
-                    new[tuple(slice(0, s) for s in old.shape)] = old.to(new.dtype)
-                    sd[k] = new
-                    print(f"  resized (grow) {k}: {tuple(old.shape)} → {tuple(new.shape)}")
-                elif all(o >= c for o, c in zip(old.shape, cur.shape)):
-                    sd[k] = old[tuple(slice(0, s) for s in cur.shape)].to(cur.dtype)
-                    print(f"  resized (truncate) {k}: {tuple(old.shape)} → {tuple(cur.shape)}")
-        model.llm.load_state_dict(sd, strict=False)
+        # Stage 2 or bridge checkpoint: LoRA on the fixed LORA_TARGET_MODULES.
+        model.llm = _apply_lora_adapter(model.llm, Path(checkpoint) / "lora_adapter",
+                                        lora_rank=lora_rank, lora_alpha=lora_alpha,
+                                        merge=merge_lora, target_modules=LORA_TARGET_MODULES)
         state = torch.load(Path(checkpoint) / "projector_and_state.pt", map_location=device)
         model.projector.load_state_dict(state["projector_state_dict"])
-        if merge_lora:
-            model.llm = model.llm.merge_and_unload()
 
     model = model.to(device)
     if not is_trainable:
         model = model.eval()
     return model, model.tokenizer
+
+
+ENCODER_NAME_BY_DIM = {256: "orb_v3_direct_20_omat", 128: "uma-s-1p1",
+                       640: "pet-mad-xs", 1280: "pet-mad-s"}
+
+
+def resolve_encoder(model, name=None, dim=None) -> tuple[str, int]:
+    """Fill in the encoder cache name and per-atom feature dim from the projector's input dim when not given."""
+    if dim is None:
+        dim = int(model.projector[0].in_features)
+    if name is None:
+        name = ENCODER_NAME_BY_DIM.get(dim, "orb_v3_direct_20_omat")
+    print(f"[load_alm] atomistic_feature_dim={dim}, atomistic_model_name={name}", flush=True)
+    return name, dim
 
 
 def load_base_only(base_model="Qwen/Qwen3-8B", device=None):

@@ -1,16 +1,12 @@
 """MatText perovskites / KVRH / GVRH MAE via live OrbV3 from CIF strings."""
 
 import argparse
-import sys
 from io import StringIO
-from pathlib import Path
 
 import torch
 from ase.io import read as ase_read
 from datasets import load_dataset
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils import _PROPERTY_PREDICTION_SYSTEM
 
 from loader import load_alm
@@ -20,25 +16,12 @@ from metrics import mae
 from runs import run_dir, write_run
 
 
+# task -> (n0w0f/MatText config, property name in the prompt). Every config has `cif_p1` and `labels` columns.
 _TASKS = {
-    "perovskites": ("perovskites-train-filtered", "heat of formation",
-                    ["labels", "heat", "heat_of_formation", "label", "target", "value"]),
-    "kvrh":        ("kvrh-train-filtered", "log10(bulk modulus)",
-                    ["labels", "log_kvrh", "log10_kvrh", "kvrh", "label", "target"]),
-    "gvrh":        ("gvrh-train-filtered", "log10(shear modulus)",
-                    ["labels", "log_gvrh", "log10_gvrh", "gvrh", "label", "target"]),
+    "perovskites": ("perovskites-train-filtered", "heat of formation"),
+    "kvrh":        ("kvrh-train-filtered", "log10(bulk modulus)"),
+    "gvrh":        ("gvrh-train-filtered", "log10(shear modulus)"),
 }
-
-
-def _pick_first(row, candidates):
-    for k in candidates:
-        if k in row and row[k] is not None and row[k] != "":
-            return row[k]
-    raise KeyError(f"none of {candidates} in row keys={list(row.keys())[:8]}")
-
-
-def _cif_from_row(row):
-    return _pick_first(row, ["cif_p1", "cif_structure", "cif", "structure", "structure_cif"])
 
 
 def _build_sample(cif, prop_name, tokenizer, max_num_tokens):
@@ -72,17 +55,18 @@ def _collate(batch):
 
 
 def _run_task(model, tokenizer, task, args):
-    config_name, prop_name, target_keys = _TASKS[task]
+    config_name, prop_name = _TASKS[task]
     # n0w0f/MatText ships 5-fold CV splits, no "test" split; default fold_0.
     ds = load_dataset("n0w0f/MatText", config_name, split=args.fold)
     if args.max_samples and args.max_samples > 0:
         ds = ds.select(range(min(args.max_samples, len(ds))))
 
     preds, targets, predictions = [], [], []
-    n_leaked = [0]   # mutable box so the inner flush() closure can write it
+    n_leaked = 0
     samples_buf, raw_targets_buf, ids_buf = [], [], []
 
     def flush():
+        nonlocal n_leaked
         if not samples_buf:
             return
         for i in range(len(samples_buf)):
@@ -98,7 +82,7 @@ def _run_task(model, tokenizer, task, args):
                                 "generated": gen, "parsed": parsed,
                                 "leaked": leaked, "ok": ok})
             if leaked:
-                n_leaked[0] += 1
+                n_leaked += 1
             if ok:
                 preds.append(parsed)
                 targets.append(float(raw))
@@ -107,9 +91,8 @@ def _run_task(model, tokenizer, task, args):
         ids_buf.clear()
 
     for i, row in enumerate(ds):
-        cif = _cif_from_row(row)
-        target = float(_pick_first(row, target_keys))
-        samples_buf.append(_build_sample(cif, prop_name, tokenizer, args.max_num_tokens))
+        target = float(row["labels"])
+        samples_buf.append(_build_sample(row["cif_p1"], prop_name, tokenizer, args.max_num_tokens))
         raw_targets_buf.append(target)
         ids_buf.append(f"{task}/{i}")
         if len(samples_buf) >= args.batch_size:
@@ -117,9 +100,9 @@ def _run_task(model, tokenizer, task, args):
     flush()
 
     n_total = len(predictions)
-    metrics = {"n_total": n_total, "n_valid": len(preds), "n_leaked": n_leaked[0],
+    metrics = {"n_total": n_total, "n_valid": len(preds), "n_leaked": n_leaked,
                "validity_rate": len(preds) / max(1, n_total),
-               "leak_rate":     n_leaked[0] / max(1, n_total)}
+               "leak_rate":     n_leaked / max(1, n_total)}
     if preds:
         metrics["mae"] = mae(preds, targets)
     return metrics, predictions
@@ -141,7 +124,7 @@ def main():
                    help="Suppress markdown-image / URL token openers at decode time (off by default).")
     args = p.parse_args()
 
-    # live OrbV3 path, so the encoder must be loaded
+    # Structures come from CIF strings, so load the live OrbV3 encoder.
     model, tokenizer = load_alm(
         checkpoint=args.checkpoint, merge_lora=not args.no_merge_lora,
         use_cached_embeddings=False,
@@ -156,7 +139,7 @@ def main():
         m, preds = _run_task(model, tokenizer, task, args)
         metrics[task] = m
         predictions.extend(preds)
-        print(f"  → {m}")
+        print(f"  {m}")
 
     write_run(run_dir("mattext", args.checkpoint), metrics, predictions)
 

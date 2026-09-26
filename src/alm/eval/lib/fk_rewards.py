@@ -2,19 +2,14 @@
 from __future__ import annotations
 
 
-import sys
-from pathlib import Path
+import math
 from typing import Iterable, Mapping, Protocol
 
 import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
 
-_ALM_DIR = Path(__file__).resolve().parents[1]
-if str(_ALM_DIR) not in sys.path:
-    sys.path.insert(0, str(_ALM_DIR))
-
-from composition_utils import symbol_to_z  # noqa: E402
+from composition_utils import symbol_to_z
 
 
 class Reward(Protocol):
@@ -62,12 +57,6 @@ def _expand_multiset_to_size(target_counts: Mapping[int, int], n_atoms: int) -> 
     multiset: list[int] = []
     for z, n in floors.items():
         multiset.extend([z] * n)
-    if len(multiset) > n_atoms:
-        return multiset[:n_atoms]
-    if len(multiset) < n_atoms:
-        # Defensive pad with the highest-count target element if rounding undershoots.
-        pad_z = max(target_counts, key=lambda z: target_counts[z])
-        multiset.extend([pad_z] * (n_atoms - len(multiset)))
     return multiset
 
 
@@ -84,11 +73,8 @@ class StoichiometricMatchReward:
         self.target_counts = dict(target_counts)
         self.eps = eps
 
-    def __call__(self, x_hat_0, t, t_idx, *, _probs_override=None):
-        if _probs_override is not None:
-            probs = _probs_override
-        else:
-            probs = torch.softmax(x_hat_0["atomic_numbers_logits"][:, :100], dim=-1)
+    def __call__(self, x_hat_0, t, t_idx):
+        probs = torch.softmax(x_hat_0["atomic_numbers_logits"][:, :100], dim=-1)
         batch_idx = x_hat_0["batch_idx"]
         n_particles = int(batch_idx.max().item()) + 1
         scores = torch.zeros(n_particles, device=probs.device, dtype=probs.dtype)
@@ -119,11 +105,8 @@ class StoichCountL1Reward:
     def __init__(self, target_counts: Mapping[int, int]):
         self.target_counts = dict(target_counts)
 
-    def __call__(self, x_hat_0, t, t_idx, *, _probs_override=None):
-        if _probs_override is not None:
-            probs = _probs_override
-        else:
-            probs = torch.softmax(x_hat_0["atomic_numbers_logits"][:, :100], dim=-1)
+    def __call__(self, x_hat_0, t, t_idx):
+        probs = torch.softmax(x_hat_0["atomic_numbers_logits"][:, :100], dim=-1)
         batch_idx = x_hat_0["batch_idx"]
         n_particles = int(batch_idx.max().item()) + 1
         argmax_z = probs.argmax(dim=-1)                          # 0-indexed
@@ -154,11 +137,8 @@ class StoichRatioKLReward:
     def __init__(self, target_counts: Mapping[int, int]):
         self.target_counts = dict(target_counts)
 
-    def __call__(self, x_hat_0, t, t_idx, *, _probs_override=None):
-        if _probs_override is not None:
-            probs = _probs_override
-        else:
-            probs = torch.softmax(x_hat_0["atomic_numbers_logits"][:, :100], dim=-1)
+    def __call__(self, x_hat_0, t, t_idx):
+        probs = torch.softmax(x_hat_0["atomic_numbers_logits"][:, :100], dim=-1)
         batch_idx = x_hat_0["batch_idx"]
         n_particles = int(batch_idx.max().item()) + 1
         argmax_z = probs.argmax(dim=-1)
@@ -193,30 +173,14 @@ class InSetCompletenessReward:
 
     name = "in_set_completeness"
 
-    def __init__(self, target_elements: Iterable[str], mode: str = "soft"):
+    def __init__(self, target_elements: Iterable[str]):
         s2z = symbol_to_z()
         self.target_zs = sorted(
             {s2z[s.strip()] for s in target_elements if s.strip() in s2z}
         )
-        self.mode = mode
 
-    def __call__(self, x_hat_0, t, t_idx, *, _probs_override=None):
-        if self.mode == "hard":
-            if _probs_override is not None:
-                raise ValueError("hard mode does not support _probs_override")
-            zs = x_hat_0["atomic_numbers_logits"][:, :100].argmax(dim=-1) + 1
-            n_particles = int(x_hat_0["batch_idx"].max().item()) + 1
-            scores = []
-            for p in range(n_particles):
-                present = set(zs[x_hat_0["batch_idx"] == p].tolist())
-                hit = sum(1 for z in self.target_zs if z in present)
-                scores.append(hit / max(len(self.target_zs), 1))
-            return torch.tensor(scores, device=zs.device, dtype=torch.float32)
-
-        if _probs_override is not None:
-            probs = _probs_override
-        else:
-            probs = torch.softmax(x_hat_0["atomic_numbers_logits"][:, :100], dim=-1)
+    def __call__(self, x_hat_0, t, t_idx):
+        probs = torch.softmax(x_hat_0["atomic_numbers_logits"][:, :100], dim=-1)
         batch_idx = x_hat_0["batch_idx"]
         n_particles = int(batch_idx.max().item()) + 1
         target_cols = [z - 1 for z in self.target_zs]
@@ -256,11 +220,8 @@ class PhysicalSanityReward:
     def _viol_hi(val: float, hi: float) -> float:
         return max(0.0, (val - hi) / max(abs(hi), 1e-3))
 
-    def __call__(self, x_hat_0, t, t_idx, *, _probs_override=None):
-        if _probs_override is not None:
-            probs = _probs_override
-        else:
-            probs = torch.softmax(x_hat_0["atomic_numbers_logits"][:, :100], dim=-1)
+    def __call__(self, x_hat_0, t, t_idx):
+        probs = torch.softmax(x_hat_0["atomic_numbers_logits"][:, :100], dim=-1)
         pos = x_hat_0["pos"]            # (N_atoms_total, 3) cartesian
         cell = x_hat_0["cell"]          # (n_particles, 3, 3)
         batch_idx = x_hat_0["batch_idx"]  # (N_atoms_total,)
@@ -330,6 +291,9 @@ class PhysicalSanityReward:
         return scores
 
 
+_MATTERSIM_MAX_Z = 94  # MatterSim's atomic-number one-hot covers Z = 1..94
+
+
 class MatterSimEnergyReward:
     """Soft [-1,0] penalty proportional to MatterSim energy/atom; biases toward low-energy structures."""
 
@@ -381,11 +345,9 @@ class MatterSimEnergyReward:
         cell_cpu = cell.detach().cpu().numpy()
         batch_cpu = batch_idx.detach().cpu().tolist()
 
-        # Skip particles with Z outside MatterSim's one-hot range (Z>94): the OOB
-        # one-hot fires an async device assert that poisons the CUDA context and is
-        # uncatchable by the try/except below. Same for non-finite cell/pos.
-        import numpy as _np
-        _MS_MAX_Z = int(getattr(getattr(self.potential, "model", None), "max_z", 94))
+        # Skip particles with Z outside MatterSim's one-hot range (Z>94): the out-of-range
+        # one-hot fires an async device assert that poisons the CUDA context. Same for
+        # non-finite cell/pos.
         atoms_list = []
         valid_indices = []
         for p in range(n_particles):
@@ -395,18 +357,12 @@ class MatterSimEnergyReward:
             pp = pos_cpu[slice_idx]
             zs = [argmax_z[i] for i in slice_idx]
             C = cell_cpu[p]
-            if any((z < 1 or z > _MS_MAX_Z) for z in zs):
+            if any((z < 1 or z > _MATTERSIM_MAX_Z) for z in zs):
                 continue
-            if not _np.isfinite(C).all() or not _np.isfinite(pp).all():
+            if not np.isfinite(C).all() or not np.isfinite(pp).all():
                 continue
-            try:
-                atoms = _Atoms(
-                    numbers=zs, positions=pp, cell=cell_cpu[p], pbc=True,
-                )
-                atoms_list.append(atoms)
-                valid_indices.append(p)
-            except Exception:
-                pass
+            atoms_list.append(_Atoms(numbers=zs, positions=pp, cell=C, pbc=True))
+            valid_indices.append(p)
 
         scores = torch.full((n_particles,), -1.0, device=pos.device, dtype=pos.dtype)
         if not atoms_list:
@@ -432,7 +388,7 @@ class MatterSimEnergyReward:
                 e_atom = float(e_total) / n_atoms
             except (TypeError, ValueError):
                 continue
-            if not (e_atom == e_atom) or e_atom in (float("inf"), float("-inf")):
+            if not math.isfinite(e_atom):
                 continue
             per_particle_e_atom.append((p, e_atom))
 
@@ -536,7 +492,7 @@ class OrbV3EnergyReward:
                 e_atom = float(e_total) / max(1, n_p)
             except (TypeError, ValueError):
                 continue
-            if not (e_atom == e_atom) or e_atom in (float("inf"), float("-inf")):
+            if not math.isfinite(e_atom):
                 continue
             per_particle_e_atom.append((p, e_atom))
         if not per_particle_e_atom:
@@ -612,7 +568,6 @@ class DensityDirectionReward:
 
     @torch.no_grad()
     def __call__(self, x_hat_0, t, t_idx):
-        import numpy as _np
         from ase.data import atomic_masses
         cell = x_hat_0["cell"]
         batch_idx = x_hat_0["batch_idx"]
@@ -634,7 +589,7 @@ class DensityDirectionReward:
             if not slice_idx:
                 dens.append(None); continue
             mass = sum(float(atomic_masses[argmax_z[i]]) for i in slice_idx)
-            vol = abs(float(_np.linalg.det(cell_cpu[p])))
+            vol = abs(float(np.linalg.det(cell_cpu[p])))
             d = (mass * 1.66054 / vol) if vol > 1e-6 else float("nan")
             dens.append(d if d == d else None)
         scores = torch.full((n_particles,), -1.0, device=cell.device, dtype=cell.dtype)
@@ -651,8 +606,8 @@ class DensityDirectionReward:
 class VolumeTargetReward:
     """Geometric reward (no MLFF) matching per-atom volume to a fixed target_vpa, in [-1, 0].
 
-    Strain task: a signed direction reward would overshoot the gate's target magnitude,
-    so steer toward the recorded target_vpa instead.
+    For strain prompts a signed direction reward overshoots the requested change, so this reward
+    steers toward target_vpa.
     """
 
     name = "volume_target"
@@ -663,7 +618,6 @@ class VolumeTargetReward:
 
     @torch.no_grad()
     def __call__(self, x_hat_0, t, t_idx):
-        import numpy as _np
         cell = x_hat_0["cell"]
         batch_idx = x_hat_0["batch_idx"]
         n_particles = int(batch_idx.max().item()) + 1
@@ -676,7 +630,7 @@ class VolumeTargetReward:
             n_p = sum(1 for b in batch_cpu if b == p)
             if n_p == 0:
                 continue
-            vol = abs(float(_np.linalg.det(cell_cpu[p])))
+            vol = abs(float(np.linalg.det(cell_cpu[p])))
             if not (vol > 1e-6):
                 continue  # degenerate cell -> full penalty
             vpa = vol / n_p
@@ -724,8 +678,8 @@ def parse_rewards(
         if name in ("stoich_match", "count_l1", "ratio_kl"):
             if not target_counts:
                 raise ValueError(
-                    f"{name} needs --fk_target_counts (Z:n,…) "
-                    "OR --fk_target_counts_from_prompt_json <path:tag>"
+                    f"{name} needs target_counts (--fk_target_counts Z:n,... "
+                    "or --fk_target_counts_from_prompt_json <path:tag>)"
                 )
             out.append((cls(target_counts), weight))
         elif name == "in_set_completeness":
@@ -737,8 +691,8 @@ def parse_rewards(
         elif name == "physical_sanity":
             if not physical_bounds:
                 raise ValueError(
-                    "physical_sanity needs --fk_physical_bounds_path "
-                    "(JSON written by scripts/calibrate_physical_priors.py)"
+                    "physical_sanity needs physical_bounds "
+                    "(a JSON written by scripts/calibrate_physical_priors.py)"
                 )
             out.append((cls(physical_bounds), weight))
         elif name == "mattersim_energy":
@@ -749,11 +703,7 @@ def parse_rewards(
             out.append((cls(direction=direction), weight))
         elif name == "volume_target":
             if target_vpa is None:
-                raise ValueError(
-                    "volume_target needs a target_vpa (target per-atom volume, "
-                    "Å³/atom — the caller computes it from the row's input volume "
-                    "and recorded dV%)"
-                )
+                raise ValueError("volume_target needs target_vpa (target volume per atom, Å³)")
             out.append((cls(target_vpa=target_vpa), weight))
         elif name == "sg_match":
             if not target_sg:

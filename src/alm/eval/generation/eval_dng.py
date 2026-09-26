@@ -1,10 +1,13 @@
-"""De-novo generation eval: generate N structures, score validity/metastability/SUN via MatterSim relax + MP2020 hull. Unconditional (g=0) or conditional (--prompts_from_parquet, g>0)."""
+"""De novo generation eval: generate N structures and score validity, stability and SUN via MatterSim relaxation and the MP-2020 hull. Unconditional (g=0) or conditional (--prompts_from_parquet, g>0).
+
+Rates divide by the number of requested structures; generations that failed or went missing count
+as invalid, not stable, not unique and not novel (n_gen_failed reports them).
+"""
 from __future__ import annotations
 
 
 import argparse
 import os
-import sys
 from collections import Counter
 from pathlib import Path
 
@@ -13,8 +16,6 @@ import torch
 from ase.io import write as ase_write
 from pymatgen.core.structure import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # alm/
 
 from runs import run_dir, write_run  # noqa: E402
 from structure_metrics import (  # noqa: E402
@@ -27,11 +28,11 @@ from structure_metrics import (  # noqa: E402
     unique_indices,
     validity_full,
 )
-from paths import DATA_ROOT  # noqa: E402
+from paths import ALM_BENCH  # noqa: E402
 
 
 def _atoms_struct_to_pymatgen(struct_dict: dict) -> Structure:
-    """Convert a pairs.parquet `atoms_struct` row to a pymatgen Structure."""
+    """Convert a pairs parquet `atoms_struct` row to a pymatgen Structure."""
     from pymatgen.core import Lattice
     lat = Lattice(np.asarray(struct_dict["lattice_mat"]))
     coords = np.asarray(struct_dict["coords"])
@@ -40,8 +41,13 @@ def _atoms_struct_to_pymatgen(struct_dict: dict) -> Structure:
     return Structure(lat, elements, coords, coords_are_cartesian=cartesian)
 
 
+def rate_over_expected(mask, n_expected: int) -> float:
+    """Fraction of True over all requested structures; missing generations count as False."""
+    return float(np.sum(mask) / n_expected) if n_expected else 0.0
+
+
 def load_training_reference(parquet_path: Path, n_sample: int, seed: int = 42) -> list[Structure]:
-    """Sample a reference set from pairs.parquet for novelty checks (proxy for the full Alex-MP-20 training set)."""
+    """Sample a reference set from pairs parquet for novelty checks (proxy for the full Alex-MP-20 training set)."""
     import pyarrow.parquet as pq
     pf = pq.ParquetFile(str(parquet_path))
     total = pf.metadata.num_rows
@@ -50,6 +56,7 @@ def load_training_reference(parquet_path: Path, n_sample: int, seed: int = 42) -
     target = sorted(rng.choice(total, size=n_sample, replace=False).tolist())
     target_set = set(int(i) for i in target)
     out = []
+    n_bad = 0
     cursor = 0
     for batch in pf.iter_batches(batch_size=8192, columns=["atoms_struct"]):
         b = batch.to_pydict()
@@ -60,12 +67,14 @@ def load_training_reference(parquet_path: Path, n_sample: int, seed: int = 42) -
                 try:
                     out.append(_atoms_struct_to_pymatgen(struct))
                 except Exception:
-                    pass
+                    n_bad += 1
             cursor += 1
-            if len(out) == len(target_set):
+            if len(out) + n_bad == len(target_set):
                 break
-        if len(out) == len(target_set):
+        if len(out) + n_bad == len(target_set):
             break
+    if n_bad:
+        print(f"[dng] skipped {n_bad} unparseable reference structures", flush=True)
     return out
 
 
@@ -73,7 +82,7 @@ def _sample_prompts_from_parquet(parquet_path: Path, n_prompts: int, seed: int,
                                  parent_filter: str | None = None,
                                  slice_start: int = 0,
                                  slice_end: int | None = None):
-    """Pick `n_prompts` prompts from pairs.parquet (seed+n_prompts fully determines the list, so worker slices stay consistent), return prompts[slice_start:slice_end]."""
+    """Pick `n_prompts` prompts from pairs parquet (seed+n_prompts fully determines the list, so worker slices stay consistent), return prompts[slice_start:slice_end]."""
     import pyarrow.parquet as pq
     pf = pq.ParquetFile(str(parquet_path))
     total = pf.metadata.num_rows
@@ -152,9 +161,8 @@ def _sample_prompts_from_parquet(parquet_path: Path, n_prompts: int, seed: int,
     # Fail loud: an out-of-range slice_start would silently yield 0 gens / NaN metrics.
     if slice_start >= len(prompts):
         raise RuntimeError(
-            f"prompt slice_start={slice_start} >= n_prompts={len(prompts)}; this shard "
-            f"would generate 0 structures. Check the launcher's slice/num_samples units "
-            f"(prompt list length = num_samples/batch_size)."
+            f"prompt slice_start={slice_start} is past the end of the prompt list "
+            f"({len(prompts)} prompts, one per batch of --batch_size)"
         )
     return (prompts[slice_start:slice_end],
             prompt_ids[slice_start:slice_end],
@@ -172,50 +180,38 @@ def main():
     ap.add_argument("--batch_size", type=int, default=16,
                     help="Per-call MatterGen batch size; total = ceil(num_samples/batch_size).")
     ap.add_argument("--diffusion_snr", type=float, default=None,
-                    help="Sampling temperature analog (scales Langevin corrector "
-                         "SNR vs defaults pos=0.4 / cell=0.2). <1.0 = warmer, "
-                         ">1.0 = cooler, None = default.")
+                    help="Scale on the Langevin corrector SNR (defaults pos=0.4, cell=0.2); below 1 is warmer.")
     ap.add_argument("--guidance_factor", type=float, default=0.0,
-                    help="0 = strictly unconditional. Default 0.")
+                    help="CFG guidance scale (0 = unconditional).")
     ap.add_argument("--mattergen_pretrained", default="mattergen_base")
     ap.add_argument("--mattergen_model_path", default=None,
-                    help="Local MatterGen backbone dir (e.g. csp_backbone / csp_backbone). "
-                         "Overrides --mattergen_pretrained — REQUIRED for DNG on bridge models "
-                         "trained against a local model_path, else the WRONG backbone is loaded "
-                         "(mattergen_base) and the bridge's cond layers never match.")
+                    help="Local MatterGen checkpoint dir; overrides --mattergen_pretrained and must match the backbone the bridge was trained on.")
     ap.add_argument("--num_atoms_distribution", default="ALEX_MP_20")
     ap.add_argument("--mattersim_potential_path", default=None,
-                    help="Path to MatterSim checkpoint. If None, MatterSim's default is used "
-                         "(downloaded on first call to Potential.from_checkpoint).")
+                    help="MatterSim checkpoint path (default: MatterSim's bundled potential).")
     ap.add_argument("--metastable_threshold", type=float, default=0.1,
-                    help="E_hull threshold (eV/atom) for 'metastable'. Default 0.1.")
+                    help="E_hull threshold (eV/atom) for metastable.")
     ap.add_argument("--reference_parquet",
-                    default=os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs.parquet"),
+                    default=os.path.join(ALM_BENCH, "pretraining/describe.parquet"),
                     help="Source for the novelty reference set.")
     ap.add_argument("--reference_size", type=int, default=10000,
                     help="Number of training-set rows to sample for novelty.")
     ap.add_argument("--prompts_from_parquet", type=Path, default=None,
-                    help="If set, sample prompts from this parquet (uses the `user_prompt` column "
-                         "when present, falling back to `narrative`). One distinct prompt per "
-                         "generation chunk of size --batch_size; total generations = num_samples. "
-                         "When unset, uses a placeholder prompt + ZerosEmbedding (true unconditional).")
+                    help="Sample one prompt per --batch_size chunk from this parquet (user_prompt, else narrative); unset means unconditional.")
     ap.add_argument("--prompts_seed", type=int, default=1337,
                     help="RNG seed for prompt sampling (distinct from training seeds).")
     ap.add_argument("--prompts_parent_filter", type=str, default=None,
-                    help="If set, restrict to one pairs.parquet `parent` (e.g. 'dft_3d').")
+                    help="Restrict prompts to one pairs parquet parent (e.g. 'dft_3d').")
     ap.add_argument("--prompt_slice_start", type=int, default=0,
-                    help="Multi-GPU slicing: 0-indexed start within the (seed-determined) "
-                         "prompt list. Each worker generates prompts[start:end] only.")
+                    help="Start index into the seed-determined prompt list for multi-GPU slicing.")
     ap.add_argument("--prompt_slice_end", type=int, default=None,
-                    help="Multi-GPU slicing: exclusive end index. None = generate to "
-                         "the end of the prompt list. With --prompt_slice_start this lets "
-                         "N parallel workers split the same N=num_samples prompt set.")
+                    help="Exclusive end index into the prompt list (default: the end).")
     # FK stoichiometry steering: in-diffusion SMC, ESS-gated resampling toward the
     # prompt composition via a Hungarian reward on the Tweedie x-hat-0 Z-logits.
     ap.add_argument("--fk_n_particles", type=int, default=0,
-                    help="0 = no FK (default). >0 = K particles/prompt with FK stoich steering.")
+                    help="FK particles per prompt with stoichiometry steering (0 = off).")
     ap.add_argument("--fk_rewards", type=str, default="stoich_match:1.0",
-                    help="FK reward composition. Default = Hungarian stoichiometry match.")
+                    help="FK reward specification (default: Hungarian stoichiometry match).")
     ap.add_argument("--fk_resample_every", type=int, default=10)
     ap.add_argument("--fk_t_start_frac", type=float, default=0.5)
     ap.add_argument("--fk_lambda", type=float, default=0.5)
@@ -224,25 +220,20 @@ def main():
     ap.add_argument("--fk_log_w_clip", type=float, default=10.0)
     # Count-lock: N_p = multiple of sum(target_counts) lets the sum potential work on DNG.
     ap.add_argument("--fk_constrain_n_atoms_to_target_multiple", action="store_true",
-                    help="DNG recipe: force N_p = integer multiple of sum(target_counts).")
+                    help="Force N_p to an integer multiple of sum(target_counts).")
     ap.add_argument("--fk_n_atoms_exact_sum_target", action="store_true",
                     help="Force N_p = sum(target_counts) exactly.")
     ap.add_argument("--fk_enforce_target_counts", action="store_true",
                     help="Post-hoc Hungarian Z-override to the exact target composition.")
     ap.add_argument("--skip_relax", action="store_true",
-                    help="Skip MatterSim relaxation (then stability/SUN are NaN). Useful for "
-                         "smoke-testing the generation+novelty path quickly.")
+                    help="Skip MatterSim relaxation (stability and SUN are then not computed).")
     ap.add_argument("--out_root", type=Path, default=None)
     ap.add_argument("--run_id", type=str, default=None)
     ap.add_argument("--diffusion_seed", type=int, default=1337,
-                    help="Seed for diffusion noise. Per-prompt offset is added so "
-                         "reordering prompts doesn't change individual outputs. "
-                         "Set to a different integer to draw a fresh sample set.")
+                    help="Diffusion noise seed; a per-prompt offset keeps outputs independent of prompt order.")
     # LLM-temperature CoT sampling between "Structure: " and [atoms_0..7].
     ap.add_argument("--cot_tokens", type=int, default=0,
-                    help="K' = number of LLM-sampled tokens spliced between the "
-                         "assistant anchor 'Structure: ' and the K=8 [atoms_i] "
-                         "tokens. 0 (default) = deterministic, current behavior.")
+                    help="LLM-sampled tokens between the assistant anchor 'Structure: ' and the [atoms_i] tokens (0 = off).")
     ap.add_argument("--llm_temperature", type=float, default=1.0,
                     help="Sampling temperature for the CoT (used when --cot_tokens > 0).")
     ap.add_argument("--cot_top_p", type=float, default=0.9,
@@ -264,20 +255,19 @@ def main():
 
     if args.out_root is not None:
         os.environ["ALM_EVAL_RESULTS_ROOT"] = str(args.out_root)
-    bench_name = f"stage3b_dng_g{int(args.guidance_factor*10):02d}"
+    bench_name = f"dng_g{int(args.guidance_factor*10):02d}"
     rd = run_dir(bench_name, args.alm_checkpoint, run_id=args.run_id)
     print(f"[dng] writing results to {rd}", flush=True)
 
-    # ── 1. Generate ────────────────────────────────────────────────────────
+    # 1. Generate.
     # FK steering forces batch dim = particle dim (K per prompt), so n_calls = num_samples/K.
     fk_active = args.fk_n_particles > 0
     gen_batch = args.fk_n_particles if fk_active else args.batch_size
     n_calls = (args.num_samples + gen_batch - 1) // gen_batch
     if args.prompts_from_parquet is not None:
         if args.guidance_factor == 0.0:
-            print("[dng] WARNING: --prompts_from_parquet was given but --guidance_factor=0; "
-                  "the prompt content will be ignored (ZerosEmbedding). Set "
-                  "--guidance_factor > 0 to actually condition on the prompt.", flush=True)
+            print("[dng] warning: --guidance_factor=0 ignores the --prompts_from_parquet prompts",
+              flush=True)
         prompts, prompt_ids, elements_per_prompt, json_counts_per_prompt = _sample_prompts_from_parquet(
             Path(args.prompts_from_parquet),
             n_prompts=n_calls,
@@ -353,12 +343,15 @@ def main():
         for s in chunk:
             raw.append(s if isinstance(s, Structure) else AseAtomsAdaptor.get_structure(s))
     raw = raw[:args.num_samples]
-    print(f"[dng] generated {len(raw)} structures", flush=True)
+    n_expected = min(args.num_samples, len(prompts) * gen_batch)
+    n_gen_failed = max(0, n_expected - len(raw))
+    print(f"[dng] generated {len(raw)} structures ({n_gen_failed} of {n_expected} requested "
+          f"missing)", flush=True)
 
     ase_atoms_pre = [AseAtomsAdaptor.get_atoms(s) for s in raw]
     ase_write(rd / "pre_relax.extxyz", ase_atoms_pre, format="extxyz")
 
-    # ── 2. Validity ────────────────────────────────────────────────────────
+    # 2. Validity.
     valid_flags = [validity_full(s) for s in raw]
     # dtype=bool: empty-list np.array() defaults to float64, breaking the `&` below.
     valid_geom = np.array([v["geom"] for v in valid_flags], dtype=bool)
@@ -366,7 +359,7 @@ def main():
     print(f"[dng] validity_geom = {valid_geom.mean():.3f}, "
           f"validity_charge = {valid_charge.mean():.3f}", flush=True)
 
-    # ── 3. Relax + score energy ────────────────────────────────────────────
+    # 3. Relax and score energy.
     e_per_atom = np.full(len(raw), np.nan)
     e_hull = np.full(len(raw), np.nan)
     relaxed_atoms = None
@@ -409,7 +402,7 @@ def main():
     stable_mask = (e_hull <= 0.0) & np.isfinite(e_hull)
     metastable_mask = (e_hull <= args.metastable_threshold) & np.isfinite(e_hull)
 
-    # ── 4. Uniqueness within batch ─────────────────────────────────────────
+    # 4. Uniqueness within the batch.
     print(f"[dng] computing uniqueness (within {len(raw)} samples)...", flush=True)
     matcher = cdvae_matcher()
     unique_idx = unique_indices(raw, matcher=matcher)
@@ -417,7 +410,7 @@ def main():
     unique_mask[unique_idx] = True
     print(f"[dng] uniqueness = {unique_mask.mean():.3f}", flush=True)
 
-    # ── 5. Novelty against training reference ──────────────────────────────
+    # 5. Novelty against the training reference.
     print(f"[dng] loading {args.reference_size} reference structures from {args.reference_parquet}...",
           flush=True)
     ref_structs = load_training_reference(Path(args.reference_parquet), args.reference_size)
@@ -425,11 +418,11 @@ def main():
     novel_mask = novel_mask_by_formula(raw, ref_structs, matcher=matcher)
     print(f"[dng] novelty = {novel_mask.mean():.3f}", flush=True)
 
-    # ── 6. S.U.N. ──────────────────────────────────────────────────────────
+    # 6. S.U.N.
     sun_mask = stable_mask & unique_mask & novel_mask
     metastable_sun_mask = metastable_mask & unique_mask & novel_mask
 
-    # ── 7. Write ───────────────────────────────────────────────────────────
+    # 7. Write.
     predictions = []
     for i, s in enumerate(raw):
         predictions.append({
@@ -448,18 +441,24 @@ def main():
             "metastable_sun": bool(metastable_sun_mask[i]),
         })
 
+    def _rate(mask):
+        return rate_over_expected(mask, n_expected)
+
     metrics = {
         "n_generated": len(raw),
+        "n_expected": n_expected,
+        "n_gen_failed": n_gen_failed,
+        "gen_failed_rate": n_gen_failed / n_expected if n_expected else 0.0,
         "guidance_factor": args.guidance_factor,
-        "validity_geom_pct": float(valid_geom.mean()),
-        "validity_charge_pct": float(valid_charge.mean()),
-        "validity_full_pct": float((valid_geom & valid_charge).mean()),
-        "stable_pct": float(stable_mask.mean()),
-        "metastable_pct": float(metastable_mask.mean()),
-        "unique_pct": float(unique_mask.mean()),
-        "novel_pct": float(novel_mask.mean()),
-        "sun_pct": float(sun_mask.mean()),  # strict S.U.N. (E_hull <= 0)
-        "metastable_sun_pct": float(metastable_sun_mask.mean()),  # MatterGen MSUN convention (E_hull <= 0.1)
+        "validity_geom_pct": _rate(valid_geom),
+        "validity_charge_pct": _rate(valid_charge),
+        "validity_full_pct": _rate(valid_geom & valid_charge),
+        "stable_pct": _rate(stable_mask),
+        "metastable_pct": _rate(metastable_mask),
+        "unique_pct": _rate(unique_mask),
+        "novel_pct": _rate(novel_mask),
+        "sun_pct": _rate(sun_mask),  # S.U.N. with E_hull <= 0
+        "metastable_sun_pct": _rate(metastable_sun_mask),  # MSUN (E_hull <= metastable_threshold)
         "n_relaxation_inputs": int(valid_geom.sum()),
         "n_with_e_hull": int(np.isfinite(e_hull).sum()),
         "alm_checkpoint": str(args.alm_checkpoint),
@@ -469,7 +468,7 @@ def main():
     write_run(rd, metrics, predictions)
 
     print()
-    print(f"[dng] DONE — {len(raw)} samples")
+    print(f"[dng] done: {len(raw)} samples ({n_gen_failed} failed of {n_expected} requested)")
     print(f"  validity_geom    = {metrics['validity_geom_pct']:.3f}")
     print(f"  validity_charge  = {metrics['validity_charge_pct']:.3f}")
     print(f"  metastable       = {metrics['metastable_pct']:.3f}")

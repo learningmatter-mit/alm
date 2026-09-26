@@ -1,6 +1,6 @@
 # Steering MatterGen with a Custom Conditioning Embedding
 
-A self-contained recipe for driving MatterGen's crystal diffusion from an arbitrary `(B, D_in)` embedding produced by any model. This repo steers MatterGen from a frozen LLM's hidden states; the recipe generalizes so any producer module works.
+A self-contained recipe for driving MatterGen's crystal diffusion from an arbitrary `(B, D_in)` embedding produced by any model. This repo steers MatterGen from LLM hidden states, and the same recipe works with any producer module.
 
 ## 1. What this is
 
@@ -91,7 +91,7 @@ For a sequence producer, drop the `.mean(dim=1)` (returns `(B, K, 512)`; see `At
 
 ### C. cond_field YAML
 
-`mattergen/conf/lightning_module/diffusion_module/model/property_embeddings/<field>.yaml`. For a **pooled `(B,512)`** producer (`src/alm/.../alm_embedding.yaml`):
+`mattergen/conf/lightning_module/diffusion_module/model/property_embeddings/<field>.yaml`. For a pooled `(B,512)` producer (the fork's `property_embeddings/alm_embedding.yaml`):
 
 ```yaml
 _target_: mattergen.property_embeddings.PropertyEmbedding
@@ -150,14 +150,14 @@ props_to_stamp["alm_embedding"] = e_vec.detach().cpu().unsqueeze(0)  # (1, D_in)
 #   +condition_loader_partial.num_samples=<N>
 ```
 
-`draw_samples_from_sampler`'s `properties_to_condition_on={field: e.unsqueeze(0)}` serves only the trained-fields assert; the condition loader stamps the *actual* conditioning values onto every ChemGraph. **Operating point `g = 0.5`.**
+`draw_samples_from_sampler`'s `properties_to_condition_on={field: e.unsqueeze(0)}` serves only the trained-fields assert; the condition loader stamps the *actual* conditioning values onto every ChemGraph.
 
 ## 5. CFG & guidance
 
 - **Dropout (train):** `diffusion_module.pre_corruption_fn.p_unconditional` (default `0.2`) randomly routes rows to the unconditional branch, so the model learns both conditional and unconditional scores.
 - **Null rewrite:** `GemNetTAdapter.__init__` overwrites each adapter field's `unconditional_embedding_module` with a `Zeros*` of the matching shape (`ZerosEmbeddingSequence` if the original carried a `K` attribute, else `ZerosEmbedding`), so a new field never perturbs the unconditional score. A `Learned*` null opts out of this rewrite and keeps a learnable baseline.
-- **Guidance `g`** (`sampler_partial.guidance_scale`): `g=0` ⇒ conditioning fully off (`alm_embedding` removed, the *no-bridge baseline* and never an operating point); `g=1` ⇒ pure conditional; `0<g<1` interpolates; `g>1` extrapolates (NaNs at high g). **`g=0.5` is the operating point.**
-- **`dropout_fields_iid` AND-gate pitfall:** with `dropout_fields_iid=False` (default), the not-NaN mask AND-s across **all** cond_fields, so a NaN in *any* field forces *every* field unconditional for that row, silently starving the embedding. Adding a second cond_field (e.g. a `task_direction` scalar) whose value is NaN on most rows demands `diffusion_module.pre_corruption_fn.dropout_fields_iid = True` (`dropout_fields_iid`) to decouple per-field dropout.
+- **Guidance `g`** (`sampler_partial.guidance_scale`): `g=0` turns conditioning off (equivalent to the unconditional model); `g=1` is pure conditional; `0<g<1` interpolates; `g>1` extrapolates and can produce NaNs. The paper uses `g=0.5`.
+- **`dropout_fields_iid` AND-gate:** with `dropout_fields_iid=False` (default), the not-NaN mask AND-s across **all** cond_fields, so a NaN in *any* field forces *every* field unconditional for that row, silently starving the embedding. Adding a second cond_field (e.g. a `task_direction` scalar) whose value is NaN on most rows requires `diffusion_module.pre_corruption_fn.dropout_fields_iid=True` so each field is dropped independently.
 
 ## 6. Bridge-kind matrix
 

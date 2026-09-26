@@ -4,10 +4,8 @@ import argparse
 import csv
 import json
 import os
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[0].parent / "alm" / "eval"))
 from baselines import BASELINES
 
 
@@ -38,7 +36,7 @@ def _tex_table(rows, benchmark):
         for task, metric in cols:
             match = [r for r in bench_rows if r["model"] == model
                      and r["task"] == task and r["metric"] == metric]
-            cells.append(f"{match[0]['value']:.4f}" if match else "—")
+            cells.append(f"{match[0]['value']:.4f}" if match else "-")
         out.append(f"{model} & " + " & ".join(cells) + " \\\\")
     out += ["\\bottomrule", "\\end{tabular}"]
     return "\n".join(out)
@@ -50,9 +48,9 @@ def main():
         "ALM_EVAL_RESULTS_ROOT", "./eval_results"))
     p.add_argument("--out_dir", default="evals")
     p.add_argument("--run_id", default=None,
-                   help="filter to one run subdir per benchmark (e.g. step=12000)")
+                   help="Only include this run subdir in each benchmark (e.g. step=12000).")
     p.add_argument("--benchmarks", nargs="*", default=None,
-                   help="optional list of benchmark dir names; defaults to all under --root")
+                   help="Benchmark dir names to include; defaults to all under --root.")
     args = p.parse_args()
 
     rows = []
@@ -82,10 +80,7 @@ def main():
                 for metric, value in metrics.items():
                     if value is None:
                         continue
-                    try:
-                        v = float(value)
-                    except (TypeError, ValueError):
-                        continue
+                    v = float(value)
                     rows.append({"benchmark": bench, "run_id": "cited",
                                  "model": model, "task": str(task),
                                  "metric": metric, "value": v})

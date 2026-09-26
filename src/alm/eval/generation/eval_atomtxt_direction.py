@@ -5,8 +5,7 @@ Usage:
   python -m alm.eval.generation.eval_atomtxt_direction \\
       --alm_checkpoint <ckpt_dir> \\
       --atoms_mapper   <ckpt_dir>/atoms_mapper.pt \\
-      --atomtxt_parquet <data_root>/pairs_atomtxt.parquet \\
-      --cached_embs_root <data_root>/cached_embs_narratives \\
+      --atomtxt_parquet <data_root>/ALM-Bench/alm_bench/eval/atomtxt.parquet \\
       --max_rows 100 --K 20 \\
       --out_dir <results_dir>/atomtxt_direction
 """
@@ -18,8 +17,8 @@ import asyncio
 import hashlib
 import json
 import os
+import random
 import re
-import sys
 import time
 import warnings
 from collections import Counter, defaultdict
@@ -36,12 +35,11 @@ from ase.data import atomic_masses, atomic_numbers
 from pymatgen.core import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
 from llm_judge import (  # noqa: E402
     DEFAULT_MODEL, batch_judge, build_atomtxt_direction_messages,
     get_failure_counts, parse_score, reset_failure_counts,
 )
-from paths import DATA_ROOT  # noqa: E402
+from paths import ALM_BENCH  # noqa: E402
 
 # atomtxt-{parent}-{input_idx}-to-{target_idx}-{prop}-{direction}
 ROW_ID_RE = re.compile(
@@ -65,7 +63,7 @@ def _parse_row_id(row_id: str) -> dict | None:
     return m.groupdict()
 
 
-def _ase_to_struct(atoms_struct: dict) -> Structure | None:
+def _struct_from_dict(atoms_struct: dict) -> Structure | None:
     try:
         elements = [str(e).strip() for e in atoms_struct["elements"]]
         coords = np.asarray(atoms_struct["coords"], dtype=np.float64)
@@ -99,7 +97,7 @@ def _selected_atomtxt_rows(parquet_path: Path, max_rows: int, seed: int) -> list
 
 
 def _measure_struct(atoms: Atoms) -> dict:
-    """density (g/cm³), volume_per_atom (Å³), formation_energy (eV/atom from MatterSim total energy)."""
+    """density (g/cm^3), volume_per_atom (A^3), and formation_energy_per_atom (MatterSim total energy per atom, no elemental references)."""
     n = max(1, len(atoms))
     vol = float(abs(np.linalg.det(np.asarray(atoms.cell))))
     mass_amu = sum(atomic_masses[atomic_numbers[a.symbol]] for a in atoms)
@@ -123,7 +121,7 @@ def _load_orbv3_cache(cached_embs_root: Path, parents: set[str]) -> dict:
         bin_p = cached_embs_root / parent / "embeddings" / "orb_v3_direct_20_omat_atom.flat.bin"
         idx_p = cached_embs_root / parent / "embeddings" / "orb_v3_direct_20_omat_atom.flat.idx.json"
         if not bin_p.exists() or not idx_p.exists():
-            print(f"[eval_atomtxt] WARN no cache for {parent} at {bin_p}", flush=True)
+            print(f"[eval_atomtxt] warning: no cache for {parent} at {bin_p}", flush=True)
             continue
         with open(idx_p) as f:
             out["idx"][parent] = json.load(f)
@@ -151,9 +149,9 @@ def main() -> int:
     ap.add_argument("--alm_checkpoint", required=True)
     ap.add_argument("--atoms_mapper", required=True)
     ap.add_argument("--atomtxt_parquet", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_atomtxt.parquet")))
-    ap.add_argument("--cached_embs_root", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "cached_embs_narratives")))
+                    default=Path(os.path.join(ALM_BENCH, "alm_bench/eval/atomtxt.parquet")))
+    ap.add_argument("--cached_embs_root", type=Path, default=None,
+                    help="Optional precomputed OrbV3 cache root; by default the input structures are encoded live.")
     ap.add_argument("--mattergen_pretrained", default="mattergen_base")
     ap.add_argument("--out_dir", type=Path, required=True)
     ap.add_argument("--max_rows", type=int, default=100)
@@ -166,22 +164,15 @@ def main() -> int:
     ap.add_argument("--judge_model", default=DEFAULT_MODEL)
     ap.add_argument("--judge_concurrency", type=int, default=16)
     ap.add_argument("--judge_max_per_prompt", type=int, default=0,
-                    help="Cap number of judge calls per prompt (default 0 = no cap). "
-                         "Set to e.g. 3 to reduce OpenAI API volume when rate-limited. "
-                         "The deterministic direction-correctness rate is unaffected; "
-                         "this only caps the judge overlay.")
+                    help="Cap on judge calls per prompt (0 = no cap); the direction-correctness rate is unaffected.")
     ap.add_argument("--mattersim_potential_path", type=str, default=None)
     ap.add_argument("--row_start", type=int, default=0)
     ap.add_argument("--row_end", type=int, default=-1)
     ap.add_argument("--diffusion_seed", type=int, default=1337,
-                    help="Seed for diffusion noise. Per-prompt offset added so "
-                         "reordering doesn't change individual outputs.")
-    # ── FK steering: preserve input's element set + stoichiometry ──
+                    help="Diffusion noise seed; a per-prompt offset keeps outputs independent of prompt order.")
+    # FK steering: preserve the input's element set and stoichiometry.
     ap.add_argument("--fk_n_particles", type=int, default=0,
-                    help="0 = no FK (default; vanilla diffusion). When > 0, "
-                         "REPLACES --K: each prompt produces fk_n_particles "
-                         "structures via FK steering. Element mask + "
-                         "stoich-match reward are auto-derived from input_atoms_struct.")
+                    help="Number of FK-steered particles per prompt (overrides --K); 0 disables FK.")
     ap.add_argument("--fk_lambda", type=float, default=0.5)
     ap.add_argument("--fk_log_w_clip", type=float, default=50.0)
     ap.add_argument("--fk_potential", type=str, default="sum",
@@ -190,28 +181,22 @@ def main() -> int:
     ap.add_argument("--fk_t_start_frac", type=float, default=0.5)
     ap.add_argument("--fk_rewards", type=str,
                     default="stoich_match:1.0;count_l1:1.0;ratio_kl:1.0",
-                    help="FK reward composition. target_counts is auto-set to the "
-                         "input's atomic-number multiset.")
+                    help="FK reward specification; target_counts is the input's atomic-number multiset.")
     ap.add_argument("--fk_mask_input_elements", action=argparse.BooleanOptionalAction,
                     default=True,
-                    help="When FK is on, hard-mask atomic-number logits to "
-                         "input's element set (the atomtxt pairs' invariant). "
-                         "Default ON.")
+                    help="With FK, mask atomic-number logits to the input's elements (default on).")
     ap.add_argument("--fk_enforce_target_counts", action="store_true",
-                    help="Post-hoc Hungarian Z-override at end of denoising — "
-                         "force exact input stoichiometry on every particle. "
-                         "Default OFF (atomtxt may want some compositional flex).")
+                    help="Reassign atom types after denoising to match the input stoichiometry exactly.")
     ap.add_argument("--fk_n_atoms_exact_sum_target", action="store_true",
-                    help="Force N_p = sum(input_counts) exactly. Default OFF "
-                         "(atomtxt prompts can ask for cells of different sizes).")
+                    help="Force N_p = sum(input_counts) exactly.")
     args = ap.parse_args()
 
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[eval_atomtxt] writing → {args.out_dir}", flush=True)
+    print(f"[eval_atomtxt] writing to {args.out_dir}", flush=True)
     t0 = time.time()
 
-    # ── 1. Pick rows + load OrbV3 caches ──
+    # 1. Pick rows and load OrbV3 caches.
     rows = _selected_atomtxt_rows(args.atomtxt_parquet, args.max_rows, args.seed)
     if args.row_end < 0:
         args.row_end = len(rows)
@@ -222,12 +207,13 @@ def main() -> int:
     print(f"[eval_atomtxt] by prop: {dict(by_prop)}", flush=True)
     print(f"[eval_atomtxt] by direction: {dict(by_dir)}", flush=True)
 
-    parents = {r["parent"] for r in rows}
-    print(f"[eval_atomtxt] loading OrbV3 caches for parents: {parents}", flush=True)
-    cache = _load_orbv3_cache(args.cached_embs_root, parents)
+    cache = None
+    if args.cached_embs_root is not None:
+        parents = {r["parent"] for r in rows}
+        print(f"[eval_atomtxt] loading OrbV3 caches for parents: {parents}", flush=True)
+        cache = _load_orbv3_cache(args.cached_embs_root, parents)
 
-    # ── 2. Load model ──
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))                       # alm/
+    # 2. Load the model.
     from generate_stage3 import load_alm_and_pl_module
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[eval_atomtxt] loading ALM + MatterGen on {device} ...", flush=True)
@@ -236,9 +222,10 @@ def main() -> int:
         atoms_mapper=args.atoms_mapper,
         mattergen_pretrained=args.mattergen_pretrained,
         device=device,
+        use_cached_embeddings=cache is not None,  # live OrbV3 encodes input_atoms_struct
     )
 
-    # ── 3. Generate per-prompt with input atom features ──
+    # 3. Generate per prompt with input atom features.
     # Run prompts one at a time via the primitives so cached input features get
     # spliced in, rather than forking generate_stage3's zero-length input path.
     from generate_stage3 import (
@@ -246,13 +233,11 @@ def main() -> int:
         _ensure_fk_hook_installed, _install_fk_on_sampler,
     )
 
-    # FK plumbing
     fk_active = args.fk_n_particles > 0
     if fk_active:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
         from fk_rewards import parse_rewards as _fk_parse_rewards
         _ensure_fk_hook_installed(pl_module)
-        print(f"[eval_atomtxt] FK steering ON: K={args.fk_n_particles} "
+        print(f"[eval_atomtxt] FK steering: K={args.fk_n_particles} "
               f"λ={args.fk_lambda} pot={args.fk_potential} "
               f"clip={args.fk_log_w_clip} t_start={args.fk_t_start_frac} "
               f"resample_every={args.fk_resample_every}", flush=True)
@@ -261,10 +246,6 @@ def main() -> int:
               f"enforce_target_counts={args.fk_enforce_target_counts} "
               f"n_atoms_exact_sum_target={args.fk_n_atoms_exact_sum_target}", flush=True)
 
-    import random as _random
-    import numpy as _np
-    from collections import Counter as _Counter
-    from ase.data import atomic_numbers as _atomic_numbers
     structures_per_prompt: list[list] = []
     for i, r in enumerate(rows):
         # Per-prompt seed: reproducible and order-independent.
@@ -272,15 +253,19 @@ def main() -> int:
         torch.manual_seed(_s)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(_s)
-        _np.random.seed(_s)
-        _random.seed(_s)
-        atom_embed = _input_atom_embed(cache, r["parent"], r["input_source_idx"], device)
+        np.random.seed(_s)
+        random.seed(_s)
+        if cache is not None:
+            atom_embed = _input_atom_embed(cache, r["parent"], r["input_source_idx"], device)
+        else:
+            from eval_edit import _ase_atoms_from_struct, _live_orbv3_features
+            atom_embed = _live_orbv3_features(alm, _ase_atoms_from_struct(r["input_atoms_struct"]), device)
         if atom_embed is None:
-            print(f"[eval_atomtxt] {r['row_id']}: no cached input features → skip", flush=True)
+            print(f"[eval_atomtxt] {r['row_id']}: no input features; counted as failed", flush=True)
             structures_per_prompt.append([])
             continue
         input_elems = [str(e) for e in r["input_atoms_struct"]["elements"]]
-        json_counts = dict(_Counter(input_elems))
+        json_counts = dict(Counter(input_elems))
         # wrap_user_template=False: atomtxt prompts already start with "<atoms>\nGenerate a ...".
         alm_emb = get_alm_embedding(
             alm, tokenizer, r["user_prompt"], device,
@@ -294,16 +279,15 @@ def main() -> int:
         constrain_exact = 0
         if fk_active:
             try:
-                input_zs = [_atomic_numbers[e] for e in input_elems]
+                input_zs = [atomic_numbers[e] for e in input_elems]
             except KeyError:
                 # Unknown element symbol -> fall back to vanilla for this row.
                 input_zs = None
             if input_zs is not None:
-                target_counts = dict(_Counter(input_zs))
+                target_counts = dict(Counter(input_zs))
                 allowed_z = set(input_zs) if args.fk_mask_input_elements else None
                 if args.fk_n_atoms_exact_sum_target:
                     constrain_exact = int(sum(target_counts.values()))
-        # hasattr guard: older pl_module instances lack _element_mask_state.
         if hasattr(pl_module, "_element_mask_state"):
             if fk_active and allowed_z is not None:
                 pl_module._element_mask_state.allowed_z = allowed_z
@@ -356,14 +340,14 @@ def main() -> int:
         if (i + 1) % 10 == 0:
             print(f"[eval_atomtxt] generated {i+1}/{len(rows)} prompts in {time.time()-t0:.0f}s", flush=True)
 
-    # ── 4. Relax inputs + outputs ──
+    # 4. Relax inputs and outputs.
     from structure_metrics import relax_structures_mattersim
     print(f"[eval_atomtxt] relaxing inputs ...", flush=True)
     input_structs: list[Structure | None] = []
     for r in rows:
-        s = _ase_to_struct(r["input_atoms_struct"])
+        s = _struct_from_dict(r["input_atoms_struct"])
         input_structs.append(s)
-    # Defensive Z-range filter: one bad input would crash the whole relax batch.
+    # Drop Z outside [1, 94]; MatterSim asserts on them and kills the batch.
     valid_inputs: list[Structure] = []
     input_ok: list[bool] = []
     n_input_filtered = 0
@@ -424,7 +408,7 @@ def main() -> int:
     )
     print(f"[eval_atomtxt] relax done in {time.time()-t0:.0f}s total", flush=True)
 
-    # ── 5. Score deterministically + collect judge inputs ──
+    # 5. Score deterministically and collect judge inputs.
     judge_items: list[dict] = []
     judge_back_idx: list[int] = []   # indices into examples
     examples: list[dict] = []
@@ -508,7 +492,7 @@ def main() -> int:
           f"{n_gen_failed}/{n_slots} generations unscorable and counted as wrong "
           f"(gen_failed_rate={gen_failed_rate:.3f})", flush=True)
 
-    # ── 6. Optional LLM judge overlay ──
+    # 6. Optional LLM judge overlay.
     judge_score_by_idx: dict[int, int] = {}
     if args.judge and judge_items:
         reset_failure_counts()
@@ -529,7 +513,7 @@ def main() -> int:
             examples[back_i]["judge_verdict"] = verdict.get("verdict") if verdict else None
             examples[back_i]["judge_reason"] = verdict.get("reason") if verdict else None
 
-    # ── 7. Aggregates ──
+    # 7. Aggregates.
     per_prompt_rate = {
         rid: float(np.mean(corrects))
         for rid, corrects in per_prompt_correct.items() if corrects
@@ -576,7 +560,7 @@ def main() -> int:
     if judge_mean is not None:
         print(f"[eval_atomtxt]            judge_consistency_score = {judge_mean:.3f} / 2.0", flush=True)
     print(f"[eval_atomtxt]            by-prop: {by_prop_rate}", flush=True)
-    print(f"[eval_atomtxt] DONE in {time.time()-t0:.0f}s", flush=True)
+    print(f"[eval_atomtxt] done in {time.time()-t0:.0f}s", flush=True)
     return 0
 
 

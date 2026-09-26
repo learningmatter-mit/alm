@@ -7,9 +7,6 @@ import os
 import subprocess
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_EVAL_EDIT = os.path.join(_HERE, "eval_edit.py")
-
 # task -> (primary metric key, human label)
 PRIMARY = {
     "atomtxt":   ("direction_correct_rate", "direction-correct"),
@@ -17,14 +14,14 @@ PRIMARY = {
     "doping":    ("correct_substitution_rate", "correct substitution"),
     "app":       ("overall_consistency_mean_per_prompt", "app-consistency (judge)"),
 }
-DIAGNOSTICS = ["structurally_valid", "gen_failed_rate", "n_scored"]
+DIAGNOSTICS = ["structurally_valid", "gen_failed_rate", "n_scored", "n_expected"]
 
 
 def run_task(task, args):
     out_dir = os.path.join(args.out_dir, task)
     os.makedirs(out_dir, exist_ok=True)
     cmd = [
-        sys.executable, _EVAL_EDIT, "--task", task,
+        sys.executable, "-m", "alm.eval.generation.eval_edit", "--task", task,
         "--alm_checkpoint", args.alm_checkpoint,
         "--atoms_mapper", args.atoms_mapper,
         "--guidance_factor", str(args.guidance_factor),
@@ -36,43 +33,37 @@ def run_task(task, args):
         cmd += ["--mattergen_model_path", args.mattergen_model_path]
     if task == "app":
         cmd += ["--judge_model", args.judge_model]
-    print(f"\n{'='*72}\n[almbench] task={task}\n  $ {' '.join(cmd)}\n{'='*72}", flush=True)
+    print(f"\n[almbench] task={task}\n  $ {' '.join(cmd)}", flush=True)
     rc = subprocess.run(cmd).returncode
-    # metrics.json may nest under a run subdir
+    # metrics.json may be nested under a run subdir.
     found = None
     for dp, _, fs in os.walk(out_dir):
         if "metrics.json" in fs:
             found = os.path.join(dp, "metrics.json")
             break
-    metrics = {}
-    if found:
-        try:
-            metrics = json.load(open(found))
-        except Exception as e:  # noqa: BLE001
-            print(f"[almbench] WARN: could not parse {found}: {e}")
+    metrics = json.load(open(found)) if found else {}
     return {"task": task, "returncode": rc, "metrics_path": found, "metrics": metrics}
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--alm_checkpoint", required=True, help="Stage-2 step=N dir")
-    ap.add_argument("--atoms_mapper", required=True, help="Stage-3 step=N/atoms_mapper.pt (edit/synthesis model)")
+    ap.add_argument("--alm_checkpoint", required=True, help="Stage-2 step=N dir.")
+    ap.add_argument("--atoms_mapper", required=True, help="Stage-3 checkpoint's atoms_mapper.pt.")
     ap.add_argument("--mattergen_model_path", default=None,
-                    help="CSP-mode MatterGen checkpoint dir used as the editing decoder")
+                    help="CSP-mode MatterGen backbone directory (config.yaml + checkpoints/).")
     ap.add_argument("--tasks", default="atomtxt,polymorph,doping,app",
-                    help="comma list; default = all four ALM-Bench tasks")
-    ap.add_argument("--guidance_factor", type=float, default=0.5, help="CFG g (operating point = 0.5)")
+                    help="Comma-separated tasks (default: all four ALM-Bench tasks).")
+    ap.add_argument("--guidance_factor", type=float, default=0.5, help="CFG guidance scale (operating point 0.5).")
     ap.add_argument("--diffusion_steps", type=int, default=1000)
     ap.add_argument("--max_rows", type=int, default=100)
-    ap.add_argument("--judge_model", default="gpt-4o-mini", help="app task only (needs OPENAI_API_KEY)")
+    ap.add_argument("--judge_model", default="gpt-4o-mini", help="Judge model for the app task (needs OPENAI_API_KEY).")
     ap.add_argument("--out_dir", default="eval_results/almbench")
     args = ap.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     if "app" in tasks and not os.environ.get("OPENAI_API_KEY"):
-        print("[almbench] OPENAI_API_KEY not set; skipping the 'app' task (LM judge). "
-              "Set the key to include it.")
+        print("[almbench] OPENAI_API_KEY not set; skipping the app task.")
         tasks = [t for t in tasks if t != "app"]
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -97,7 +88,7 @@ def main():
     sp = os.path.join(args.out_dir, "almbench_summary.json")
     json.dump(summary, open(sp, "w"), indent=2)
 
-    print(f"\n{'='*78}\nALM-Bench summary  (g={args.guidance_factor}, max_rows={args.max_rows})\n{'='*78}")
+    print(f"\nALM-Bench summary (g={args.guidance_factor}, max_rows={args.max_rows})")
     print(f"{'task':<11}{'metric':<26}{'value':>8}{'valid':>8}{'gen_fail':>10}{'n':>6}{'rc':>4}")
     for task, label, primary, valid, genfail, n, rc in rows:
         pv = f"{primary:.4f}" if isinstance(primary, (int, float)) else "  n/a"

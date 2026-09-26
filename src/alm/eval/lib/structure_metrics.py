@@ -3,7 +3,6 @@ from __future__ import annotations
 
 
 import os
-import sys
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -13,13 +12,13 @@ from pymatgen.core.composition import Composition
 from pymatgen.core.structure import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
-from mattergen.evaluation.utils.structure_matcher import OrderedStructureMatcher  # noqa: E402
-from mattergen.evaluation.utils.dataset_matcher import (  # noqa: E402
+from mattergen.evaluation.utils.structure_matcher import OrderedStructureMatcher
+from mattergen.evaluation.utils.dataset_matcher import (
     get_matches,
     get_unique,
 )
 
-from paths import DATA_ROOT  # noqa: E402
+from paths import DATA_ROOT
 
 
 # Matcher: CDVAE/CrystaLLM tolerances (looser than MatterGen's 0.2/0.3/5).
@@ -245,8 +244,8 @@ def relax_structures_mattersim(
     ok_idx = [i for i, a in enumerate(atoms_list) if not _degenerate(a)]
     n_bad = len(atoms_list) - len(ok_idx)
     if n_bad:
-        print(f"[relax] skipping {n_bad}/{len(atoms_list)} geometrically-degenerate "
-              f"cell(s) (NaN energy; would MemoryError pymatgen's neighbor list)", flush=True)
+        print(f"[relax] skipping {n_bad}/{len(atoms_list)} degenerate cells (energy set to NaN)",
+              flush=True)
 
     relaxed_full: list[Atoms] = list(atoms_list)
     energies_full = np.full(len(atoms_list), float("nan"), dtype=float)
@@ -260,10 +259,10 @@ def relax_structures_mattersim(
                 output_path=str(output_extxyz) if output_extxyz else None,
             )
         except Exception as batch_exc:
-            # Batch poisoned by a bad cell: fall back to per-structure relax, loading the
-            # Potential ONCE (per-row from_checkpoint would be a multi-minute reload each).
+            # One bad cell can fail the whole batch, so retry one structure at a time.
+            # Load the potential once; reloading it per structure takes minutes.
             print(f"[relax] batch relax failed ({type(batch_exc).__name__}: {batch_exc}); "
-                  f"retrying per-structure with a SHARED potential (no per-row reload)", flush=True)
+                  f"retrying one structure at a time", flush=True)
             from mattersim.applications.batch_relax import BatchRelaxer
             from mattersim.forcefield.potential import Potential
             _pot = Potential.from_checkpoint(
@@ -303,7 +302,7 @@ def load_hull_reference(hull_dir: Path | str = DEFAULT_HULL_DIR):
     hull_dir = Path(hull_dir)
     if not hull_dir.exists():
         raise FileNotFoundError(
-            f"hull dir {hull_dir} does not exist — run scripts/fetch_mp_hull.py"
+            f"hull dir {hull_dir} does not exist; run scripts/fetch_mp_hull.py"
         )
 
     preferred = hull_dir / "preferred.txt"
@@ -319,7 +318,7 @@ def load_hull_reference(hull_dir: Path | str = DEFAULT_HULL_DIR):
                 break
         else:
             raise FileNotFoundError(
-                f"no hull reference found in {hull_dir} — run scripts/fetch_mp_hull.py"
+                f"no hull reference found in {hull_dir}; run scripts/fetch_mp_hull.py"
             )
 
     if path.suffix == ".gz":

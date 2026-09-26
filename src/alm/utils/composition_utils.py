@@ -7,7 +7,7 @@ import numpy as np
 # Z range modeled, matches CompositionHead's 100-d output.
 N_ELEMENTS = 100
 
-# Per-element count cap; pairs.parquet is <=20 atoms/cell so 20 bounds any element.
+# Per-element count cap; pairs parquet is <=20 atoms/cell so 20 bounds any element.
 MAX_COUNT = 20
 
 

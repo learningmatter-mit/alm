@@ -23,9 +23,9 @@ class AuxHead(nn.Module):
 
 
 class CompositionHead(AuxHead):
-    """Multi-hot presence over Z=1..100, BCEWithLogits; pos_weight escapes the all-negative trivial minimum."""
+    """Multi-hot presence over Z=1..N_ELEMENTS, BCEWithLogits; pos_weight escapes the all-negative trivial minimum."""
     target_kind = "composition"
-    target_dim = 100
+    target_dim = N_ELEMENTS
 
     def __init__(self, in_dim: int = 512, pos_weight: float = 32.0):
         super().__init__()

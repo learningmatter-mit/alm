@@ -1,8 +1,9 @@
-"""Build pairs_atomtxt.parquet: atom-input + text-prompt -> structure-target directional pairs."""
+"""Build the ALM-Bench `atomtxt` bucket (alm_bench/atomtxt.parquet): atom-input + text-prompt -> structure-target directional pairs."""
 from __future__ import annotations
 
 
 import argparse
+import hashlib
 import os
 import random
 from collections import Counter, defaultdict
@@ -13,10 +14,10 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 import alm  # noqa: F401  (puts the flat alm module namespace on sys.path)
-from paths import DATA_ROOT
+from paths import DATA_ROOT, ALM_BENCH
 
 
-# Per-parent source column -> canonical property name (oqmd has no volume).
+# Per-parent map from property name to source column (oqmd has no volume).
 PARENT_PROPS = {
     "dft_3d": {
         "formation_energy": "formation energy per atom (eV/atom)",
@@ -44,7 +45,7 @@ PARENT_PROPS = {
 }
 
 
-# One template per (property, direction) slot is picked per pair via deterministic hash.
+# One template per (property, direction) is picked per pair by an md5 of the pair key.
 PROMPT_TEMPLATES = {
     ("formation_energy", "lower"): [
         "Generate a more thermodynamically stable version of this material.",
@@ -176,15 +177,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pairs_parquet", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs.parquet")))
+                    default=Path(os.path.join(ALM_BENCH, "pretraining/describe.parquet")))
     ap.add_argument("--narratives_root", type=Path,
                     default=Path(os.path.join(DATA_ROOT, "GPT-Narratives-for-Materials")))
     ap.add_argument("--out_path", type=Path,
-                    default=Path(os.path.join(DATA_ROOT, "stage3_outputs/stage3a/pairs_atomtxt.parquet")))
+                    default=Path(os.path.join(ALM_BENCH, "alm_bench/atomtxt.parquet")))
     ap.add_argument("--max_pairs_per_cluster", type=int, default=10,
                     help="Cap pairs per (parent, element-set) cluster; k(k-1) grows fast.")
     ap.add_argument("--max_total_pairs", type=int, default=300000,
-                    help="Cap on total pairs written. Subsampled randomly if needed.")
+                    help="Max total pairs written (randomly subsampled).")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -252,7 +253,7 @@ def main() -> int:
         print(f"  {prop:20s} {direction:8s}  {n:>8,}")
 
     # Build (parent, source_idx) -> row lookup for atoms_struct.
-    print(f"[main] loading pairs.parquet for atoms_struct lookup")
+    print(f"[main] loading the describe pairs parquet for atoms_struct lookup")
     pf_pairs = pq.ParquetFile(args.pairs_parquet)
     pair_lookup: dict[tuple, dict] = {}
     for batch in tqdm(pf_pairs.iter_batches(batch_size=10000),
@@ -262,7 +263,7 @@ def main() -> int:
             pair_lookup[(r["parent"], r["source_idx"])] = r
     print(f"[main] lookup table size: {len(pair_lookup):,}")
 
-    # Output schema = pairs.parquet schema plus input_atoms_struct and input_source_idx.
+    # Output schema = describe pairs schema plus input_atoms_struct and input_source_idx.
     print(f"[main] building output rows")
     pairs_schema = pf_pairs.schema_arrow
     out_schema = pa.schema(
@@ -282,7 +283,7 @@ def main() -> int:
         if key not in PROMPT_TEMPLATES:
             continue
         templates = PROMPT_TEMPLATES[key]
-        h = hash((p["parent"], p["input_source_idx"], p["target_source_idx"]))
+        h = int(hashlib.md5(f"{p['parent']}-{p['input_source_idx']}-{p['target_source_idx']}".encode()).hexdigest(), 16)
         prompt = templates[h % len(templates)]
 
         # Row is the target (out_row); prepend <atoms> so the input-side OrbV3 splice lands.
