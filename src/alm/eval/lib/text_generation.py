@@ -64,6 +64,17 @@ def generate_batch(model, batch, max_new_tokens=512, atomistic=True,
     inputs_embeds, _, attention_mask, _ = model._merge_embeddings(
         text_embeds, atom_features, prompt_ids_list, dummy_labels, prompt_attn,
     )
+    # _merge_embeddings right-pads (the training layout), but generate() continues from the
+    # last column of every row, so shorter prompts would start decoding from a pad embedding.
+    # Move the padding to the left; HF derives position ids from the attention mask.
+    lens = attention_mask.sum(dim=1).tolist()
+    L = inputs_embeds.shape[1]
+    left_embeds = torch.zeros_like(inputs_embeds)
+    left_mask = torch.zeros_like(attention_mask)
+    for b, n in enumerate(lens):
+        left_embeds[b, L - n:] = inputs_embeds[b, :n]
+        left_mask[b, L - n:] = attention_mask[b, :n]
+    inputs_embeds, attention_mask = left_embeds, left_mask
 
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
